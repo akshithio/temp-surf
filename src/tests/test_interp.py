@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from dataio.get_input import CH_CLIMATE_BANDS, CH_S1_BANDS, CH_S2_BANDS, Benchmark
+from dataio.get_input import Benchmark
 from diagnostics.interp import (
     AttributionBatch,
     BandSpec,
@@ -17,6 +17,7 @@ from diagnostics.interp import (
     subset_benchmark,
     write_importance,
 )
+from evals.benchmarks.cropharvest import CH_CLIMATE_BANDS, CH_S1_BANDS, CH_S2_BANDS
 
 
 def _bench() -> Benchmark:
@@ -27,7 +28,7 @@ def _bench() -> Benchmark:
     s2[:, :, 1] = np.arange(n, dtype=np.float32)[:, None]
     return Benchmark(
         name="tiny",
-        task="binary",
+        label_kind="binary",
         s2=s2,
         s1=np.ones((n, t, len(CH_S1_BANDS)), dtype=np.float32),
         climate=np.full((n, t, len(CH_CLIMATE_BANDS)), 2.0, dtype=np.float32),
@@ -44,7 +45,7 @@ def _bench() -> Benchmark:
     )
 
 
-class FakeEncoder:
+class FakeModel:
     def encode(self, bench):
         return np.stack([bench.s2[:, :, 0].mean(axis=1), bench.s2[:, :, 1].mean(axis=1)], axis=1).astype(np.float32)
 
@@ -109,13 +110,13 @@ def test_permutation_importance_ranks_known_useful_band_first() -> None:
     specs = [s for s in band_specs(bench) if s.modality == "s2" and s.index in {0, 1}]
 
     rows = permutation_importance(
-        FakeEncoder(),
+        FakeModel(),
         FakeProbe(),
         bench,
         bench.labels,
         _accuracy,
         specs=specs,
-        metadata={"encoder": "fake", "task": "unit"},
+        metadata={"model": "fake", "benchmark": "unit"},
         seed=2,
     )
 
@@ -144,7 +145,7 @@ def test_gradient_input_importance_returns_finite_band_values() -> None:
         emb = torch.stack([x[:, :, 0].mean(dim=1), x[:, :, 1].mean(dim=1)], dim=1)
         return AttributionBatch(emb, x, specs)
 
-    rows = gradient_input_importance(callback, FakeProbe(), bench, metadata={"encoder": "fake"})
+    rows = gradient_input_importance(callback, FakeProbe(), bench, metadata={"model": "fake"})
 
     assert [r["band"] for r in rows] == ["B2", "B3"]
     assert all(np.isfinite(r["importance"]) and r["importance"] >= 0 for r in rows)
@@ -153,12 +154,12 @@ def test_gradient_input_importance_returns_finite_band_values() -> None:
 
 def test_write_importance_writes_flat_csv(tmp_path) -> None:
     path = tmp_path / "feature_importance.csv"
-    rows = [{"encoder": "fake", "task": "unit", "importance_method": "permutation", "importance": 1.5}]
+    rows = [{"model": "fake", "benchmark": "unit", "importance_method": "permutation", "importance": 1.5}]
 
     out = write_importance(rows, output_path=path, append=False)
 
     assert out == path
     with path.open(newline="", encoding="utf-8") as f:
         read = list(csv.DictReader(f))
-    assert read[0]["encoder"] == "fake"
+    assert read[0]["model"] == "fake"
     assert read[0]["importance"] == "1.5"

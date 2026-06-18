@@ -1,4 +1,4 @@
-"""GPU smoke test for every active frozen encoder.
+"""GPU smoke test for every active frozen model.
 
 Configuration is intentionally kept in this file so the run command stays
 short and reproducible.
@@ -25,7 +25,7 @@ EXPECTED_DIMS = {
 
 def main() -> None:
     if not torch.cuda.is_available():
-        raise RuntimeError("A CUDA device is required for the encoder smoke test")
+        raise RuntimeError("A CUDA device is required for the model smoke test")
     benchmark = get_input(
         BENCHMARK,
         root=cacheutils.INPUT_ROOT,
@@ -33,8 +33,8 @@ def main() -> None:
         shuffle=False,
     )
     for name, expected_dim in EXPECTED_DIMS.items():
-        encoder = cacheutils.build_encoder(name, device="cuda:0")
-        embeddings = encoder.encode(benchmark)
+        model = cacheutils.build_model(name, device="cuda:0")
+        embeddings = model.encode(benchmark)
         expected_shape = (benchmark.n_samples, expected_dim)
         if embeddings.shape != expected_shape:
             raise AssertionError(f"{name}: expected {expected_shape}, received {embeddings.shape}")

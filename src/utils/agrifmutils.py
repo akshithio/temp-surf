@@ -1,4 +1,4 @@
-"""Vendored AgriFM video_swin_transformer.py — SwinTransformer3D for the S2 encoder.
+"""Vendored AgriFM video_swin_transformer.py — SwinTransformer3D for the S2 model.
 
 Stubs out mmseg registries so no compiled mmcv is needed.
 """
@@ -489,7 +489,7 @@ class SwinTransformer3D(nn.Module):
             x = torch.reshape(feat, (B, C * D, H, W))
         elif self.feature_fusion == 'mean':
             x = torch.mean(x, dim=2)
-        return {'encoder_features': x, 'features_list': out_feats}
+        return {'model_features': x, 'features_list': out_feats}
 
     def train(self, mode=True):
         super().train(mode)

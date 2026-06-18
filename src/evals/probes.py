@@ -296,7 +296,7 @@ def score_segmentation(
     ``x_test`` is the flattened valid-pixel feature matrix and ``y_test`` the per-pixel class
     labels (background / void already dropped upstream). mIoU is averaged over ``eval_classes``
     (default = the probe's trained classes), excluding classes absent from ``y_test`` (NaN) --
-    matching the standard frozen-encoder linear-probe mIoU report (Galileo Table 17 / OlmoEarth).
+    matching the standard frozen-model linear-probe mIoU report (Galileo Table 17 / OlmoEarth).
     """
     with perf.measure("probe.score/segmentation", n_samples=len(y_test), n_features=x_test.shape[1]):
         pred = clf.predict(x_test)
@@ -323,3 +323,43 @@ def score_segmentation(
         }
         return scores, per_sample
     return scores
+
+
+def score_segmentation_per_tile(
+    clf: Any,
+    x_test: np.ndarray,
+    y_test: np.ndarray,
+    tile_ids: np.ndarray,
+    *,
+    eval_classes: np.ndarray | None = None,
+) -> dict[str, float]:
+    """Score segmentation per tile and return aggregated tile-level metrics.
+
+    Reports ``mean_per_tile_miou`` (average of per-tile mIoUs) and
+    ``worst_tile_miou`` (minimum per-tile mIoU) alongside the number of tiles
+    scored (``n_tiles_scored``).  Tiles with zero valid pixels after void
+    removal are excluded.
+    """
+    classes = np.asarray(
+        eval_classes if eval_classes is not None else getattr(clf, "classes_", np.unique(y_test))
+    )
+    pred = clf.predict(x_test)
+    unique_tiles = np.unique(tile_ids)
+    tile_mious: list[float] = []
+    for tid in unique_tiles:
+        mask = tile_ids == tid
+        if mask.sum() == 0:
+            continue
+        yt, pt = y_test[mask], pred[mask]
+        ious = per_class_iou(yt, pt, classes)
+        present = [v for v in ious.values() if not np.isnan(v)]
+        if present:
+            tile_mious.append(float(np.mean(present)))
+    if not tile_mious:
+        return {"mean_per_tile_miou": float("nan"), "worst_tile_miou": float("nan"), "n_tiles_scored": 0}
+    arr = np.asarray(tile_mious)
+    return {
+        "mean_per_tile_miou": float(np.mean(arr)),
+        "worst_tile_miou": float(np.min(arr)),
+        "n_tiles_scored": len(arr),
+    }

@@ -6,15 +6,12 @@ import numpy as np
 import pytest
 
 from dataio.get_input import (
-    CH_CLIMATE_BANDS,
-    CH_S1_BANDS,
-    CH_S2_BANDS,
     Benchmark,
-    PastisBenchmark,
-    _resample_to,
-    degrade,
     get_input,
 )
+from evals.benchmarks.cropharvest import CH_CLIMATE_BANDS, CH_S1_BANDS, CH_S2_BANDS
+from evals.benchmarks.eurocropsml import _resample_to
+from evals.benchmarks.pastis_r import PastisBenchmark
 from utils import ioutils
 
 
@@ -22,7 +19,7 @@ def _tiny_benchmark() -> Benchmark:
     n, t = 3, 4
     return Benchmark(
         name="tiny",
-        task="regression",
+        label_kind="regression",
         s2=np.arange(n * t * 11, dtype=np.float32).reshape(n, t, 11),
         s1=np.ones((n, t, 2), dtype=np.float32),
         climate=np.full((n, t, len(CH_CLIMATE_BANDS)), 2.0, dtype=np.float32),
@@ -37,30 +34,6 @@ def _tiny_benchmark() -> Benchmark:
         s1_bands=CH_S1_BANDS,
         climate_bands=CH_CLIMATE_BANDS,
     )
-
-
-def test_degraded_sensor_off() -> None:
-    bench = _tiny_benchmark()
-
-    out = degrade(bench, sensor_off="s2")
-
-    assert np.all(out.s2 == 0)
-    assert np.all(out.s2_mask == 0)
-    np.testing.assert_array_equal(out.s1, bench.s1)
-    np.testing.assert_array_equal(out.climate, bench.climate)
-
-
-def test_degraded_temporal_drop() -> None:
-    bench = _tiny_benchmark()
-
-    out = degrade(bench, temporal_drop=0.99, seed=3)
-
-    assert np.all(out.s2_mask[:, 0] == 1)
-    assert np.all(out.s1_mask[:, 0] == 1)
-    assert np.all(out.climate_mask[:, 0] == 1)
-    assert np.all(out.s2_mask.sum(axis=1) >= 2)
-    assert np.all(out.s1_mask.sum(axis=1) >= 2)
-    assert np.all(out.climate_mask.sum(axis=1) >= 2)
 
 
 def test_resample_to() -> None:
@@ -85,7 +58,7 @@ def test_get_input_rejects_unknown_benchmark() -> None:
 
 
 def test_pastis_is_lazy_and_yields_64_pixel_tiles(tmp_path) -> None:
-    base = tmp_path / "pastis"
+    base = tmp_path / "pastis_r"
     for directory in ("DATA_S2", "DATA_S1A", "ANNOTATIONS"):
         (base / directory).mkdir(parents=True)
     properties = {
@@ -103,7 +76,7 @@ def test_pastis_is_lazy_and_yields_64_pixel_tiles(tmp_path) -> None:
     target[0, 0, 0] = 19
     np.save(base / "ANNOTATIONS" / "TARGET_10000.npy", target)
 
-    bench = get_input("pastis", root=tmp_path, shuffle=False)
+    bench = get_input("pastis_r", root=tmp_path, shuffle=False)
     tiles = list(bench.iter_tiles())
 
     assert isinstance(bench, PastisBenchmark)
@@ -118,13 +91,13 @@ def test_pastis_is_lazy_and_yields_64_pixel_tiles(tmp_path) -> None:
 
 def test_summarize_rows_ignores_legacy_rows_missing_grouping_keys() -> None:
     rows = [
-        {"encoder": "old", "f1": 0.0},
-        {"encoder": "new", "split_regime": "random_id", "f1": 1.0},
+        {"model": "old", "f1": 0.0},
+        {"model": "new", "split_regime": "random_id", "f1": 1.0},
     ]
 
-    summary = ioutils.summarize_rows(rows, keys=["encoder", "split_regime"], metrics=["f1"])
+    summary = ioutils.summarize_rows(rows, keys=["model", "split_regime"], metrics=["f1"])
 
     assert len(summary) == 1
-    assert summary[0]["encoder"] == "new"
+    assert summary[0]["model"] == "new"
     assert summary[0]["split_regime"] == "random_id"
     assert summary[0]["mean_f1"] == 1.0

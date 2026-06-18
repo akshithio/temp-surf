@@ -1,4 +1,4 @@
-"""AgriFM frozen-encoder wrapper (runs the published S2 encoder, no mmcv needed).
+"""AgriFM frozen-model wrapper (runs the published S2 model, no mmcv needed).
 
 AgriFM (Li et al. 2025, arXiv:2505.21357) is a multi-source temporal foundation
 model: per-modality 3D patch embeds (HLSL30 / Sentinel-2 / MODIS) feeding ONE shared
@@ -11,13 +11,13 @@ compiled mmcv is needed. We pair it with the S2 patch embed (a single 3D conv) a
 load the matching weights straight from ``AgriFM.pth``.
 
 Architecture is read directly off the released checkpoint
-(``encoder.S2_patch_emd.{weights,bias}`` + shared ``encoder.backbone.*``):
+(``model.S2_patch_emd.{weights,bias}`` + shared ``model.backbone.*``):
 patch embed = Conv3d(10→128, kernel/stride (4,4,4)); backbone Swin embed_dim=128,
 depths [2,2,18,2], heads [4,8,16,32], window (8,7,7) → 1024-d.
 
 The benchmark stores pixel/field time series, not 256² chips, so each S2 series is
 normalized in AgriFM's band order, resampled to 32 frames, expanded to a constant
-spatial tile, run through the encoder, and globally pooled to ``(N, 1024)``.
+spatial tile, run through the model, and globally pooled to ``(N, 1024)``.
 """
 
 from __future__ import annotations
@@ -106,8 +106,8 @@ class _S2PatchEmbed(nn.Module):
         return F.conv3d(x, self.weights, self.bias, stride=self.patch_size)
 
 
-class _AgriFMS2Encoder(nn.Module):
-    """S2 patch embed + shared Swin backbone → {'encoder_features', 'features_list'}."""
+class _AgriFMS2Model(nn.Module):
+    """S2 patch embed + shared Swin backbone → {'model_features', 'features_list'}."""
 
     def __init__(self, swin_cls):
         super().__init__()
@@ -129,16 +129,16 @@ def _default_load_model(weights_path: str | Path, device: str) -> Any:
     if missing:
         raise ImportError(f"AgriFM needs: {', '.join(missing)}. Run `uv pip install -e .` from the project env.")
 
-    model = _AgriFMS2Encoder(SwinTransformer3D)
+    model = _AgriFMS2Model(SwinTransformer3D)
 
     ck = torch.load(weights, map_location="cpu")
     ck = ck.get("state_dict", ck) if isinstance(ck, dict) else ck
     patch_sd, back_sd = {}, {}
     for k, v in ck.items():
-        if k.startswith("encoder.S2_patch_emd."):
-            patch_sd[k[len("encoder.S2_patch_emd."):]] = v
-        elif k.startswith("encoder.backbone."):
-            back_sd[k[len("encoder.backbone."):]] = v
+        if k.startswith("model.S2_patch_emd."):
+            patch_sd[k[len("model.S2_patch_emd."):]] = v
+        elif k.startswith("model.backbone."):
+            back_sd[k[len("model.backbone."):]] = v
     model.patch_emd.load_state_dict(patch_sd, strict=True)
     miss, unexp = model.backbone.load_state_dict(back_sd, strict=False)
     # buffers (relative_position_index, attn_mask) are recomputed at init and may be absent
@@ -154,8 +154,8 @@ def _default_load_model(weights_path: str | Path, device: str) -> Any:
 
 
 @dataclass
-class AgriFMEncoder:
-    """Frozen AgriFM S2 encoder adapted to benchmark time series."""
+class AgriFMModel:
+    """Frozen AgriFM S2 model adapted to benchmark time series."""
 
     name: str = "agrifm"
     embedding_dim: int = AGRIFM_EMBEDDING_DIM
@@ -212,7 +212,7 @@ class AgriFMEncoder:
             sl = slice(start, start + self.batch_size)
             batch = torch.from_numpy(series[sl]).to(self.device)
             batch = batch[:, :, :, None, None].expand(-1, -1, -1, self.tile_size, self.tile_size).contiguous()
-            features = self._model(batch)["encoder_features"]
+            features = self._model(batch)["model_features"]
             emb = features.mean(dim=tuple(range(2, features.ndim)))
             out.append(torch.nan_to_num(emb).detach().cpu().numpy().astype(np.float32))
         result = np.concatenate(out, axis=0)
@@ -223,7 +223,7 @@ class AgriFMEncoder:
     def encode_dense(self, tile) -> np.ndarray:
         """Encode one PASTIS tile natively and upsample the 2D feature grid."""
         self._ensure_loaded()
-        from dataio.get_input import PASTIS_S2_BANDS
+        from evals.benchmarks.pastis_r import PASTIS_S2_BANDS
 
         columns = {band: index for index, band in enumerate(PASTIS_S2_BANDS)}
         indices = [columns[band] for band in AGRIFM_S2_BANDS]
@@ -233,7 +233,7 @@ class AgriFMEncoder:
             AGRIFM_STD.reshape(1, -1, 1, 1) + 1e-9
         )
         values *= tile.s2_mask[frames, None, None, None]
-        features = self._model(torch.from_numpy(values[None]).to(self.device))["encoder_features"]
+        features = self._model(torch.from_numpy(values[None]).to(self.device))["model_features"]
         features = F.interpolate(features, size=(tile.height, tile.width), mode="bilinear", align_corners=False)
         dense = features[0].permute(1, 2, 0).reshape(-1, features.shape[1])
         return dense[tile.valid.reshape(-1)].cpu().numpy().astype(np.float32)

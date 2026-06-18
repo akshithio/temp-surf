@@ -3,10 +3,10 @@ from __future__ import annotations
 import numpy as np
 
 from dataio.get_input import Benchmark
-from models.agrifm import AgriFMEncoder
-from models.olmoearth import OlmoEarthEncoder
-from models.presto import PrestoEncoder
-from models.tessera import TESSERA_S2_BANDS, TesseraEncoder
+from models.agrifm import AgriFMModel
+from models.olmoearth import OlmoEarthModel
+from models.presto import PrestoModel
+from models.tessera import TESSERA_S2_BANDS, TesseraModel
 from utils import cacheutils
 
 
@@ -15,23 +15,23 @@ class FakePrestoModel:
 
 
 def test_presto_is_registered_without_loading_external_weights() -> None:
-    enc = cacheutils.build_encoder("presto", load_model=lambda weights_path: FakePrestoModel())
+    mod = cacheutils.build_model("presto", load_model=lambda weights_path: FakePrestoModel())
 
-    assert isinstance(enc, PrestoEncoder)
+    assert isinstance(mod, PrestoModel)
 
 
 def test_model_pool_wrappers_are_registered_without_loading_external_weights() -> None:
-    assert AgriFMEncoder.name == "agrifm"
-    assert TesseraEncoder.name == "tessera"
-    assert cacheutils.ENCODERS["agrifm"] == ("models.agrifm", "AgriFMEncoder")
-    assert cacheutils.ENCODERS["tessera"] == ("models.tessera", "TesseraEncoder")
+    assert AgriFMModel.name == "agrifm"
+    assert TesseraModel.name == "tessera"
+    assert cacheutils.MODELS["agrifm"] == ("models.agrifm", "AgriFMModel")
+    assert cacheutils.MODELS["tessera"] == ("models.tessera", "TesseraModel")
 
 
 def _benchmark() -> Benchmark:
     n, t = 2, 12
     return Benchmark(
         name="test",
-        task="binary",
+        label_kind="binary",
         s2=np.arange(n * t * 11, dtype=np.float32).reshape(n, t, 11) + 1000,
         s1=np.full((n, t, 2), -12.0, dtype=np.float32),
         climate=np.zeros((n, t, 0), dtype=np.float32),
@@ -50,8 +50,8 @@ def _benchmark() -> Benchmark:
 
 
 def test_tessera_uses_v11_band_order_and_buckets_only_valid_observations() -> None:
-    encoder = TesseraEncoder()
-    groups = encoder._prepare_streams(_benchmark())
+    model = TesseraModel()
+    groups = model._prepare_streams(_benchmark())
 
     assert TESSERA_S2_BANDS == ["B4", "B2", "B3", "B8", "B8A", "B5", "B6", "B7", "B11", "B12"]
     assert set(groups) == {(16, 16), (8, 8)}
@@ -64,7 +64,7 @@ def test_olmoearth_builds_one_timestamp_and_mask_per_observation(monkeypatch) ->
             def __init__(self, value):
                 self.value = value
 
-        ONLINE_ENCODER = _Value(0)
+        ONLINE_MODEL = _Value(0)
         MISSING = _Value(3)
 
     class Modality:
@@ -90,7 +90,7 @@ def test_olmoearth_builds_one_timestamp_and_mask_per_observation(monkeypatch) ->
         "olmoearth_pretrain.data.normalize",
         types.SimpleNamespace(Normalizer=Normalizer, Strategy=Strategy),
     )
-    images, masks, timestamps = OlmoEarthEncoder()._bench_to_olmoearth(_benchmark())
+    images, masks, timestamps = OlmoEarthModel()._bench_to_olmoearth(_benchmark())
 
     assert images.shape == (2, 1, 1, 12, 12)
     assert masks.shape == (2, 1, 1, 12, 1)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from methods.dfr import Dfr
-from methods.grit import Grit, projection_from_diffs, view_drop_diffs
+from methods.grit import Grit, projection_from_diffs
 from methods.tent import Tent
 
 
@@ -18,14 +18,14 @@ def test_dfr_subset_balances_strata() -> None:
     assert strata == {(0, "a"), (0, "b"), (1, "a"), (1, "b")}
 
 
-def test_method_variants_match_task_families() -> None:
+def test_method_variants_match_label_kinds() -> None:
     from methods import dfr, grit, tent
 
     assert dfr.variants("regression") == {}
     assert tent.variants("regression") == {}
     assert "tent" in tent.variants("binary")
     assert "dfr" in dfr.variants("multiclass")
-    assert "grit_viewdrop_r4" in grit.variants("regression")
+    assert len(grit.variants("regression")) == 0
 
 
 def test_projection_from_diffs() -> None:
@@ -56,17 +56,6 @@ def test_grit_conditional_projection() -> None:
     assert abs(out[0, 0]) < 1e-5
     assert abs(out[0, 1] - 3.0) < 1e-5
 
-
-def test_view_drop_diffs_requires_aligned_shapes() -> None:
-    x = np.zeros((3, 2), dtype=np.float32)
-    x_bad = np.zeros((4, 2), dtype=np.float32)
-
-    try:
-        view_drop_diffs(x, x_bad, max_pairs=8, seed=0)
-    except ValueError as exc:
-        assert "same samples" in str(exc)
-    else:
-        raise AssertionError("view_drop_diffs should reject shape mismatch")
 
 
 def test_tent_records_target_features() -> None:

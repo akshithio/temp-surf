@@ -1,13 +1,9 @@
-"""Task-agnostic evaluation protocol: constants, condition filtering, sweep orchestration.
-
-This module re-exports everything from ``protocol.{splits,probes}`` so that
-existing callers (``from evals import evals as EV``) continue to work.
+"""Benchmark-agnostic evaluation protocol: constants, sweep orchestration.
 
 Scope:
-  * shared protocol constants (holdouts, conditions, budgets, metrics)
-  * condition filtering by robustness axis (``filter_conditions_by_axes``)
+  * shared protocol constants (holdouts, budgets, metrics)
   * budget-sweep orchestration (``_sweep_budgets``, ``_sweep_target_budgets``)
-  * per-task public runners (``run_probes*``)
+  * per-benchmark public runners (``run_probes*``)
 """
 
 from __future__ import annotations
@@ -18,7 +14,7 @@ from typing import Any
 import numpy as np
 from sklearn.model_selection import train_test_split
 
-from evals.protocol.probes import (  # noqa: F401 — re-exported for backward compat
+from evals.probes import (  # noqa: F401
     FeatureTransform,
     _apply,
     best_f1_threshold,
@@ -28,13 +24,14 @@ from evals.protocol.probes import (  # noqa: F401 — re-exported for backward c
     score_binary,
     score_multiclass,
     score_segmentation,
+    score_segmentation_per_tile,
 )
-from evals.protocol.splits import (  # noqa: F401 — re-exported for backward compat
-    make_grouped_holdout_folds,
-    make_splits,
-    make_strict_holdout_splits,
-    subset_indices,
-)
+
+# Split-regime constructors now live with their regimes (evals/regimes/<regime>.py);
+# re-exported here so existing callers (EV.make_splits, ...) keep working.
+from evals.regimes.geographic_ood import make_strict_holdout_splits  # noqa: F401
+from evals.regimes.grouped_ood import make_grouped_holdout_folds  # noqa: F401
+from evals.regimes.random_id import make_splits  # noqa: F401
 from utils import perfutils as perf
 
 for _thread_var in [
@@ -47,90 +44,28 @@ for _thread_var in [
     os.environ.setdefault(_thread_var, "1")
 
 
+def subset_indices(y: np.ndarray, budget: float, seed: int, stratify: bool = True) -> np.ndarray:
+    """Sub-sample of indices for a sparse-label budget.
+
+    Falls back to non-stratified if a class is too small to stratify at
+    the requested budget (expected for multiclass at tiny budgets -- unseen-class
+    drops are part of the EuroCropsML transfer story).
+    """
+    idx = np.arange(len(y))
+    if budget >= 1.0:
+        return idx
+    k = min(len(idx) - 1, max(2, int(round(budget * len(idx)))))
+    strat = y if stratify else None
+    try:
+        sub, _ = train_test_split(idx, train_size=k, random_state=seed, stratify=strat)
+    except ValueError:
+        sub, _ = train_test_split(idx, train_size=k, random_state=seed, stratify=None)
+    return np.sort(sub)
+
+
 # --------------------------------------------------------------------------- #
 # Protocol constants
 # --------------------------------------------------------------------------- #
-
-# CropHarvest crop/non-crop strict-holdout groups: the small, agriculturally
-# meaningful datasets held out one-at-a-time for strict geographic transfer.
-# Each is two-class. (Counts from data labels at setup: togo 1276, ethiopia 830,
-# lem-brazil 800, rwanda 565, togo-eval 306.) LEM Brazil is the known failure
-# case where locally discriminative NIR magnitude does not transfer.
-STRICT_HOLDOUTS: list[str] = [
-    "togo",
-    "ethiopia",
-    "lem-brazil",
-    "rwanda",
-    "togo-eval",
-]
-
-# Structured stress conditions: (name, sensor_off, temporal_drop_fraction).
-# These names are the contract between extraction (src/models/*) and evaluation:
-# encoders emit one embedding matrix per condition name, keyed identically.
-#   sensor_off in {"none", "s2", "s1", "climate"}; temporal_drop in [0, 1).
-CONDITIONS: list[tuple[str, str, float]] = [
-    ("baseline", "none", 0.0),
-    ("sensor_off_s2", "s2", 0.0),
-    ("sensor_off_s1", "s1", 0.0),
-    ("sensor_off_climate", "climate", 0.0),
-    ("temporal_drop_30", "none", 0.3),
-    ("temporal_drop_50", "none", 0.5),
-    ("temporal_drop_70", "none", 0.7),
-    ("s2_off_tdrop50", "s2", 0.5),
-    ("s1_off_tdrop50", "s1", 0.5),
-]
-
-# Which robustness axes each condition exercises. Used by ACTIVE_AXES in main.py
-# to filter conditions at startup. "baseline" is always included.
-CONDITION_AXES: dict[str, set[str]] = {
-    "baseline": set(),
-    "sensor_off_s2": {"sensorial"},
-    "sensor_off_s1": {"sensorial"},
-    "sensor_off_climate": {"sensorial"},
-    "temporal_drop_30": {"temporal"},
-    "temporal_drop_50": {"temporal"},
-    "temporal_drop_70": {"temporal"},
-    "s2_off_tdrop50": {"sensorial", "temporal"},
-    "s1_off_tdrop50": {"sensorial", "temporal"},
-}
-
-
-def filter_conditions_by_axes(
-    conditions: list[tuple[str, str, float]],
-    active_axes: list[str],
-) -> list[tuple[str, str, float]]:
-    """Return only conditions whose axes are a subset of *active_axes*.
-
-    "baseline" (no axes) is always included since it is the unstressed baseline.
-    A compound condition like ``s2_off_tdrop50`` requires both ``sensorial``
-    and ``temporal`` to be active.
-    """
-    axes_set = set(active_axes)
-    return [c for c in conditions if CONDITION_AXES.get(c[0], set()).issubset(axes_set)]
-
-
-# Which robustness axes each split regime exercises. Used by ACTIVE_AXES in main.py
-# to filter split regimes at startup. "random_id" is always included.
-SPLIT_AXES: dict[str, set[str]] = {
-    "random_id": set(),
-    "grouped_ood": {"geographic"},
-    "geographic_ood": {"geographic"},
-}
-
-
-def filter_split_regimes_by_axes(
-    split_regimes: list[str],
-    active_axes: list[str],
-) -> list[str]:
-    """Return only split regimes whose required axes are a subset of *active_axes*.
-
-    ``random_id`` (no axes) is always included since it is the in-distribution
-    baseline. ``grouped_ood`` and ``geographic_ood`` require a ``geographic``
-    robustness axis to be active.
-    """
-    axes_set = set(active_axes)
-    return [r for r in split_regimes if SPLIT_AXES.get(r, set()).issubset(axes_set)]
-
 
 # Sparse-label probe budgets.
 #
@@ -138,12 +73,21 @@ def filter_split_regimes_by_axes(
 #                   Answers: "Does more source-region training data help geographic
 #                   generalization?"
 # TARGET_BUDGETS — absolute count of target-region labels used for training (main
-#                   experiment). 0  = strict geographic holdout (zero-shot transfer);
-#                   5–50 = few-shot target adaptation.
+#                   experiment).
 SOURCE_BUDGETS: list[float] = [0.05, 0.10, 0.25, 1.00]
 TARGET_BUDGETS: list[int] = [5, 10, 25, 50]
 
-# Reported metrics per task family. calibrated_* use a source-validation threshold
+# Sentinel for the in-distribution target upper bound:
+#   Train on 80% of the target region (no source), test on the remaining 20%.
+#   Provides the "how good can we get on this region if trained in-distribution?"
+#   baseline, used to separate transfer loss from inherent regional difficulty.
+TARGET_ID_UPPER_BOUND: int = -1
+
+# Extended target budgets including the strict geographic holdout (0) and the
+# target-ID upper bound (-1).
+ALL_TARGET_BUDGETS: list[int] = [0, *TARGET_BUDGETS, TARGET_ID_UPPER_BOUND]
+
+# Reported metrics per label family. calibrated_* use a source-validation threshold
 # rather than 0.5 -- default-0.5 F1 misrepresents transfer under distribution shift.
 METRICS: list[str] = [
     "f1",
@@ -165,14 +109,13 @@ METRICS_MULTICLASS: list[str] = [
     "accuracy",
     "macro_auc",
 ]
-METRICS_SEGMENTATION: list[str] = ["miou", "pixel_accuracy", "macro_f1", "weighted_f1"]
-
-def condition_names() -> list[str]:
-    return [name for name, _, _ in CONDITIONS]
-
+METRICS_SEGMENTATION: list[str] = [
+    "miou", "pixel_accuracy", "macro_f1", "weighted_f1",
+    "mean_per_tile_miou", "worst_tile_miou", "n_tiles_scored",
+]
 
 # --------------------------------------------------------------------------- #
-# Shared budget sweep + per-task runners
+# Shared budget sweep + per-benchmark runners
 # --------------------------------------------------------------------------- #
 
 def _append_prediction_rows(
@@ -260,7 +203,7 @@ def _sweep_budgets(
     row each.
 
     ``fit_score(x_tr_sub, y_tr_sub, x_test, y_test, probe_seed) -> (scores, extra)``
-    is the only task-specific piece; everything else (transform application,
+    is the only benchmark-specific piece; everything else (transform application,
     budget sub-sampling, metadata, bookkeeping) is shared.
     """
     meta = dict(meta or {})
@@ -276,13 +219,12 @@ def _sweep_budgets(
         identity = {
             "seed": seed,
             "holdout": meta.get("holdout"),
-            "condition": meta.get("condition"),
             "method": meta.get("method"),
             "budget_type": "source",
             "label_budget": budget,
         }
         perf.set_identity(identity)
-        with perf.measure(f"probe.sweep.source/{meta.get('task', '?')}/{meta.get('method', '?')}",
+        with perf.measure(f"probe.sweep.source/{meta.get('benchmark', '?')}/{meta.get('method', '?')}",
                           n_train=len(sub), n_test=len(y_test)):
             result = fit_score(
                 x_train[sub], y_train[sub], x_test, y_test, seed + int(round(budget * 1000)) + 17
@@ -345,6 +287,8 @@ def _sweep_target_budgets(
     """Sweep target-region label budgets (absolute counts).
 
     Budget = 0 → strict geographic holdout (train only on source).
+    Budget = TARGET_ID_UPPER_BOUND → target-ID upper bound (train only on
+    80 % of target, test on remaining 20 %; no source used).
     Budget > 0 → sample that many *target* labels for training, keep the
     remaining target samples for testing.
     """
@@ -359,6 +303,25 @@ def _sweep_target_budgets(
             x_te, y_te = x_target_t, y_target_full
             n_tr = len(x_source_t)
             test_idx = np.arange(len(y_target_full))
+        elif budget == TARGET_ID_UPPER_BOUND:
+            sub_seed = seed + int(round(budget * 1000))
+            n_target = len(y_target_full)
+            train_size = max(1, min(int(n_target * 0.8), n_target - 1))
+            idx = np.arange(n_target)
+            strat = y_target_full if stratify else None
+            try:
+                train_idx, test_idx = train_test_split(
+                    idx, train_size=train_size, random_state=sub_seed, stratify=strat
+                )
+            except ValueError:
+                train_idx, test_idx = train_test_split(
+                    idx, train_size=train_size, random_state=sub_seed, stratify=None
+                )
+            x_tr = x_target_t[train_idx]
+            y_tr = y_target_full[train_idx]
+            x_te = x_target_t[test_idx]
+            y_te = y_target_full[test_idx]
+            n_tr = len(train_idx)
         else:
             sub_seed = seed + int(round(budget * 1000))
             n_target = len(y_target_full)
@@ -383,13 +346,12 @@ def _sweep_target_budgets(
         identity = {
             "seed": seed,
             "holdout": meta.get("holdout"),
-            "condition": meta.get("condition"),
             "method": meta.get("method"),
             "budget_type": "target",
             "label_budget": budget,
         }
         perf.set_identity(identity)
-        with perf.measure(f"probe.sweep.target/{meta.get('task', '?')}/{meta.get('method', '?')}",
+        with perf.measure(f"probe.sweep.target/{meta.get('benchmark', '?')}/{meta.get('method', '?')}",
                           n_train=n_tr, n_test=len(y_te)):
             result = fit_score(x_tr, y_tr, x_te, y_te, sub_seed)
             if len(result) == 3:
@@ -474,14 +436,19 @@ def run_probes_target(
     seed: int,
     *,
     transform: FeatureTransform | None = None,
-    budgets: list[int] = TARGET_BUDGETS,
+    budgets: list[int] = ALL_TARGET_BUDGETS,
     meta: dict[str, Any] | None = None,
     groups_source: np.ndarray | None = None,
     predictions: list[dict[str, Any]] | None = None,
     sample_ids_target: np.ndarray | None = None,
     groups_target: np.ndarray | None = None,
 ) -> None:
-    """Binary calibrated-probe *target-budget* sweep."""
+    """Binary calibrated-probe *target-budget* sweep.
+
+    Includes budgets 0 (strict geographic holdout, train on source only),
+    TARGET_BUDGETS (few-shot target training), and TARGET_ID_UPPER_BOUND
+    (target-ID upper bound, train on 80 % of target only).
+    """
 
     def fit_score(x_tr: np.ndarray, y_tr: np.ndarray, x_te: np.ndarray, y_te: np.ndarray, probe_seed: int):
         clf, threshold, n_fit, n_cal, probe_meta = fit_probe_with_calibration(x_tr, y_tr, probe_seed)
@@ -549,14 +516,19 @@ def run_probes_multiclass_target(
     seed: int,
     *,
     transform: FeatureTransform | None = None,
-    budgets: list[int] = TARGET_BUDGETS,
+    budgets: list[int] = ALL_TARGET_BUDGETS,
     meta: dict[str, Any] | None = None,
     groups_source: np.ndarray | None = None,
     predictions: list[dict[str, Any]] | None = None,
     sample_ids_target: np.ndarray | None = None,
     groups_target: np.ndarray | None = None,
 ) -> None:
-    """Multiclass target-budget sweep."""
+    """Multiclass target-budget sweep.
+
+    Includes budgets 0 (strict geographic holdout, train on source only),
+    TARGET_BUDGETS (few-shot target training), and TARGET_ID_UPPER_BOUND
+    (target-ID upper bound, train on 80 % of target only).
+    """
 
     def fit_score(x_tr: np.ndarray, y_tr: np.ndarray, x_te: np.ndarray, y_te: np.ndarray, probe_seed: int):
         clf, probe_meta = fit_probe_multiclass(x_tr, y_tr, probe_seed)
@@ -587,8 +559,14 @@ def run_probes_segmentation(
     transform: FeatureTransform | None = None,
     budgets: list[float] = SOURCE_BUDGETS,
     meta: dict[str, Any] | None = None,
+    tile_ids_test: np.ndarray | None = None,
 ) -> None:
-    """PASTIS-R linear-probe sweep using folds 1-3/4/5 as train/val/test."""
+    """PASTIS-R linear-probe sweep using folds 1-3/4/5 as train/val/test.
+
+    When ``tile_ids_test`` is provided, per-tile metrics (mean per-tile mIoU,
+    worst-tile mIoU) are computed for the test split in addition to the global
+    scores.
+    """
     meta = dict(meta or {})
     x_train = _apply(transform, x_train)
     x_val = _apply(transform, x_val)
@@ -602,16 +580,19 @@ def run_probes_segmentation(
             ("validation", x_val, y_val),
             ("test", x_test, y_test),
         ):
-            rows.append(
-                {
-                    **meta,
-                    "evaluation_split": split_name,
-                    "budget_type": "source",
-                    "label_budget": budget,
-                    "seed": seed,
-                    "n_train_sub": int(len(sub)),
-                    "n_test": int(len(y_eval)),
-                    **probe_meta,
-                    **score_segmentation(clf, x_eval, y_eval, eval_classes=eval_classes),
-                }
-            )
+            row = {
+                **meta,
+                "evaluation_split": split_name,
+                "budget_type": "source",
+                "label_budget": budget,
+                "seed": seed,
+                "n_train_sub": int(len(sub)),
+                "n_test": int(len(y_eval)),
+                **probe_meta,
+                **score_segmentation(clf, x_eval, y_eval, eval_classes=eval_classes),
+            }
+            if split_name == "test" and tile_ids_test is not None:
+                row.update(
+                    score_segmentation_per_tile(clf, x_eval, y_eval, tile_ids_test, eval_classes=eval_classes)
+                )
+            rows.append(row)

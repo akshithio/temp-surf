@@ -1,10 +1,10 @@
-"""Presto frozen-encoder wrapper.
+"""Presto frozen-model wrapper.
 
 Presto (Tseng et al., "Lightweight, Pre-trained Transformers for Remote Sensing
 Timeseries") is the lightweight pixel-timeseries baseline -- the model WorldCereal
-actually deploys. We use it frozen: degrade a :class:`Benchmark`, run it through
-``PrestoEncoder.encode``, get ``(N, 128)`` embeddings, and feed those to the
-robustness methods + probe like any other encoder.
+actually deploys. We use it frozen: feed a :class:`Benchmark` through
+``PrestoModel.encode``, get ``(N, 128)`` embeddings, and feed those to the
+robustness methods + probe like any other model.
 
 Install through the project environment::
 
@@ -16,7 +16,7 @@ Authoritative input contract (from Presto's single_file_presto.py):
   * ``latlons``      : (B, 2) float, [lat, lon]
   * ``mask``         : (B, T, 17) float, 1 == band missing at that timestep
   * ``month``        : (B,) long start month (0-11), Presto cycles it over T
-  * encoder(..., eval_task=True) -> (B, 128) = norm(mean over time tokens)
+  * model(..., eval_task=True) -> (B, 128) = norm(mean over time tokens)
 
 Our Benchmark provides all 17 bands for CropHarvest (including SRTM ``slope``);
 EuroCropsML has no climate/SRTM modality, so those bands are marked missing there.
@@ -119,7 +119,7 @@ def _doy_to_month(doy: np.ndarray) -> np.ndarray:
 
 
 def _default_load_model(weights_path: str | None) -> Any:
-    """Load a pretrained Presto and return its encoder. Override via PrestoEncoder.load_model."""
+    """Load a pretrained Presto and return its model. Override via PrestoModel.load_model."""
     if Presto is None:
         raise ImportError(
             "Presto is not installed. Install it with:\n"
@@ -133,15 +133,14 @@ def _default_load_model(weights_path: str | None) -> Any:
     model = Presto.construct()
     model.load_state_dict(torch.load(path, map_location="cpu", weights_only=False))
     model.eval()
-    return model.encoder
+    return model.model
 
 
 @dataclass
-class PrestoEncoder:
-    """Frozen Presto encoder: Benchmark -> (N, 128) embeddings.
+class PrestoModel:
+    """Frozen Presto model: Benchmark -> (N, 128) embeddings.
 
-    ``encode`` expects an already-degraded Benchmark (apply ``degrade`` upstream);
-    this class is condition-agnostic, exactly like every other encoder.
+    ``encode`` expects a :class:`Benchmark` instance.
     """
 
     name: str = "presto"
@@ -151,14 +150,14 @@ class PrestoEncoder:
     weights_path: str | None = PRESTO_WEIGHTS_PATH
     normalizer: tuple[np.ndarray, np.ndarray] | None = PRESTO_NORMALIZER
     load_model: Callable[[str | None], Any] = field(default=_default_load_model)
-    _encoder: Any = field(default=None, repr=False)
+    _model: Any = field(default=None, repr=False)
 
     # ---- model loading -----------------------------------------------------
     def _ensure_loaded(self) -> None:
-        if self._encoder is None:
-            self._encoder = self.load_model(self.weights_path)
-            self._encoder.to(self.device)
-            self._encoder.eval()
+        if self._model is None:
+            self._model = self.load_model(self.weights_path)
+            self._model.to(self.device)
+            self._model.eval()
 
     # ---- input assembly (verifiable without Presto) ------------------------
     def to_presto_inputs(
@@ -212,7 +211,7 @@ class PrestoEncoder:
     def compute_macs(self) -> int:
         self._ensure_loaded()
         B, T = 1, 12
-        dev = next(self._encoder.parameters()).device  # dummies must match the model's device
+        dev = next(self._model.parameters()).device  # dummies must match the model's device
         dummy = {
             "x": torch.randn(B, T, PRESTO_NUM_BANDS, device=dev),
             "dynamic_world": torch.full((B, T), DYNAMIC_WORLD_MISSING, dtype=torch.long, device=dev),
@@ -222,17 +221,17 @@ class PrestoEncoder:
             "eval_task": True,
         }
         # thop.profile only passes positional `inputs` to the model; wrap so the forward's
-        # remaining keyword args are supplied while thop still hooks the real encoder modules.
+        # remaining keyword args are supplied while thop still hooks the real model modules.
         rest = {k: v for k, v in dummy.items() if k != "x"}
-        encoder = self._encoder
+        model = self._model
 
         class _MacWrap(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.encoder = encoder
+                self.model = model
 
             def forward(self, x):
-                return self.encoder(x, **rest)
+                return self.model(x, **rest)
 
         macs, _ = thop.profile(_MacWrap(), inputs=(dummy["x"],), verbose=False)
         return int(macs)
@@ -245,7 +244,7 @@ class PrestoEncoder:
         self._ensure_loaded()
         x, mask, dw, latlons, months = self.to_presto_inputs(bench)
         x_t = torch.from_numpy(x).to(self.device).requires_grad_(True)
-        emb = self._encoder(
+        emb = self._model(
             x=x_t,
             dynamic_world=torch.from_numpy(dw).to(self.device),
             latlons=torch.from_numpy(latlons).to(self.device),
@@ -265,7 +264,7 @@ class PrestoEncoder:
         out: list[np.ndarray] = []
         for start in range(0, n, self.batch_size):
             sl = slice(start, start + self.batch_size)
-            emb = self._encoder(
+            emb = self._model(
                 x=torch.from_numpy(x[sl]).to(self.device),
                 dynamic_world=torch.from_numpy(dw[sl]).to(self.device),
                 latlons=torch.from_numpy(latlons[sl]).to(self.device),

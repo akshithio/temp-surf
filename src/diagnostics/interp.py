@@ -1,7 +1,7 @@
-"""Feature-importance diagnostics for frozen encoder runs.
+"""Feature-importance diagnostics for frozen model runs.
 
 This module is deliberately config-free. Callers pass the benchmark subset,
-encoder/probe objects, metric function, and metadata explicitly, then write the
+model/probe objects, metric function, and metadata explicitly, then write the
 returned rows to the single flat output table.
 """
 
@@ -36,14 +36,13 @@ class AttributionBatch:
 
 
 OUTPUT_COLUMNS = [
-    "encoder",
-    "task",
+    "model",
+    "benchmark",
     "benchmark",
     "seed",
     "split_regime",
     "holdout",
     "condition",
-    "train_regime",
     "importance_method",
     "perturbation",
     "modality",
@@ -85,9 +84,9 @@ def _band_group(modality: str, band: str) -> str:
 
 
 def specs_for(channels: list[tuple[str, str]]) -> list[BandSpec]:
-    """BandSpec list for an encoder's input-tensor channels, given (modality, band) in order.
+    """BandSpec list for an model's input-tensor channels, given (modality, band) in order.
 
-    Encoders can feed bands in their own order/layout, so each ``forward_for_attribution`` builds its own specs that align with its
+    Models can feed bands in their own order/layout, so each ``forward_for_attribution`` builds its own specs that align with its
     tensor's channel axis -- not ``band_specs(bench)`` (which is in benchmark order).
     """
     return [BandSpec(m, b, i, _band_group(m, b)) for i, (m, b) in enumerate(channels)]
@@ -186,7 +185,7 @@ def _normalize_and_rank(rows: list[dict[str, Any]]) -> None:
 
 
 def permutation_importance(
-    encoder: Any,
+    model: Any,
     probe: Any,
     bench: Any,
     y: np.ndarray,
@@ -203,7 +202,7 @@ def permutation_importance(
     specs = list(specs or band_specs(bench))
     meta = dict(metadata or {})
     y = np.asarray(y)
-    baseline = baseline_embeddings if baseline_embeddings is not None else encoder.encode(bench)
+    baseline = baseline_embeddings if baseline_embeddings is not None else model.encode(bench)
     baseline_score = _score_value(score_fn(probe, baseline, y))
     baseline_prob = _prob_mean(probe, baseline)
 
@@ -211,7 +210,7 @@ def permutation_importance(
     for repeat in range(repeats):
         for spec in specs:
             perturbed = perturb_band(bench, spec, mode=mode, seed=seed + repeat * 1009 + spec.index)
-            x_pert = encoder.encode(perturbed)
+            x_pert = model.encode(perturbed)
             pert_score = _score_value(score_fn(probe, x_pert, y))
             pert_prob = _prob_mean(probe, x_pert)
             delta_score = baseline_score - pert_score
@@ -281,7 +280,7 @@ def gradient_input_importance(
     bench: Any,
     metadata: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Compute gradient × input saliency rows for a frozen encoder + fitted linear probe."""
+    """Compute gradient × input saliency rows for a frozen model + fitted linear probe."""
     meta = dict(metadata or {})
     raw = attribution_fn(bench)
     batch = raw if isinstance(raw, AttributionBatch) else AttributionBatch(*raw)

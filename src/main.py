@@ -1,15 +1,15 @@
 """Orchestrator for the frozen-embedding robustness pipeline.
 
-    task spec -> get_input -> degrade -> encode (frozen) -> cache
-              -> {ERM, ACTIVE_METHODS} -> task probe -> tables
+    benchmark spec -> get_input -> encode (frozen) -> cache
+                  -> {ERM, ACTIVE_METHODS} -> probe -> tables
 
 Edit the config block below, then::
 
     cd src && python main.py                 # single process
-    cd src && python utils/gputils.py        # split (encoder, task) work across all GPUs
+    cd src && python utils/gputils.py        # split (model, benchmark) work across all GPUs
 
-Everything is resumable: assembled benchmarks are pickle-cached, encoder embeddings
-are cached per condition (atomic writes), and probe results are appended to a
+Everything is resumable: assembled benchmarks are pickle-cached, model embeddings
+are cached (atomic writes), and probe results are appended to a
 JSON-lines log as each cell completes. Re-running skips all finished work, so a
 crash only loses the in-flight cell.
 """
@@ -23,6 +23,7 @@ from typing import Any
 import numpy as np
 from joblib import Parallel, delayed
 
+from evals import compat
 from evals import evals as EV
 from utils import (
     cacheutils,
@@ -34,17 +35,12 @@ from utils import (
 )
 
 # === Configuration ===========================================================
-ACTIVE_ENCODERS = ["presto", "olmoearth", "galileo", "agrifm", "tessera"]
-TASKS = ["bin-crop-class", "crop-class", "pastis-crop-seg"]
-ACTIVE_AXES = ["geographic"]  # choose between temporal, sensorial, geographic
+BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis_r"]
 ACTIVE_METHODS = []
+SPLIT_REGIMES = ["random_id", "grouped_ood", "geographic_ood", "hybrid_ood", "phenology_ood"]
 
-ACTIVE_CONDITIONS = None  # applicable only if either temporal or sensorial is active
-SPLIT_REGIMES = ["random_id", "grouped_ood", "geographic_ood"]
-GROUPED_FOLDS = 5  # number of random group folds for grouped_ood
-
-MAX_SAMPLES = None  # benchmark samples per task (None = all)
-MAX_DENSE_PIXELS = 50_000  # sampled pixels per PASTIS fold partition and condition
+MAX_SAMPLES = None  # benchmark samples per benchmark (None = all)
+MAX_DENSE_PIXELS = 50_000  # sampled pixels per PASTIS fold partition
 N_JOBS = -1  # cores for the (single-threaded sklearn) probe sweep; -1 = all
 OVERWRITE_MODE = "skip"  # choose between skip, override
 SEEDS = [0, 1]  # random seeds for probe reproducibility
@@ -52,7 +48,7 @@ SEEDS = [0, 1]  # random seeds for probe reproducibility
 
 BENCH_SHUFFLE_SEED = 0  # fixed so cached embeddings stay aligned to the bench row order
 
-# TASK_KIND -> (probe runner, metric list)
+# LABEL_KIND -> (probe runner, metric list)
 DISPATCH = {
     "binary": (EV.run_probes, EV.METRICS_BINARY),
     "multiclass": (EV.run_probes_multiclass, EV.METRICS_MULTICLASS),
@@ -63,8 +59,18 @@ DISPATCH_TARGET = {
 }
 
 
-def load_task(task_name: str):
-    return importlib.import_module(f"evals.tasks.{task_name.replace('-', '_')}")
+def load_benchmark(benchmark_name: str):
+    return importlib.import_module(f"evals.benchmarks.{benchmark_name}")
+
+
+def load_regime(regime_name: str):
+    """Import a split-regime module (evals/regimes/<regime_name>.py).
+
+    Each regime owns both its domain assignment and splitting. The module exposes
+    ``GROUP_KIND``, ``assign_domains(bench)``, ``HAS_TARGET``, and
+    ``iter_splits(y, domains, *, seed, holdouts, n_folds)``.
+    """
+    return importlib.import_module(f"evals.regimes.{regime_name}")
 
 
 def _effective_n_jobs(embeddings: dict[str, np.ndarray]) -> int:
@@ -76,11 +82,16 @@ def _effective_n_jobs(embeddings: dict[str, np.ndarray]) -> int:
     elif requested == 0:
         requested = 1
 
+    # The probe sweep runs with prefer="threads" (see Parallel(...) below), so the embedding
+    # matrix is SHARED across jobs, not copied per job. Only each cell's working set (the
+    # subset view + scaler + fitted probe) grows with thread count, so the old per-process
+    # caps (1 job >2GB, 2 jobs >200MB) were far too conservative -- e.g. they throttled
+    # EuroCropsML's ~360MB embeddings to 2 cores. Only throttle the genuinely huge matrices.
     max_bytes = max(np.asarray(arr).nbytes for arr in embeddings.values())
-    if max_bytes >= 2_000_000_000:
-        return 1
-    if max_bytes >= 200_000_000:
-        return min(requested, 2)
+    if max_bytes >= 4_000_000_000:
+        return min(requested, 4)
+    if max_bytes >= 1_000_000_000:
+        return min(requested, 8)
     return requested
 
 
@@ -89,12 +100,12 @@ def _effective_n_jobs(embeddings: dict[str, np.ndarray]) -> int:
 # --------------------------------------------------------------------------- #
 
 
-def build_methods(task_kind: str, seed: int):
+def build_methods(label_kind: str, seed: int):
     """name -> (cls_or_none, kwargs).  ERM (no transform) is always included."""
     methods: dict[str, tuple[Any, dict]] = {"erm": (None, {})}
     for name in ACTIVE_METHODS:
         mod = importlib.import_module(f"methods.{name}")
-        for vname, base_kwargs in mod.variants(task_kind).items():
+        for vname, base_kwargs in mod.variants(label_kind).items():
             methods[vname] = (getattr(mod, name.title()), {**base_kwargs, "seed": seed})
     return methods
 
@@ -106,8 +117,7 @@ def build_methods(task_kind: str, seed: int):
 
 def _probe_cell(
     probe_fn,
-    emb_train,
-    emb_cond,
+    emb,
     train,
     test,
     y,
@@ -115,31 +125,28 @@ def _probe_cell(
     cls,
     kwargs,
     uses_target,
-    cond_clean,
     meta,
     seed,
 ) -> tuple[list[dict], list[dict]]:
     """Fit the (optional) method transform and run the source-budget-swept probe.
 
-    ``emb_train`` is what the probe trains on: ``emb["baseline"]`` for the
-    deployment-realistic regime, ``emb[condition]`` for the degrade\\degrade regime.
     Self-contained and picklable so joblib can run many cells across cores. Returns
     ``(rows, per_sample_predictions)``.
     """
-    x_tr, x_cond_te = emb_train[train], emb_cond[test]
+    x_tr, x_cond_te = emb[train], emb[test]
     y_tr, y_te, g_tr = y[train], y[test], groups[train]
     mname = meta.get("method", "?")
-    identity = {k: meta[k] for k in ("seed", "holdout", "condition", "method") if k in meta}
+    identity = {k: meta[k] for k in ("seed", "holdout", "method") if k in meta}
     transform = None
     if cls is not None:
-        x_paired = x_cond_te if uses_target else (None if cond_clean else emb_cond[train])
+        x_paired = x_cond_te if uses_target else None
         transform = cls(**kwargs)
         with perf.measure(f"method.fit/{mname}", identity=identity, n_samples=len(train), n_features=x_tr.shape[1]):
             transform.fit(x_tr, y_tr, g_tr, x_paired=x_paired)
     rows: list[dict] = []
     perf.set_identity(identity)
     with perf.measure(
-        f"probe.run/{meta.get('task', '?')}/{mname}",
+        f"probe.run/{meta.get('benchmark', '?')}/{mname}",
         n_samples_train=len(train),
         n_samples_test=len(test),
         n_features=x_tr.shape[1],
@@ -165,8 +172,7 @@ def _probe_cell(
 
 def _probe_cell_target(
     probe_fn,
-    emb_train,
-    emb_cond,
+    emb,
     train,
     test,
     y,
@@ -174,24 +180,20 @@ def _probe_cell_target(
     cls,
     kwargs,
     uses_target,
-    cond_clean,
     meta,
     seed,
 ) -> tuple[list[dict], list[dict]]:
     """Target-budget variant: passes the *full* target pool so the probe runner
     can sample N target labels for few-shot training and use the rest for testing.
-
-    Budget = 0 -> strict geographic holdout (train only on source) = the headline OOD.
-    Budget > 0 -> move that many target samples from test into training.
     """
-    x_source_tr, x_target_full = emb_train[train], emb_cond[test]
+    x_source_tr, x_target_full = emb[train], emb[test]
     y_source_tr, y_target_full = y[train], y[test]
     g_source_tr = groups[train]
     mname = meta.get("method", "?")
-    identity = {k: meta[k] for k in ("seed", "holdout", "condition", "method") if k in meta}
+    identity = {k: meta[k] for k in ("seed", "holdout", "method") if k in meta}
     transform = None
     if cls is not None:
-        x_paired = x_target_full if uses_target else (None if cond_clean else emb_cond[train])
+        x_paired = x_target_full if uses_target else None
         transform = cls(**kwargs)
         with perf.measure(
             f"method.fit/{mname}", identity=identity, n_samples=len(train), n_features=x_source_tr.shape[1]
@@ -200,7 +202,7 @@ def _probe_cell_target(
     rows: list[dict] = []
     perf.set_identity(identity)
     with perf.measure(
-        f"probe.target/{meta.get('task', '?')}/{mname}",
+        f"probe.target/{meta.get('benchmark', '?')}/{mname}",
         n_samples_source=len(train),
         n_samples_target=len(test),
         n_features=x_source_tr.shape[1],
@@ -229,48 +231,38 @@ def _probe_cell_target(
 # --------------------------------------------------------------------------- #
 
 
-def _iter_splits(split_regime, y, groups, holdouts, seed):
-    """Yield (split_label, train_idx, test_idx, has_target) for a split regime.
+def _iter_splits(split_regime, bench, y, holdouts, seed):
+    """Yield split metadata and regime-assigned domain labels.
 
-    has_target marks an OOD split (train/test are different regions) where the
-    few-shot target-budget sweep is meaningful; random_id has no target region.
+    A regime owns the domain basis (for example geography or phenology) and the
+    train/test splitting rule over those domains.
     """
-    if split_regime == "random_id":
-        train, _val, test = EV.make_splits(y, seed)  # ID upper anchor: train+test share regions
-        yield "random_id", train, test, False
-    elif split_regime == "grouped_ood":
-        yield from (
-            (lbl, tr, te, True) for lbl, tr, te in EV.make_grouped_holdout_folds(y, groups, seed, n_folds=GROUPED_FOLDS)
+    regime = load_regime(split_regime)
+    domains = np.asarray(regime.assign_domains(bench), dtype=object)
+    if len(domains) != len(y):
+        raise ValueError(
+            f"{split_regime}.assign_domains returned {len(domains)} domains for {len(y)} labels"
         )
-    elif split_regime == "geographic_ood":
-        for holdout in holdouts:
-            try:
-                train, _val, test, _tv = EV.make_strict_holdout_splits(y, groups, holdout, seed)
-            except ValueError:
-                continue
-            yield holdout, train, test, True
-    else:
-        raise ValueError(f"Unknown split_regime: {split_regime}")
+    for split_label, train, test in regime.iter_splits(y, domains, seed=seed, holdouts=holdouts):
+        yield split_label, train, test, domains, regime.HAS_TARGET, regime.GROUP_KIND
 
 
-def run_segmentation(task_name, encoder_name, conditions, seeds, max_samples, **enc_kwargs) -> None:
+def run_segmentation(benchmark_name, model_name, seeds, max_samples, **enc_kwargs) -> None:
     """Run the fixed PASTIS-R folds without materializing the full release."""
-    task = load_task(task_name)
-    conditions = [condition for condition in conditions if condition[1] != "climate"]
+    bench_mod = load_benchmark(benchmark_name)
     bench_kwargs = dict(max_samples=max_samples, shuffle=True, seed=BENCH_SHUFFLE_SEED)
-    tag = cacheutils.bench_tag(task.BENCHMARK, bench_kwargs)
+    tag = cacheutils.bench_tag(bench_mod.BENCHMARK, bench_kwargs)
     perf.reset()
-    bench = cacheutils.cached_bench(task.BENCHMARK, tag, **bench_kwargs)
-    cache_dirs = cacheutils.extract_dense_and_cache(
+    bench = cacheutils.cached_bench(bench_mod.BENCHMARK, tag, **bench_kwargs)
+    emb_dir = cacheutils.extract_dense_and_cache(
         bench,
-        task.BENCHMARK,
-        encoder_name,
+        bench_mod.BENCHMARK,
+        model_name,
         tag,
-        conditions,
         overwrite=OVERWRITE_MODE,
         **enc_kwargs,
     )
-    results_dir = cacheutils.OUTPUT_DIR / "results" / encoder_name / task_name
+    results_dir = cacheutils.OUTPUT_DIR / "results" / model_name / benchmark_name
     rows_path = results_dir / "probe_results.jsonl"
     if OVERWRITE_MODE == "override":
         for path in (rows_path, results_dir / "probe_results.csv", results_dir / "summary.csv"):
@@ -278,68 +270,57 @@ def run_segmentation(task_name, encoder_name, conditions, seeds, max_samples, **
                 path.unlink()
     rows = IOU.read_jsonl(rows_path)
     done = {
-        (r.get("seed"), r.get("condition"), r.get("train_regime"), r.get("method"))
+        (r.get("seed"), r.get("method"))
         for r in rows
     }
     for seed in seeds:
-        for method_name, (cls, kwargs) in build_methods(task.TASK_KIND, seed).items():
-            for condition, _sensor_off, _temporal_drop in conditions:
-                train_regimes = ["clean\\degrade"] if condition == "baseline" else [
-                    "clean\\degrade",
-                    "degrade\\degrade",
-                ]
-                for train_regime in train_regimes:
-                    key = (seed, condition, train_regime, method_name)
-                    if key in done:
-                        continue
-                    train_condition = "baseline" if train_regime == "clean\\degrade" else condition
-                    x_train, y_train, groups_train = cacheutils.load_dense_samples(
-                        cache_dirs[train_condition], task.TRAIN_FOLDS, MAX_DENSE_PIXELS, seed
-                    )
-                    x_val, y_val, _ = cacheutils.load_dense_samples(
-                        cache_dirs[condition], task.VAL_FOLDS, MAX_DENSE_PIXELS, seed + 10_000
-                    )
-                    x_test, y_test, _ = cacheutils.load_dense_samples(
-                        cache_dirs[condition], task.TEST_FOLDS, MAX_DENSE_PIXELS, seed + 20_000
-                    )
-                    transform = None
-                    if cls is not None:
-                        transform = cls(**kwargs)
-                        paired = x_test if getattr(cls, "USES_TARGET", False) else None
-                        transform.fit(x_train, y_train, groups_train, x_paired=paired)
-                    cell_rows: list[dict] = []
-                    EV.run_probes_segmentation(
-                        cell_rows,
-                        x_train,
-                        x_val,
-                        x_test,
-                        y_train,
-                        y_val,
-                        y_test,
-                        seed,
-                        transform=transform,
-                        meta={
-                            "encoder": encoder_name,
-                            "benchmark": task.BENCHMARK,
-                            "task": task_name,
-                            "method": method_name,
-                            "split_regime": "official_folds",
-                            "holdout": "fold_5",
-                            "condition": condition,
-                            "train_regime": train_regime,
-                        },
-                    )
-                    IOU.append_jsonl(rows_path, cell_rows)
-                    rows.extend(cell_rows)
+        for method_name, (cls, kwargs) in build_methods(bench_mod.LABEL_KIND, seed).items():
+            key = (seed, method_name)
+            if key in done:
+                continue
+            x_train, y_train, groups_train, _ = cacheutils.load_dense_samples(
+                emb_dir, bench_mod.TRAIN_FOLDS, MAX_DENSE_PIXELS, seed
+            )
+            x_val, y_val, _, _ = cacheutils.load_dense_samples(
+                emb_dir, bench_mod.VAL_FOLDS, MAX_DENSE_PIXELS, seed + 10_000
+            )
+            x_test, y_test, _, tile_ids_test = cacheutils.load_dense_samples(
+                emb_dir, bench_mod.TEST_FOLDS, MAX_DENSE_PIXELS, seed + 20_000
+            )
+            transform = None
+            if cls is not None:
+                transform = cls(**kwargs)
+                paired = x_test if getattr(cls, "USES_TARGET", False) else None
+                transform.fit(x_train, y_train, groups_train, x_paired=paired)
+            cell_rows: list[dict] = []
+            EV.run_probes_segmentation(
+                cell_rows,
+                x_train,
+                x_val,
+                x_test,
+                y_train,
+                y_val,
+                y_test,
+                seed,
+                transform=transform,
+                meta={
+                    "model": model_name,
+                    "benchmark": bench_mod.BENCHMARK,
+                    "method": method_name,
+                    "split_regime": "official_folds",
+                    "holdout": "fold_5",
+                },
+                tile_ids_test=tile_ids_test,
+            )
+            IOU.append_jsonl(rows_path, cell_rows)
+            rows.extend(cell_rows)
     IOU.write_csv(results_dir / "probe_results.csv", rows)
     summary = IOU.summarize_rows(
         rows,
         keys=[
-            "encoder",
+            "model",
             "method",
             "evaluation_split",
-            "train_regime",
-            "condition",
             "budget_type",
             "label_budget",
         ],
@@ -349,26 +330,25 @@ def run_segmentation(task_name, encoder_name, conditions, seeds, max_samples, **
     perf.write_log(results_dir / "perf.jsonl")
 
 
-def run(task_name, encoder_name, conditions, seeds, max_samples, split_regimes, **enc_kwargs) -> None:
-    task = load_task(task_name)
-    if task.TASK_KIND == "segmentation":
-        run_segmentation(task_name, encoder_name, conditions, seeds, max_samples, **enc_kwargs)
+def run(benchmark_name, model_name, seeds, max_samples, split_regimes, **enc_kwargs) -> None:
+    bench_mod = load_benchmark(benchmark_name)
+    if bench_mod.LABEL_KIND == "segmentation":
+        run_segmentation(benchmark_name, model_name, seeds, max_samples, **enc_kwargs)
         return
-    probe_fn_src, metrics = DISPATCH[task.TASK_KIND]
-    probe_fn_tgt, _ = DISPATCH_TARGET[task.TASK_KIND]
-    holdouts = task.HOLDOUTS or EV.STRICT_HOLDOUTS
+    probe_fn_src, metrics = DISPATCH[bench_mod.LABEL_KIND]
+    probe_fn_tgt, _ = DISPATCH_TARGET[bench_mod.LABEL_KIND]
+    holdouts = bench_mod.HOLDOUTS
 
     bench_kwargs = dict(max_samples=max_samples, shuffle=True, seed=BENCH_SHUFFLE_SEED)
-    tag = cacheutils.bench_tag(task.BENCHMARK, bench_kwargs)
+    tag = cacheutils.bench_tag(bench_mod.BENCHMARK, bench_kwargs)
     perf.reset()
-    bench = cacheutils.cached_bench(task.BENCHMARK, tag, **bench_kwargs)
-    y, groups = task.make_targets(bench)
+    bench = cacheutils.cached_bench(bench_mod.BENCHMARK, tag, **bench_kwargs)
+    y, _native_groups = bench_mod.make_targets(bench)
     emb = cacheutils.extract_and_cache(
-        bench, task.BENCHMARK, encoder_name, tag, conditions, overwrite=OVERWRITE_MODE, **enc_kwargs
+        bench, bench_mod.BENCHMARK, model_name, tag, overwrite=OVERWRITE_MODE, **enc_kwargs
     )
-    cond_names = [c[0] for c in conditions]
 
-    results_dir = cacheutils.OUTPUT_DIR / "results" / encoder_name / task_name
+    results_dir = cacheutils.OUTPUT_DIR / "results" / model_name / benchmark_name
     rows_path = results_dir / "probe_results.jsonl"
     preds_path = results_dir / "predictions.jsonl"
 
@@ -384,14 +364,11 @@ def run(task_name, encoder_name, conditions, seeds, max_samples, split_regimes, 
                 p.unlink()
 
     rows = IOU.read_jsonl(rows_path)
-    # Resume key: every dimension that defines a cell. (split_regime + train_regime are new.)
     done = {
         (
             r.get("seed"),
             r.get("split_regime"),
             r.get("holdout"),
-            r.get("condition"),
-            r.get("train_regime"),
             r.get("method"),
             r.get("budget_type"),
         )
@@ -404,69 +381,56 @@ def run(task_name, encoder_name, conditions, seeds, max_samples, split_regimes, 
         return getattr(cls, "USES_TARGET", False)
 
     for seed in seeds:
-        for mname, (cls, kwargs) in build_methods(task.TASK_KIND, seed).items():
+        for mname, (cls, kwargs) in build_methods(bench_mod.LABEL_KIND, seed).items():
             for split_regime in split_regimes:
-                for split_label, train, test, has_target in _iter_splits(split_regime, y, groups, holdouts, seed):
-                    for cond in cond_names:
-                        # train_regime: "clean\degrade" = deployment-realistic (train on clean source);
-                        # "degrade\degrade" = oracle (train on the SAME degradation as test).
-                        # For baseline condition the two coincide, so only emit "clean\degrade".
-                        train_regimes = (
-                            ["clean\\degrade"] if cond == "baseline" else ["clean\\degrade", "degrade\\degrade"]
+                for split_label, train, test, groups, has_target, domain_basis in _iter_splits(
+                    split_regime, bench, y, holdouts, seed
+                ):
+                    meta = {
+                        "model": model_name,
+                        "benchmark": bench_mod.BENCHMARK,
+                        "method": mname,
+                        "split_regime": split_regime,
+                        "domain_basis": domain_basis,
+                        "holdout": split_label,
+                    }
+                    # ---- Target-budget sweep ----
+                    if (
+                        has_target
+                        and (seed, split_regime, split_label, mname, "target") not in done
+                    ):
+                        jobs.append(
+                            delayed(_probe_cell_target)(
+                                probe_fn_tgt,
+                                emb,
+                                train,
+                                test,
+                                y,
+                                groups,
+                                cls,
+                                kwargs,
+                                uses_target_flag(cls),
+                                {**meta, "budget_type": "target"},
+                                seed,
+                            )
                         )
-                        for train_regime in train_regimes:
-                            emb_train = emb["baseline"] if train_regime == "clean\\degrade" else emb[cond]
-                            meta = {
-                                "encoder": encoder_name,
-                                "benchmark": task.BENCHMARK,
-                                "task": task_name,
-                                "method": mname,
-                                "split_regime": split_regime,
-                                "holdout": split_label,
-                                "condition": cond,
-                                "train_regime": train_regime,
-                            }
-                            # ---- Target-budget sweep (deployment headline at budget 0) ----
-                            if (
-                                has_target
-                                and (seed, split_regime, split_label, cond, train_regime, mname, "target") not in done
-                            ):
-                                jobs.append(
-                                    delayed(_probe_cell_target)(
-                                        probe_fn_tgt,
-                                        emb_train,
-                                        emb[cond],
-                                        train,
-                                        test,
-                                        y,
-                                        groups,
-                                        cls,
-                                        kwargs,
-                                        uses_target_flag(cls),
-                                        cond == "baseline",
-                                        {**meta, "budget_type": "target"},
-                                        seed,
-                                    )
-                                )
-                            # ---- Source-fraction sweep (ID anchor for random_id; secondary diagnostic for OOD) ----
-                            if (seed, split_regime, split_label, cond, train_regime, mname, "source") not in done:
-                                jobs.append(
-                                    delayed(_probe_cell)(
-                                        probe_fn_src,
-                                        emb_train,
-                                        emb[cond],
-                                        train,
-                                        test,
-                                        y,
-                                        groups,
-                                        cls,
-                                        kwargs,
-                                        uses_target_flag(cls),
-                                        cond == "baseline",
-                                        {**meta, "budget_type": "source"},
-                                        seed,
-                                    )
-                                )
+                    # ---- Source-fraction sweep ----
+                    if (seed, split_regime, split_label, mname, "source") not in done:
+                        jobs.append(
+                            delayed(_probe_cell)(
+                                probe_fn_src,
+                                emb,
+                                train,
+                                test,
+                                y,
+                                groups,
+                                cls,
+                                kwargs,
+                                uses_target_flag(cls),
+                                {**meta, "budget_type": "source"},
+                                seed,
+                            )
+                        )
 
     if jobs:
         n_jobs = _effective_n_jobs(emb)
@@ -480,13 +444,14 @@ def run(task_name, encoder_name, conditions, seeds, max_samples, split_regimes, 
     IOU.write_csv(results_dir / "probe_results.csv", rows)
     summary = IOU.summarize_rows(
         rows,
-        keys=["encoder", "method", "split_regime", "train_regime", "condition", "budget_type", "label_budget"],
+        keys=["model", "method", "split_regime", "budget_type", "label_budget"],
         metrics=metrics,
     )
     IOU.write_csv(results_dir / "summary.csv", summary)
 
-    # Geographic drop: delta = metric(random_id, baseline) - metric(geographic_ood, baseline, target=0)
-    # with relative + floor-normalized drop, a region×seed CI, and a per-sample CI from predictions.
+    # Delta table: ID (random_id, source=1.0) minus OOD (geographic_ood, target=0),
+    # plus grouped_ood and hybrid_ood secondary anchors, WILDS-style inherent-difficulty
+    # decomposition (when target=-1 rows exist), and worst-region metrics.
     deltas = IOU.compute_deltas(rows, metrics, predictions=IOU.read_jsonl(preds_path))
     IOU.write_csv(results_dir / "deltas.csv", deltas)
 
@@ -496,55 +461,25 @@ def run(task_name, encoder_name, conditions, seeds, max_samples, split_regimes, 
 
 
 if __name__ == "__main__":
-    # "baseline" always runs as the unstressed baseline
-    conditions: list[tuple[str, str, float]] = [("baseline", "none", 0.0)]
+    enc_kwargs = {"device": gputils.device()}
 
-    # Build pool of stress conditions filtered by ACTIVE_AXES
-    stress_pool = [c for c in EV.filter_conditions_by_axes(EV.CONDITIONS, ACTIVE_AXES) if c[0] != "baseline"]
-
-    # ACTIVE_CONDITIONS controls which stress conditions to add:
-    #   None → all stress conditions within ACTIVE_AXES
-    #   []   → no stress (baseline only)
-    #   [...] → explicit subset of stress conditions
-    if ACTIVE_CONDITIONS is None:
-        conditions.extend(stress_pool)
-    elif ACTIVE_CONDITIONS:
-        cond_map = {c[0]: c for c in stress_pool}
-        unknown = set(ACTIVE_CONDITIONS) - cond_map.keys()
-        if unknown:
-            raise ValueError(
-                f"Unknown stress conditions: {sorted(unknown)}. "
-                f"Available within ACTIVE_AXES={ACTIVE_AXES}: {list(cond_map)}"
-            )
-        conditions.extend(cond_map[n] for n in ACTIVE_CONDITIONS)
-    # else ACTIVE_CONDITIONS == []: just baseline, already set
-
-    # Filter split regimes by ACTIVE_AXES (which robustness dimensions are active)
-    split_regimes = EV.filter_split_regimes_by_axes(SPLIT_REGIMES, ACTIVE_AXES)
-    if not split_regimes:
-        raise ValueError(
-            f"ACTIVE_AXES={ACTIVE_AXES} leaves no split regimes enabled. "
-            f"Available: random_id (always), grouped_ood (needs 'geographic'), "
-            f"geographic_ood (needs 'geographic')."
-        )
-
-    enc_kwargs = {"device": gputils.device()}  # the one GPU this shard sees (or cpu)
-
-    # (encoder, task) is the unit of work; gputils keeps just this shard's slice.
-    work = gputils.take_shard([(enc, tsk) for enc in ACTIVE_ENCODERS for tsk in TASKS])
+    # The compatibility matrix (evals/compat.py) decides which models run on each
+    # benchmark; we only specify BENCHMARKS. Each pair is one unit of work.
+    all_pairs = [(mod, bm) for bm in BENCHMARKS for mod in compat.eligible_models(bm)]
+    work = gputils.take_shard(all_pairs)
     shard, nshards = gputils.shard_indices()
-    for enc, tsk in work:
-        print(f"\n========== [shard {shard}/{nshards}] {enc} / {tsk} ==========", flush=True)
-        print(f"  split_regimes={split_regimes}  conditions={[c[0] for c in conditions]}", flush=True)
+    for mod, bm in work:
+        print(f"\n========== [shard {shard}/{nshards}] {mod} / {bm} ==========", flush=True)
+        print(f"  split_regimes={SPLIT_REGIMES}", flush=True)
         try:
-            run(tsk, enc, conditions, SEEDS, MAX_SAMPLES, split_regimes, **enc_kwargs)
-        except NotImplementedError as exc:  # known (encoder, task) incompatibility -> clean skip, no traceback
-            print(f"   [shard {shard}] {enc}/{tsk} skipped: {exc}", flush=True)
-        except Exception as exc:  # isolate each pair: a missing weight / bad encoder skips just that pair
+            run(bm, mod, SEEDS, MAX_SAMPLES, SPLIT_REGIMES, **enc_kwargs)
+        except NotImplementedError as exc:
+            print(f"   [shard {shard}] {mod}/{bm} skipped: {exc}", flush=True)
+        except Exception as exc:
             import traceback
 
             print(
-                f"!! [shard {shard}] {enc}/{tsk} FAILED: {type(exc).__name__}: {exc} (skipping; re-run to resume)",
+                f"!! [shard {shard}] {mod}/{bm} FAILED: {type(exc).__name__}: {exc} (skipping; re-run to resume)",
                 flush=True,
             )
             traceback.print_exc()
