@@ -1,23 +1,12 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 
 from evals import evals as EV
-
-
-def test_filter_conditions_by_axes() -> None:
-    conditions = [
-        ("baseline", "none", 0.0),
-        ("sensor_off_s2", "s2", 0.0),
-        ("temporal_drop_50", "none", 0.5),
-        ("s2_off_tdrop50", "s2", 0.5),
-    ]
-
-    sensorial = EV.filter_conditions_by_axes(conditions, ["sensorial"])
-    both = EV.filter_conditions_by_axes(conditions, ["sensorial", "temporal"])
-
-    assert [c[0] for c in sensorial] == ["baseline", "sensor_off_s2"]
-    assert [c[0] for c in both] == ["baseline", "sensor_off_s2", "temporal_drop_50", "s2_off_tdrop50"]
+from evals.regimes import phenology_ood
+from evals.regimes.base import phenology_domains
 
 
 def test_make_strict_holdout_splits() -> None:
@@ -55,6 +44,41 @@ def test_subset_indices() -> None:
     np.testing.assert_array_equal(full, np.arange(len(y)))
 
 
+def test_phenology_domains_use_ndvi_peak_timing_and_low_amplitude() -> None:
+    bench = SimpleNamespace(
+        name="toy",
+        s2=np.array(
+            [
+                [[0.1], [0.8], [0.2], [0.1]],  # early peak
+                [[0.1], [0.2], [0.3], [0.8]],  # late peak
+                [[0.4], [0.4], [0.4], [0.4]],  # low amplitude
+            ],
+            dtype=np.float32,
+        ),
+        s2_mask=np.ones((3, 4), dtype=np.float32),
+        s2_bands=["NDVI"],
+    )
+
+    domains = phenology_domains(bench)
+
+    np.testing.assert_array_equal(
+        domains,
+        np.array(["phenology_early_peak", "phenology_late_peak", "phenology_low_amplitude"], dtype=object),
+    )
+
+
+def test_phenology_ood_splits_by_assigned_domains() -> None:
+    y = np.array([0, 1, 0, 1, 0, 1])
+    domains = np.array(["early", "early", "mid", "mid", "late", "late"], dtype=object)
+
+    splits = list(phenology_ood.iter_splits(y, domains, seed=0))
+
+    assert {label for label, _train, _test in splits} == {"early", "mid", "late"}
+    for label, train, test in splits:
+        assert set(domains[test]) == {label}
+        assert set(train).isdisjoint(test)
+
+
 def test_expected_calibration_error() -> None:
     y = np.array([0, 0, 1, 1])
     prob = np.array([0.0, 0.0, 1.0, 1.0])
@@ -80,7 +104,7 @@ def test_binary_probe_writes_predictions_for_each_source_budget() -> None:
         y_test,
         seed=0,
         budgets=[0.5, 1.0],
-        meta={"encoder": "e", "task": "t", "method": "erm", "split_regime": "random_id", "condition": "baseline"},
+        meta={"model": "e", "benchmark": "t", "method": "erm", "split_regime": "random_id"},
         predictions=preds,
         sample_ids_test=np.arange(100, 106),
         groups_test=np.array(["g"] * 6),
@@ -111,7 +135,7 @@ def test_multiclass_probe_writes_prediction_vectors() -> None:
         y_test,
         seed=0,
         budgets=[1.0],
-        meta={"encoder": "e", "task": "t", "method": "erm", "split_regime": "random_id", "condition": "baseline"},
+        meta={"model": "e", "benchmark": "t", "method": "erm", "split_regime": "random_id"},
         predictions=preds,
         sample_ids_test=np.arange(200, 206),
         groups_test=np.array(["g"] * 6),
@@ -144,7 +168,7 @@ def test_segmentation_probe_reports_official_validation_and_test_splits() -> Non
         y_test,
         seed=0,
         budgets=[1.0],
-        meta={"task": "pastis-crop-seg"},
+        meta={"benchmark": "pastis_r"},
     )
 
     assert {row["evaluation_split"] for row in rows} == {"validation", "test"}

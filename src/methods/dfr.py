@@ -45,5 +45,5 @@ class Dfr:
         return np.sort(selected.astype(np.int64))
 
 
-def variants(task_kind: str) -> dict[str, dict]:
-    return {} if task_kind == "regression" else {"dfr": {}}
+def variants(label_kind: str) -> dict[str, dict]:
+    return {} if label_kind == "regression" else {"dfr": {}}

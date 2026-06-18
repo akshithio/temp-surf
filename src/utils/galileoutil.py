@@ -17,7 +17,7 @@ from torch.jit import Final
 
 # constants
 CONFIG_FILENAME = "config.json"
-ENCODER_FILENAME = "encoder.pt"
+MODEL_FILENAME = "model.pt"
 BASE_GSD = 10
 
 # band information
@@ -593,7 +593,7 @@ class GalileoBase(nn.Module):
         return s_t_x + s_t_embed, sp_x + sp_embed, t_x + t_embed, st_x + st_embed
 
 
-class Encoder(GalileoBase):
+class GalileoNativeModel(GalileoBase):
     cross_attn = False
 
     def __init__(
@@ -768,17 +768,17 @@ class Encoder(GalileoBase):
     def load_from_folder(cls, folder: Path, device: torch.device):
         if not (folder / CONFIG_FILENAME).exists():
             raise ValueError(f"Expected {CONFIG_FILENAME} in {folder}")
-        if not (folder / ENCODER_FILENAME).exists():
-            raise ValueError(f"Expected {ENCODER_FILENAME} in {folder}")
+        if not (folder / MODEL_FILENAME).exists():
+            raise ValueError(f"Expected {MODEL_FILENAME} in {folder}")
 
         with (folder / CONFIG_FILENAME).open("r") as f:
             config = json.load(f)
             model_config = config["model"]
-            encoder_config = model_config["encoder"]
-        encoder = cls(**encoder_config)
+            model_config = model_config["model"]
+        model = cls(**model_config)
 
-        state_dict = torch.load(folder / ENCODER_FILENAME, map_location=device)
+        state_dict = torch.load(folder / MODEL_FILENAME, map_location=device)
         for key in list(state_dict.keys()):
             state_dict[key.replace(".backbone", "")] = state_dict.pop(key)
-        encoder.load_state_dict(state_dict)
-        return encoder
+        model.load_state_dict(state_dict)
+        return model

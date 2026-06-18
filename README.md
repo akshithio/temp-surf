@@ -2,40 +2,42 @@
 
 Given an existing Earth-observation foundation model, how do you make it reliably
 deployable in a new agricultural region, with few or zero target-region labels,
-without retraining encoder weights? This repository treats EO encoders as frozen:
-the encoder is run once per condition, embeddings are cached, and every adaptation
+without retraining model weights? This repository treats EO models as frozen:
+the model is run once, embeddings are cached, and every adaptation
 method or probe operates on those cached matrices.
 
 > **Central contribution.** Establish a deployment-realistic evaluation framework
-> for geographic, sensorial, and temporal robustness in frozen agricultural EO
-> encoders, then measure whether post-hoc adaptation recovers a meaningful fraction
-> of the transfer gap without modifying encoder weights.
+> for geographic robustness in frozen agricultural EO models, then measure
+> whether post-hoc adaptation recovers a meaningful fraction of the transfer gap
+> without modifying model weights.
 
 ---
 
 ## Current Scope
 
-- **Robustness axis:** geographic transfer through strict holdouts.
-- **Tasks:** classification on CropHarvest and EuroCropsML, plus crop-type
-  segmentation on PASTIS-R.
-- **Encoders:** Presto, OlmoEarth v1.1-Base, Galileo v1 Base, AgriFM, and TESSERA v1.1.
+- **Robustness axis:** deployment-style domain transfer through geographic and
+  phenology-based holdouts.
+- **Benchmarks:** binary crop/non-crop (CropHarvest), multiclass crop-type
+  (EuroCropsML, BreizhCrops), and semantic segmentation (PASTIS-R).
+- **Models:** Presto, OlmoEarth v1.1-Base, Galileo v1 Base, AgriFM, and TESSERA v1.1.
 - **Adaptation:** ERM baseline plus optional post-hoc feature transforms.
 
-Success for this pass means a clean, reproducible geographic-holdout classification
-baseline with cached frozen embeddings and complete probe outputs. Additional encoders
-and tasks should be added only after their benchmark-input to model-input contracts are
+Success for this pass means clean, reproducible domain-holdout baselines with
+cached frozen embeddings and complete probe outputs. Additional models,
+benchmarks, and domain bases should be added only after their input contracts are
 explicitly designed and tested.
 
 ---
 
 ## Evaluation Protocol
 
-Every experiment cell is defined by the cross product of encoder, task, seed, input
-condition, train regime, split regime, method, and label budget.
+Every experiment cell is defined by the cross product of model, benchmark, seed,
+split regime (which determines the number of actual train/test splits), method,
+and label budget. Each split produces one probe fit per budget level.
 
-**Encoders**
+**Models**
 
-| Encoder | Embedding dim | Input | Status |
+| Model | Embedding dim | Input | Status |
 |---|---:|---|---|
 | Presto | 128 | S1+S2+ERA5/SRTM pixel time series | active |
 | OlmoEarth v1.1-Base | 768 | S2 L2A spatial chips (H,W,T,12) | active |
@@ -43,13 +45,14 @@ condition, train regime, split regime, method, and label budget.
 | AgriFM | 1024 | S2 time series adapted to the S2 branch | active |
 | TESSERA v1.1 | 128 | S1+S2 time series | active |
 
-**Tasks**
+**Benchmarks**
 
-| Task | Benchmark | Kind | Holdouts | Metric family | Label source |
+| Benchmark | Name | Kind | Holdouts | Metric family | Label source |
 |---|---|---|---|---|---|
-| `bin-crop-class` | CropHarvest | binary crop/non-crop | togo, ethiopia, lem-brazil, rwanda, togo-eval | F1, AUROC, calibrated F1, ECE, Brier, NLL, balanced accuracy | real `is_crop` |
-| `crop-class` | EuroCropsML | multiclass crop type | Estonia | macro/weighted F1, balanced accuracy, accuracy, macro AUC | real crop type |
-| `pastis-crop-seg` | PASTIS-R | semantic segmentation | official folds 1-3/4/5 | mIoU, pixel accuracy, macro/weighted F1 | per-pixel crop type |
+| `cropharvest` | CropHarvest | binary crop/non-crop | togo, ethiopia, lem-brazil, rwanda, togo-eval | F1, AUROC, calibrated F1, ECE, Brier, NLL, balanced accuracy | real `is_crop` |
+| `eurocropsml` | EuroCropsML | multiclass crop type | Estonia | macro/weighted F1, balanced accuracy, accuracy, macro AUC | real crop type |
+| `breizhcrops` | BreizhCrops | multiclass crop type | frh04 | macro/weighted F1, balanced accuracy, accuracy, macro AUC | real crop type |
+| `pastis` | PASTIS-R | semantic segmentation | official folds 1-3/4/5 | mIoU, pixel accuracy, macro/weighted F1 | per-pixel crop type |
 
 PASTIS-R is streamed lazily as four 64x64 tiles per source patch. S2 and
 ascending-orbit S1 observations are monthly aggregated. Class 19 (void) is
@@ -57,47 +60,65 @@ removed, while background class 0 remains part of the evaluation. OlmoEarth,
 Galileo, and AgriFM use their native spatial feature grids; Presto and TESSERA
 encode bounded pixel batches. Dense tile caches are resumable.
 
+**Model × benchmark compatibility**
+
+Not every model runs meaningfully on every benchmark. Each `(benchmark, model)`
+cell carries two independent grades — **precedent** (how strongly the literature
+sanctions the baseline) and **adaptation** (how far the wrapper bends the model's
+native input). The matrix is the single source of truth in
+[`src/evals/compat.py`](src/evals/compat.py): you specify only `BENCHMARKS`, and
+the runner reads off which models run on each.
+
+| Model | CropHarvest | EuroCropsML | BreizhCrops | PASTIS-R |
+|---|:--:|:--:|:--:|:--:|
+| Presto | 📄 | 🔗 | ⚠️ | 🆕 🚧 |
+| TESSERA | 🔗 🔴 | 🔗 🚧 | 🔗 🚧 | 📄 |
+| AgriFM | 🆕 🔴 | 🆕 🔴 | 🆕 🔴 | 🔗 |
+| OlmoEarth | 📄 | 🔗 | 📄 | 📄 |
+| Galileo | 📄 | 🔗 | 📄 | 📄 |
+
+*Precedent:* 📄 own paper, this exact benchmark · 🔗 own paper, equivalent benchmark
+· ⚠️ third-party run only · 🆕 no precedent. *Adaptation:* (none) native input · 🚧
+minor/defensible · 🔴 severe (off-distribution input or no native pathway).
+
+A pair is **eligible to run iff its adaptation is not severe** (🔴 excluded — the
+number would misrepresent the model). Eligibility per benchmark (✅ runs, rank in
+parens; ❌ skipped):
+
+| Model | CropHarvest | EuroCropsML | BreizhCrops | PASTIS-R |
+|---|:--:|:--:|:--:|:--:|
+| Presto | ✅ (1) | ✅ (4) | ✅ (3) | ✅ (8) |
+| TESSERA | ❌ (10) | ✅ (6) | ✅ (6) | ✅ (1) |
+| AgriFM | ❌ (12) | ❌ (12) | ❌ (12) | ✅ (4) |
+| OlmoEarth | ✅ (1) | ✅ (4) | ✅ (1) | ✅ (1) |
+| Galileo | ✅ (1) | ✅ (4) | ✅ (1) | ✅ (1) |
+
+Every benchmark clears ≥3 eligible models. The full grade rationale and the rank
+table live in the design doc's *A Compatibility Matrix*.
+
 **Split regimes**
 
-| Regime | Description | Controlled by |
-|---|---|---|
-| `random_id` | Random stratified 80/20 split. Train and test share regions. | always available |
-| `grouped_ood` | Groups samples by region, randomly assigns regions to folds, holds each fold out. | `"geographic"` |
-| `geographic_ood` | Curated leave-one-region-out deployment split. | `"geographic"` |
+Each regime owns both its domain assignment and splitting logic in its own file
+under [`src/evals/regimes/`](src/evals/regimes/) (named exactly after the
+regime). A regime first assigns each sample to a domain basis, then decides how
+those domains become train/test splits:
 
-**Conditions**
-
-| Condition | Sensor off | Temporal drop | Robustness axis |
+| Regime | Domain basis | Splits per benchmark | Description |
 |---|---|---:|---|
-| `baseline` | none | 0% | — |
-| `sensor_off_s2` | S2 | 0% | sensorial |
-| `sensor_off_s1` | S1 | 0% | sensorial |
-| `sensor_off_climate` | ERA5/SRTM | 0% | sensorial |
-| `temporal_drop_30` | none | 30% | temporal |
-| `temporal_drop_50` | none | 50% | temporal |
-| `temporal_drop_70` | none | 70% | temporal |
-| `s2_off_tdrop50` | S2 | 50% | sensorial + temporal |
-| `s1_off_tdrop50` | S1 | 50% | sensorial + temporal |
-
-`baseline` is always present. Stress conditions run only when their axis is active.
-
-**Train regimes**
-
-| Regime | Meaning |
-|---|---|
-| `clean\degrade` | Train the probe on clean-source embeddings, test on this condition's embeddings. |
-| `degrade\degrade` | Train and test on the same degraded condition. |
-
-`baseline` emits only `clean\degrade`, because the two regimes coincide.
+| `random_id` | geography | 1 | Random stratified 80/10/10 split. Train and test share regions/domains (in-distribution upper bound). |
+| `grouped_ood` | geography | ≤5 folds | Assigns geographic domains to random folds, then holds each fold out in turn. |
+| `geographic_ood` | geography | 1 / ≤5 holdouts | Strict leave-region/source-out. CropHarvest: curated holdouts (togo, ethiopia, lem-brazil, rwanda, togo-eval). EuroCropsML: Estonia. BreizhCrops: frh04. |
+| `hybrid_ood` | geography | ≤5 holdouts × source folds | Geographic holdout × source group-folds: for each target region, train on different random subsets of the source regions and always test on the full target. |
+| `phenology_ood` | NDVI phenology | ≤4 practical domains | Assigns domains from loaded NDVI behavior (`low_amplitude`, `early_peak`, `mid_peak`, `late_peak`) and holds each phenology domain out in turn. |
 
 **Budget types**
 
 | Type | Levels | Meaning |
 |---|---|---|
-| Target budgets | `[0, 5, 10, 25, 50]` | Absolute count of target-region labels added to OOD training. |
-| Source budgets | `[0.01, 0.05, 0.10, 0.25, 1.00]` | Fraction of source training data used. |
+| Target budgets | `[5, 10, 25, 50]` | Absolute count of target-region labels added to OOD training. |
+| Source budgets | `[0.05, 0.10, 0.25, 1.00]` | Fraction of source training data used. |
 
-Each budget level fits a calibrated logistic-regression probe and scores the task
+Each budget level fits a calibrated logistic-regression probe and scores the
 metrics on the test set.
 
 ---
@@ -109,11 +130,7 @@ metrics on the test set.
   Presto's monthly cadence, but it is not the official variable-length EuroCropsML
   leaderboard protocol.
 - **EuroCropsML preprocessed inputs are S2-only.** Missing S1 and climate channels are
-  masked for Presto on that task, so sensor-off conditions for absent modalities should
-  be interpreted as no-signal controls rather than real modality ablations.
-- **Sensor and temporal stress currently act on the shared benchmark arrays.** Future
-  encoders with different native inputs need their own tested degradation layer before
-  they are added to the active registry.
+  masked for Presto on that benchmark.
 
 ---
 
@@ -137,12 +154,14 @@ new methods target observed failure modes rather than adding decorative comparis
 ```text
 .
 ├── src/
-│   ├── main.py              # orchestrator: task -> encode/cache -> methods -> tables
+│   ├── main.py              # orchestrator: benchmark -> encode/cache -> methods -> tables
 │   ├── dataio/get_input.py  # Benchmark loader + shared degradation protocol
-│   ├── models/              # active frozen encoder wrappers
+│   ├── models/              # active frozen model wrappers
 │   ├── evals/
-│   │   ├── evals.py         # splits, probes, budget sweeps
-│   │   └── tasks/           # per-task label + metric specs
+│   │   ├── evals.py         # probes, budget sweeps, shared protocol constants
+│   │   ├── compat.py        # model × benchmark matrix -> which models run per benchmark
+│   │   ├── regimes/         # one file per regime; each owns domain assignment + splitting
+│   │   └── benchmarks/      # per-benchmark label + metric specs
 │   ├── methods/             # post-hoc feature transforms
 │   └── utils/
 │       ├── cacheutils.py    # content-keyed benchmark and embedding cache
@@ -153,8 +172,8 @@ new methods target observed failure modes rather than adding decorative comparis
 │   ├── input/               # staged benchmarks + model artifacts
 │   ├── cache/               # generated benchmark caches
 │   └── output/
-│       ├── embeddings/<bench>/<encoder>/<signature>/<condition>.npy
-│       └── results/<encoder>/<task>/
+│       ├── embeddings/<bench>/<model>/<signature>/baseline.npy
+│       └── results/<model>/<benchmark>/
 └── notebooks/
 ```
 
@@ -176,7 +195,7 @@ data/input/models/presto/model-f317d103.pth
 data/input/models/olmoearth-v1_1-base/
 data/input/models/agrifm/AgriFM.pth
 data/input/models/agrifm/source/
-data/input/models/tessera/tessera_v1_1_mpc_encoder.pt
+data/input/models/tessera/tessera_v1_1_mpc_model.pt
 ```
 
 ---
@@ -208,7 +227,7 @@ environment. The import-time dependencies needed by this repository are listed
 directly in `pyproject.toml`.
 
 OlmoEarth v1.1 requires PyTorch 2.7.1. The project pins PyTorch 2.7.1 and
-torchvision 0.22.1 for every encoder rather than maintaining a second model-specific
+torchvision 0.22.1 for every model rather than maintaining a second model-specific
 environment. `uv.lock` pins the current upstream `olmoearth_pretrain` source because
 the PyPI 0.1.0 release predates v1.1's linear patch embed. The model's `config.json` and `weights.pth` are downloaded from
 `allenai/OlmoEarth-v1_1-Base` on first use into `data/input/models/olmoearth-v1_1-base/`.
@@ -258,7 +277,7 @@ GPU smoke tests on cranberry use fixed in-file configuration:
 
 ```bash
 cd src
-python tests/smoke_encoders.py
+python tests/smoke_models.py
 python tests/smoke_pastis.py
 ```
 
@@ -268,29 +287,30 @@ Edit the config block at the top of `src/main.py`, then run:
 python src/main.py
 ```
 
-Recommended core-scope configuration:
+Recommended core-scope configuration (you list only the benchmarks; the
+compatibility matrix decides which models run on each):
 
 ```python
-ACTIVE_ENCODERS = ["presto", "olmoearth", "galileo", "agrifm", "tessera"]
-TASKS = ["bin-crop-class", "crop-class", "pastis-crop-seg"]
-ACTIVE_AXES = ["geographic"]
+BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis_r"]
 ACTIVE_METHODS = []
+SPLIT_REGIMES = ["random_id", "grouped_ood", "geographic_ood", "hybrid_ood", "phenology_ood"]
 SEEDS = [0, 1]
 ```
 
 Configuration reference:
 
 ```python
-ACTIVE_ENCODERS = ["presto", "olmoearth", "galileo", "agrifm", "tessera"]
-TASKS = ["bin-crop-class", "crop-class", "pastis-crop-seg"]
-ACTIVE_AXES = ["geographic"]  # [] = clean random_id only; add sensorial/temporal for stress
+BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis_r"]
 ACTIVE_METHODS = []           # [] = ERM baseline only
-ACTIVE_CONDITIONS = None      # None = all conditions allowed by ACTIVE_AXES
+SPLIT_REGIMES = ["random_id", "grouped_ood", "geographic_ood", "hybrid_ood", "phenology_ood"]
 MAX_SAMPLES = None            # None = all samples
 MAX_DENSE_PIXELS = 50_000     # sampled PASTIS pixels per fold partition
 SEEDS = [0, 1]
 OVERWRITE_MODE = "skip"       # "skip" resumes; "override" reruns cached outputs
 ```
+
+There is no model list to configure: `src/evals/compat.py` is the single source
+of truth for which models are eligible per benchmark.
 
 The default Presto checkpoint path is:
 
@@ -301,10 +321,10 @@ data/input/models/presto/model-f317d103.pth
 If it is missing, the wrapper downloads `torchgeo/presto`'s `model-f317d103.pth` into
 that path.
 
-TESSERA uses the encoder-only v1.1 MPC checkpoint:
+TESSERA uses the model-only v1.1 MPC checkpoint:
 
 ```text
-data/input/models/tessera/tessera_v1_1_mpc_encoder.pt
+data/input/models/tessera/tessera_v1_1_mpc_model.pt
 ```
 
 Download it from the [official TESSERA v1.1 release](https://drive.google.com/file/d/1t-gfTxi3Hg_uJXpJ9etROCRgKt2myfJ2/view).
@@ -312,19 +332,20 @@ The wrapper uses the checkpoint's 192-dimensional model and retains the released
 128-dimensional downstream prefix. Its S2 band order and MPC normalization constants
 match the official v1.1 inference code.
 
-### Holdouts By Task
+### Holdouts By Benchmark
 
-| Task | Available holdouts |
+| Benchmark | Available holdouts |
 |---|---|
-| `bin-crop-class` | `togo`, `ethiopia`, `lem-brazil`, `rwanda`, `togo-eval` |
-| `crop-class` | `Estonia` |
+| `cropharvest` | `togo`, `ethiopia`, `lem-brazil`, `rwanda`, `togo-eval` |
+| `eurocropsml` | `Estonia` |
+| `breizhcrops` | `frh04` |
 
 ### Parallelism And Resumption
 
 Everything is cache-backed and resumable:
 
 - Assembled benchmarks are pickle-cached under `data/cache/benchmark/`.
-- Encoder embeddings are cached per `(benchmark, encoder, benchmark signature, condition)`
+- Model embeddings are cached per `(benchmark, model, benchmark signature)`
   with atomic writes.
 - Probe results append to `probe_results.jsonl`; per-sample predictions append to
   `predictions.jsonl` for every probe cell.
@@ -373,11 +394,9 @@ using the sshfs mount. Override the remote location with `REMOTE_SCRATCH=...` or
 
 ### Cache Invalidation
 
-Cache keys are content-aware:
+Deleting generated cache is safe since cache keys are content-aware and `data/input/` is the only source of truth. 
 
 | Cache | Key includes | Rebuilds when you change |
 |---|---|---|
 | `data/cache/benchmark/<bench>__<tag>.pkl` | benchmark params, `get_input.py` hash, input-data fingerprint | loader code or staged benchmark inputs |
-| `data/output/embeddings/<bench>/<encoder>/<signature>/<condition>.npy` | benchmark identity and encoder source hash | benchmark inputs or encoder code |
-
-Deleting generated cache is safe; `data/input/` is the only source of truth.
+| `data/output/embeddings/<bench>/<model>/<signature>/baseline.npy` | benchmark identity and model source hash | benchmark inputs or model code |

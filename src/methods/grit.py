@@ -1,7 +1,7 @@
 """GRIT (a.k.a. ECMP): spurious-subspace projection on frozen embeddings.
 
 Adapted from inouye-lab/GRIT (``solver/ecmp.py``). The method is a closed-form
-feature projection -- no encoder training. Given counterfactual pairs (same
+feature projection -- no model training. Given counterfactual pairs (same
 label, differing only in a nuisance attribute), the top singular directions of
 their differences span the nuisance subspace; we project embeddings onto its
 orthogonal complement before the downstream probe::
@@ -12,7 +12,7 @@ orthogonal complement before the downstream probe::
 
 This is a drop-in ``FeatureTransform`` for ``evals.run_probes(transform=...)``:
 fit on the training pool, then ``transform`` is applied identically to train and
-test embeddings before the calibrated probe. The encoder is never touched.
+test embeddings before the calibrated probe. The model is never touched.
 
 Two flavors of "nuisance", set by ``matching``:
 
@@ -20,10 +20,6 @@ Two flavors of "nuisance", set by ``matching``:
   *different groups* (CropHarvest dataset / EuroCropsML country). The removed
   subspace is geographic spurious structure. This mirrors the GRIT paper's
   conditional and nearest-neighbour matching, with "domain" = our ``groups``.
-* missingness ("view_drop"): pairs are clean vs degraded (sensor-off /
-  temporal-drop) views of the *same* sample. The removed subspace is the
-  distribution shift induced by missing inputs. This flavor is specific to the
-  multimodal-EO robustness setting and has no analogue in the original paper.
 
 EO caveat: ``rank`` is the key knob -- removing too many directions deletes real
 agronomic signal. Sweep it (e.g. {1,2,4,6,8}) and report transfer vs rank.
@@ -38,7 +34,7 @@ from sklearn.neighbors import NearestNeighbors
 
 from utils import perfutils as perf
 
-MATCHINGS = ("conditional", "nearest", "view_drop")
+MATCHINGS = ("conditional", "nearest")
 
 
 def conditional_diffs(
@@ -111,21 +107,6 @@ def nearest_diffs(
     return diffs_arr
 
 
-def view_drop_diffs(
-    emb_clean: np.ndarray,
-    emb_degraded: np.ndarray,
-    max_pairs: int,
-    seed: int,
-) -> np.ndarray:
-    """Clean-vs-degraded-view differences of the same samples (missingness flavor)."""
-    if emb_clean.shape != emb_degraded.shape:
-        raise ValueError("view_drop requires clean and degraded embeddings of the same samples.")
-    diffs = (emb_clean - emb_degraded).astype(np.float32)
-    if max_pairs and len(diffs) > max_pairs:
-        sel = np.random.default_rng(seed).choice(len(diffs), size=max_pairs, replace=False)
-        diffs = diffs[sel]
-    return diffs
-
 
 def projection_from_diffs(diffs: np.ndarray, rank: int) -> np.ndarray:
     """P = I - U Uᵀ where U spans the top-`rank` directions of the pair differences."""
@@ -167,7 +148,6 @@ class Grit:
         x: np.ndarray,
         y: np.ndarray | None = None,
         groups: np.ndarray | None = None,
-        x_paired: np.ndarray | None = None,
     ) -> Grit:
         x = np.asarray(x, dtype=np.float32)
         if self.standardize:
@@ -175,18 +155,10 @@ class Grit:
             self._std = x.std(axis=0)
             self._std[self._std == 0] = 1.0
         xb = self._scale(x)
-
-        if self.matching == "view_drop":
-            if x_paired is None:
-                dim = x.shape[1]
-                self._proj = np.eye(dim, dtype=np.float32)
-                return self
-            diffs = view_drop_diffs(xb, self._scale(np.asarray(x_paired, np.float32)), self.max_pairs, self.seed)
-        else:
-            if y is None or groups is None:
-                raise ValueError(f"matching={self.matching!r} requires y and groups.")
-            builder = conditional_diffs if self.matching == "conditional" else nearest_diffs
-            diffs = builder(xb, np.asarray(y), np.asarray(groups, dtype=object), self.max_pairs, self.seed)
+        if y is None or groups is None:
+            raise ValueError(f"matching={self.matching!r} requires y and groups.")
+        builder = conditional_diffs if self.matching == "conditional" else nearest_diffs
+        diffs = builder(xb, np.asarray(y), np.asarray(groups, dtype=object), self.max_pairs, self.seed)
 
         with perf.measure("method.fit/grit", rank=self.rank, matching=self.matching, n_pairs=len(diffs), dim=diffs.shape[1]):
             self._proj = projection_from_diffs(diffs, self.rank)
@@ -198,11 +170,10 @@ class Grit:
         return (self._scale(np.asarray(x, dtype=np.float32)) @ self._proj).astype(np.float32)
 
 
-def variants(task_kind: str) -> dict[str, dict]:
+def variants(label_kind: str) -> dict[str, dict]:
     v: dict[str, dict] = {}
-    if task_kind != "regression":
+    if label_kind != "regression":
         for r in (1, 2, 4, 8):
             v[f"grit_conditional_r{r}"] = {"matching": "conditional", "rank": r}
         v["grit_nearest_r4"] = {"matching": "nearest", "rank": 4}
-    v["grit_viewdrop_r4"] = {"matching": "view_drop", "rank": 4}
     return v

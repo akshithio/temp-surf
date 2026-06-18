@@ -1,9 +1,9 @@
-"""Galileo v1 (NASA Harvest) frozen-encoder wrapper.
+"""Galileo v1 (NASA Harvest) frozen-model wrapper.
 
 Galileo is a family of multimodal Vision Transformer models pretrained on Earth
 observation data (S2, S1, ERA5, SRTM, etc.). We use the **Base** variant (768-dim,
-12-layer encoder) frozen: construct a Galileo MaskedOutput from a Benchmark,
-run ``encoder.forward(...)``, pool the tokens, and get ``(N, 768)`` embeddings.
+12-layer model) frozen: construct a Galileo MaskedOutput from a Benchmark,
+run ``model.forward(...)``, pool the tokens, and get ``(N, 768)`` embeddings.
 
 Installation
 ------------
@@ -34,9 +34,7 @@ from utils.galileoutil import (
     STATIC_BANDS,
     TIME_BAND_GROUPS_IDX,
     TIME_BANDS,
-)
-from utils.galileoutil import (
-    Encoder as GalileoNativeEncoder,
+    GalileoNativeModel,
 )
 
 if TYPE_CHECKING:
@@ -129,9 +127,9 @@ _BENCH_TO_GALILEO_ST_IDX: dict[str, int] = {
 
 
 def _default_load_model(weights_path: str | Path | None, model_size: str) -> Any:
-    """Download Galileo weights from HuggingFace and load the encoder.
+    """Download Galileo weights from HuggingFace and load the model.
 
-    Returns the Galileo ``Encoder`` module (not the full model).
+    Returns the Galileo native model module.
     """
     dim, subdir = GALILEO_VARIANTS[model_size]
     if weights_path is not None:
@@ -139,25 +137,24 @@ def _default_load_model(weights_path: str | Path | None, model_size: str) -> Any
     else:
         p = _INPUT / "models" / "galileo" / model_size
 
-    if not (p / "config.json").exists() or not (p / "encoder.pt").exists():
+    if not (p / "config.json").exists() or not (p / "model.pt").exists():
         from utils.ioutils import hf_download_to
 
         p.mkdir(parents=True, exist_ok=True)
         hf_download_to(GALILEO_HF_REPO, f"{subdir}/config.json", p / "config.json")
-        hf_download_to(GALILEO_HF_REPO, f"{subdir}/encoder.pt", p / "encoder.pt")
+        hf_download_to(GALILEO_HF_REPO, f"{subdir}/model.pt", p / "model.pt")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    encoder = GalileoNativeEncoder.load_from_folder(p, device=torch.device(device))
-    encoder.eval()
-    return encoder
+    model = GalileoNativeModel.load_from_folder(p, device=torch.device(device))
+    model.eval()
+    return model
 
 
 @dataclass
-class GalileoEncoder:
-    """Frozen Galileo encoder: Benchmark -> (N, D) embeddings.
+class GalileoModel:
+    """Frozen Galileo model: Benchmark -> (N, D) embeddings.
 
-    ``encode`` expects an already-degraded Benchmark (apply ``degrade`` upstream);
-    this class is condition-agnostic, exactly like every other encoder.
+    ``encode`` expects a :class:`Benchmark` instance.
     """
 
     name: str = "galileo"
@@ -186,7 +183,7 @@ class GalileoEncoder:
         """Convert a Benchmark to Galileo's expected inputs (numpy).
 
         Fills S1 + S2 + NDVI bands where available; marks unavailable band groups
-        as masked so the encoder ignores them.
+        as masked so the model ignores them.
 
         Returns
         -------
@@ -257,15 +254,15 @@ class GalileoEncoder:
         dummy_static_m = torch.zeros(B, len(STATIC_BAND_GROUPS_IDX), device=dev)
         dummy_months = torch.full((B, T), 6, dtype=torch.long, device=dev)
 
-        encoder = self._model
+        model = self._model
 
         class _MacWrap(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.encoder = encoder
+                self.model = model
 
             def forward(self, st, sp, t, st_x, st_m, sp_m, t_m, st_m2, m):
-                return self.encoder(
+                return self.model(
                     st,
                     sp,
                     t,
@@ -306,7 +303,7 @@ class GalileoEncoder:
 
         for start in range(0, n, self.batch_size):
             sl = slice(start, start + self.batch_size)
-            # Run encoder
+            # Run model
             result = self._model(
                 torch.from_numpy(x_st[sl]).to(self.device),
                 torch.from_numpy(sp_x[sl]).to(self.device),
@@ -321,7 +318,7 @@ class GalileoEncoder:
                 add_layernorm_on_exit=True,
             )
             s_t_x_out, sp_x_out, t_x_out, st_x_out, s_t_m_out, sp_m_out, t_m_out, st_m_out, _ = result
-            pooled = GalileoNativeEncoder.average_tokens(
+            pooled = GalileoNativeModel.average_tokens(
                 s_t_x_out,
                 sp_x_out,
                 t_x_out,
@@ -339,7 +336,7 @@ class GalileoEncoder:
     def encode_dense(self, tile) -> np.ndarray:
         """Return a per-pixel PASTIS feature map from native spatial tokens."""
         self._ensure_loaded()
-        from dataio.get_input import PASTIS_S1_BANDS, PASTIS_S2_BANDS
+        from evals.benchmarks.pastis_r import PASTIS_S1_BANDS, PASTIS_S2_BANDS
 
         height, width, timesteps = tile.height, tile.width, tile.s2.shape[0]
         x = np.zeros((1, height, width, timesteps, len(SPACE_TIME_BANDS)), dtype=np.float32)

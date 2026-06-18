@@ -7,7 +7,7 @@ dimensions, and GPU utilization at every stage.  Use as a context manager::
         ...
 
 Every event is tagged with a thread-local **identity** (seed, holdout,
-condition, method, budget, budget_type) so nested ``perf.measure`` calls
+method, budget, budget_type) so nested ``perf.measure`` calls
 inside fit/score/sweep functions automatically know which cell they belong
 to.  Callers set identity at the sweep boundary::
 
@@ -15,7 +15,7 @@ to.  Callers set identity at the sweep boundary::
     # all nested measure() calls inherit this identity
 
 The logger is thread-safe so parallel probe workers can each record their
-own timings.  All events are accumulated per-(encoder, task) and flushed
+own timings.  All events are accumulated per-(model, benchmark) and flushed
 to a JSONL file at the end of each run.
 """
 

@@ -1,4 +1,4 @@
-"""Single-tile PASTIS-R dense-encoder smoke test."""
+"""Single-tile PASTIS-R dense-model smoke test."""
 
 from __future__ import annotations
 
@@ -22,18 +22,18 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("A CUDA device is required for the PASTIS-R smoke test")
     benchmark = get_input(
-        "pastis",
+        "pastis_r",
         root=cacheutils.INPUT_ROOT,
         max_samples=MAX_PATCHES,
         shuffle=False,
     )
     tile_id, _fold, tile, labels = next(benchmark.iter_tiles())
     for name, expected_dim in EXPECTED_DIMS.items():
-        encoder = cacheutils.build_encoder(name, device="cuda:0")
+        model = cacheutils.build_model(name, device="cuda:0")
         features = (
-            encoder.encode_dense(tile)
-            if hasattr(encoder, "encode_dense")
-            else encoder.encode(tile.pixel_benchmark())
+            model.encode_dense(tile)
+            if hasattr(model, "encode_dense")
+            else model.encode(tile.pixel_benchmark())
         )
         expected_shape = (len(labels), expected_dim)
         if features.shape != expected_shape:

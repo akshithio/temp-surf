@@ -1,7 +1,7 @@
 """Result IO and summary aggregation for experiment runners.
 
 Kept dependency-free (numpy only) so it never imports the eval/method modules:
-the caller passes the metric list to summarize, since this project has three task
+the caller passes the metric list to summarize, since this project has three benchmark
 families (binary, multiclass, regression) with different metrics.
 """
 
@@ -271,10 +271,14 @@ def compute_deltas(
     n_boot_sample: int = 1000,
     seed: int = 0,
 ) -> list[dict[str, Any]]:
-    """ID→OOD drop per metric and per (encoder, task, condition, train_regime, method).
+    """ID→OOD drop per metric and per (model, benchmark, method).
 
     ``id``  = metric on the random-split in-distribution anchor (random_id, source budget 1.0).
     ``ood`` = metric on the curated geographic holdout (geographic_ood, target budget 0).
+    ``target_id`` = metric on the *target-ID upper bound* (geographic_ood, target budget -1):
+      train on 80 % of the target region (no source), test on remaining 20 %.  This
+      separates "this region is intrinsically harder" from "transfer to this region is
+      harder".  Only reported when the underlying row exists.
 
     Reports, per row:
       * ``delta`` = id - ood (deployment gap; higher-better metrics +=drop, error metrics -=worse)
@@ -285,11 +289,16 @@ def compute_deltas(
       * ``delta_sample_ci_lo/hi`` = bootstrap 95% CI over individual test samples (pooled),
         recomputed from ``predictions`` when supplied (within-region precision)
       * ``ood_std/min/max`` = spread across holdout regions; ``grouped_ood`` as a secondary anchor
+      * ``ood_hybrid`` / ``ood_hybrid_std`` / ``ood_hybrid_min`` / ``delta_hybrid`` = hybrid OOD
+        anchor (geographic holdout × source grouped folds): how OOD performance varies with
+        source-region composition
+      * ``target_id`` / ``inherent_difficulty`` / ``adjusted_delta`` / ``adjusted_relative_drop`` /
+        ``adjusted_floor_norm_drop`` = WILDS-style decomposition (see below).
     """
     if isinstance(metrics, str):
         metrics = [metrics]
     rng = np.random.default_rng(seed)
-    keys = ("encoder", "task", "condition", "train_regime", "method")
+    keys = ("model", "benchmark", "method")
 
     def vals(split_regime: str, budget_type: str, budget: float, combo: tuple, metric: str) -> list[float]:
         out: list[float] = []
@@ -344,6 +353,22 @@ def compute_deltas(
                 "n_id": len(id_vals), "n_ood": len(ood_vals),
                 "ood_std": float(np.std(ood_arr)), "ood_min": float(ood_arr.min()), "ood_max": float(ood_arr.max()),
             })
+            # worst-region metric: for each seed, find min across holdouts,
+            # then average over seeds.
+            _seed_holdout: dict[int, list[float]] = {}
+            for r in rows:
+                if (r.get("split_regime") == "geographic_ood" and r.get("budget_type") == "target"
+                        and _close(r.get("label_budget"), 0.0) and metric in r and r[metric] is not None
+                        and all(r.get(k) == combo[i] for i, k in enumerate(keys))):
+                    s = r.get("seed")
+                    if s is not None:
+                        _seed_holdout.setdefault(int(s), []).append(float(r[metric]))
+            if _seed_holdout:
+                seed_worst = np.asarray([min(vs) for vs in _seed_holdout.values()])
+                row.update({
+                    "ood_worst_region": float(np.mean(seed_worst)),
+                    "ood_worst_region_std": float(np.std(seed_worst)) if len(seed_worst) > 1 else float("nan"),
+                })
             # floor-normalized drop: fraction of above-chance ID performance erased OOD
             chance = _chance(metric, pos_rate, n_cls, majority)
             row["chance"] = float(chance) if chance is not None else float("nan")
@@ -362,6 +387,35 @@ def compute_deltas(
             if grouped:
                 row["ood_grouped"] = float(np.mean(grouped))
                 row["delta_grouped"] = idm - float(np.mean(grouped))
+            phenology = vals("phenology_ood", "target", 0.0, combo, metric)
+            if phenology:
+                row["ood_phenology"] = float(np.mean(phenology))
+                row["ood_phenology_std"] = float(np.std(phenology))
+                row["ood_phenology_min"] = float(np.min(phenology))
+                row["delta_phenology"] = idm - float(np.mean(phenology))
+            # --- Hybrid OOD: geographic holdout × source grouped folds ---
+            hybrid = vals("hybrid_ood", "target", 0.0, combo, metric)
+            if hybrid:
+                row["ood_hybrid"] = float(np.mean(hybrid))
+                row["ood_hybrid_std"] = float(np.std(hybrid))
+                row["ood_hybrid_min"] = float(np.min(hybrid))
+                row["delta_hybrid"] = idm - float(np.mean(hybrid))
+            # --- WILDS-style inherent-difficulty decomposition ---
+            # target-ID upper-bound: train on 80% of target (no source),
+            # test on remaining 20%.  Budget sentinel = -1.
+            tid_vals = vals("geographic_ood", "target", -1.0, combo, metric)
+            if tid_vals:
+                tidm = float(np.mean(tid_vals))
+                row.update({
+                    "target_id": tidm,
+                    "inherent_difficulty": idm - tidm,
+                    "adjusted_delta": tidm - oodm,
+                    "adjusted_relative_drop": (tidm - oodm) / idm if idm > 0 else float("nan"),
+                    "adjusted_floor_norm_drop": (
+                        (tidm - oodm) / (idm - chance)
+                        if (chance is not None and (idm - chance) > 1e-9) else float("nan")
+                    ),
+                })
             out_rows.append(row)
     return out_rows
 

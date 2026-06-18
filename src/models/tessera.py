@@ -1,6 +1,6 @@
-"""TESSERA v1.1 frozen encoder for benchmark pixel time series.
+"""TESSERA v1.1 frozen model for benchmark pixel time series.
 
-This wrapper matches the released v1.1 MPC encoder-only checkpoint. TESSERA v1.1
+This wrapper matches the released v1.1 MPC model-only checkpoint. TESSERA v1.1
 uses separate S2 and merged-S1 temporal backbones, produces a 192-dimensional
 representation, and publishes the first 128 dimensions for downstream use.
 """
@@ -48,7 +48,7 @@ OBSERVATION_BUCKETS = tuple(range(8, 257, 8))
 
 _REPO = Path(__file__).resolve().parents[2]
 _INPUT = Path(os.environ.get("ROBUSTNESS_INPUT", _REPO / "data" / "input"))
-DEFAULT_WEIGHTS = _INPUT / "models" / "tessera" / "tessera_v1_1_mpc_encoder.pt"
+DEFAULT_WEIGHTS = _INPUT / "models" / "tessera" / "tessera_v1_1_mpc_model.pt"
 
 
 class CustomGRUCell(nn.Module):
@@ -102,7 +102,7 @@ class CustomTemporalAwarePooling(nn.Module):
         return (weights * x).sum(dim=1)
 
 
-class TemporalPositionalEncoder(nn.Module):
+class TemporalPositionalModel(nn.Module):
     def __init__(self, d_model: int):
         super().__init__()
         self.d_model = d_model
@@ -119,12 +119,12 @@ class TemporalPositionalEncoder(nn.Module):
         return out
 
 
-class TransformerEncoder(nn.Module):
+class TransformerModel(nn.Module):
     def __init__(self, band_num: int):
         super().__init__()
         width = TESSERA_LATENT_DIM * 4
         self.embedding = nn.Sequential(nn.Linear(band_num, width), nn.ReLU(), nn.Linear(width, width))
-        self.temporal_encoder = TemporalPositionalEncoder(width)
+        self.temporal_model = TemporalPositionalModel(width)
         layer = nn.TransformerEncoderLayer(
             d_model=width,
             nhead=4,
@@ -133,21 +133,21 @@ class TransformerEncoder(nn.Module):
             activation="relu",
             batch_first=True,
         )
-        self.transformer_encoder = nn.TransformerEncoder(layer, num_layers=4)
+        self.transformer_model = nn.TransformerEncoder(layer, num_layers=4)
         self.attn_pool = CustomTemporalAwarePooling(width)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bands, doy = x[:, :, :-1], x[:, :, -1]
-        encoded = self.embedding(bands) + self.temporal_encoder(doy)
-        return self.attn_pool(self.transformer_encoder(encoded))
+        encoded = self.embedding(bands) + self.temporal_model(doy)
+        return self.attn_pool(self.transformer_model(encoded))
 
 
 class TesseraV11Model(nn.Module):
     def __init__(self):
         super().__init__()
         width = TESSERA_LATENT_DIM * 4
-        self.s2_backbone = TransformerEncoder(10)
-        self.s1_backbone = TransformerEncoder(2)
+        self.s2_backbone = TransformerModel(10)
+        self.s1_backbone = TransformerModel(2)
         self.dim_reducer = nn.Sequential(
             nn.Linear(width * 2, width * 4),
             nn.LayerNorm(width * 4),
@@ -175,13 +175,13 @@ def _bucket_size(valid_len: int) -> int:
 
 
 @dataclass
-class TesseraEncoder:
-    """Frozen TESSERA v1.1 MPC encoder."""
+class TesseraModel:
+    """Frozen TESSERA v1.1 MPC model."""
 
     name: str = "tessera"
     embedding_dim: int = TESSERA_EMBEDDING_DIM
     weights_path: str | Path | None = None
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"  # align with the other encoders' default
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"  # align with the other models' default
     batch_size: int = 256
     condition_invariant: bool = False
     _model: Any = field(default=None, repr=False)
@@ -193,7 +193,7 @@ class TesseraEncoder:
         if not path.exists():
             raise FileNotFoundError(
                 f"TESSERA v1.1 MPC weights not found at {path}. Download "
-                "tessera_v1_1_mpc_encoder.pt and set TESSERA_WEIGHTS or weights_path."
+                "tessera_v1_1_mpc_model.pt and set TESSERA_WEIGHTS or weights_path."
             )
         model = TesseraV11Model()
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)

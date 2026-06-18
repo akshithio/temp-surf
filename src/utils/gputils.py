@@ -1,6 +1,6 @@
 """GPU work-splitting + launch helpers for ``src/main.py``.
 
-main.py's unit of work is the list of ``(encoder, task)`` pairs. To use both GPUs
+main.py's unit of work is the list of ``(model, benchmark)`` pairs. To use both GPUs
 on digital-ag (2x RTX 3090), run two **sharded** processes: each is pinned to one
 GPU via ``CUDA_VISIBLE_DEVICES`` and handed a disjoint, round-robin subset of the
 pairs. The fan-out launcher does this for you::
@@ -9,12 +9,12 @@ pairs. The fan-out launcher does this for you::
 
 Inside main.py only two hooks are needed (already wired)::
 
-    work = gputils.take_shard(work)   # keep only this process's (encoder, task) pairs
+    work = gputils.take_shard(work)   # keep only this process's (model, benchmark) pairs
     device = gputils.device()         # "cuda" (the one visible GPU) or "cpu"
 
-Because shards are split by (encoder, task) and the embedding cache is written
+Because shards are split by (model, benchmark) and the embedding cache is written
 atomically (tmp + os.replace), two shards that happen to touch the same
-benchmark/encoder cache are safe -- at worst one embedding is computed twice.
+benchmark/model cache are safe -- at worst one embedding is computed twice.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ def gpu_count() -> int:
 
 
 def device() -> str:
-    """The device main.py should hand to encoders: 'cuda' (the one visible GPU) or 'cpu'."""
+    """The device main.py should hand to models: 'cuda' (the one visible GPU) or 'cpu'."""
     if torch is None:
         return "cpu"
     try:
@@ -72,7 +72,7 @@ def fan_out(num_shards: int | None = None) -> int:
     """Launch one sharded ``main.py`` per GPU in parallel; tee per-shard logs.
 
     Each child gets ``CUDA_VISIBLE_DEVICES=i`` (so it sees exactly one GPU as
-    cuda:0) plus the shard env, and runs the disjoint subset of (encoder, task)
+    cuda:0) plus the shard env, and runs the disjoint subset of (model, benchmark)
     pairs. Returns the max child exit code. Falls back to a single process if no
     GPUs are visible.
     """

@@ -1,16 +1,16 @@
-"""OlmoEarth v1.1-Base frozen-encoder wrapper.
+"""OlmoEarth v1.1-Base frozen-model wrapper.
 
 OlmoEarth (Ai2) is a ViT-Base (114M params) Earth observation foundation model
 trained on Sentinel-2 L2A, Sentinel-1, and Landsat spatial chips. We use it
 frozen: construct a :class:`MaskedOlmoEarthSample` from a :class:`Benchmark`,
-run ``model.encoder``, pool the spatial-temporal feature map, and get
+run ``model.model``, pool the spatial-temporal feature map, and get
 ``(N, 768)`` embeddings.
 
 Authoritative input contract (from olmoearth_pretrain docs):
   * ``sentinel2_l2a`` : (B, H, W, T, C=12) float32, band order = OLMOEARTH_S2_BANDS
-  * ``sentinel2_l2a_mask`` : (B, H, W, T, S=1) float32, ONLINE_ENCODER value
+  * ``sentinel2_l2a_mask`` : (B, H, W, T, S=1) float32, ONLINE_MODEL value
   * ``timestamps``   : (B, T, 3) long, [day, month-0-indexed, year]
-  * model.encoder(sample, fast_pass=True, patch_size=4)["tokens_and_masks"].sentinel2_l2a
+  * model.model(sample, fast_pass=True, patch_size=4)["tokens_and_masks"].sentinel2_l2a
     -> (B, H', W', T, S, D=768)
 """
 
@@ -83,7 +83,7 @@ DEFAULT_OLMOEARTH_WEIGHTS = _INPUT / "models" / "olmoearth-v1_1-base"
 def _default_load_model(weights_path: str | Path | None = None) -> Any:
     """Load the full OlmoEarth v1.1-Base model from Hugging Face.
 
-    Returns the full model (encoder + decoder).  Callers access ``model.encoder``.
+    Returns the full model (model + decoder).  Callers access ``model.model``.
     """
     from huggingface_hub import snapshot_download
     from olmoearth_pretrain.model_loader import load_model_from_path
@@ -103,11 +103,10 @@ def _default_load_model(weights_path: str | Path | None = None) -> Any:
 
 
 @dataclass
-class OlmoEarthEncoder:
-    """Frozen OlmoEarth v1.1-Base encoder: Benchmark -> (N, 768) embeddings.
+class OlmoEarthModel:
+    """Frozen OlmoEarth v1.1-Base model: Benchmark -> (N, 768) embeddings.
 
-    ``encode`` expects an already-degraded Benchmark (apply ``degrade`` upstream);
-    this class is condition-agnostic, exactly like every other encoder.
+    ``encode`` expects a :class:`Benchmark` instance.
     """
 
     name: str = "olmoearth"
@@ -141,7 +140,7 @@ class OlmoEarthEncoder:
         images : (N, S, S, T, 12) float32
             Point-level series broadcast to the configured spatial tile size.
         masks   : (N, S, S, T, B) float32
-            Availability mask filled with ONLINE_ENCODER value where data exists.
+            Availability mask filled with ONLINE_MODEL value where data exists.
         timestamps : (N, T, 3) int64
             [day, month, year] for every observation.
         """
@@ -169,19 +168,19 @@ class OlmoEarthEncoder:
         x *= np.asarray(bench.s2_mask, dtype=np.float32)[:, :, None]
 
         # Tile the pixel/parcel series to a constant SxS spatial chip (a spatial ViT cannot
-        # ingest a 1x1 chip); the encoder then patches/pools over a valid spatial grid.
+        # ingest a 1x1 chip); the model then patches/pools over a valid spatial grid.
         s = max(int(self.tile_size), int(self.patch_size))
         images = np.broadcast_to(x[:, None, None, :, :], (n, s, s, t, OLMOEARTH_NUM_S2_BANDS)).copy()
 
         num_band_sets = 1
         if self._model is not None:
-            tokenization = getattr(self._model.encoder, "tokenization_config", None)
+            tokenization = getattr(self._model.model, "tokenization_config", None)
             if tokenization is not None:
                 num_band_sets = tokenization.get_num_bandsets("sentinel2_l2a")
         observed = np.asarray(bench.s2_mask, dtype=bool)[:, None, None, :, None]
         avail = np.where(
             observed,
-            float(MaskValue.ONLINE_ENCODER.value),
+            float(MaskValue.ONLINE_MODEL.value),
             float(MaskValue.MISSING.value),
         )
         avail = np.broadcast_to(avail, (n, s, s, t, num_band_sets)).copy().astype(np.float32)
@@ -222,22 +221,22 @@ class OlmoEarthEncoder:
             sentinel2_l2a=torch.from_numpy(dummy_bands).to(dev),
             sentinel2_l2a_mask=torch.full(
                 (B, H, W, T, 1),
-                MaskValue.ONLINE_ENCODER.value,
+                MaskValue.ONLINE_MODEL.value,
                 dtype=torch.float32,
                 device=dev,
             ),
             timestamps=torch.tensor([15, 0, 2021], device=dev).reshape(B, 1, 3).expand(B, T, 3),
         )
 
-        encoder = self._model.encoder
+        model = self._model.model
 
         class _MacWrap(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.encoder = encoder
+                self.model = model
 
             def forward(self, s):
-                return self.encoder(s, fast_pass=True, patch_size=1)["tokens_and_masks"].sentinel2_l2a
+                return self.model(s, fast_pass=True, patch_size=1)["tokens_and_masks"].sentinel2_l2a
 
         macs, _ = thop.profile(_MacWrap(), inputs=(sample,), verbose=False)
         return int(macs)
@@ -265,7 +264,7 @@ class OlmoEarthEncoder:
             from olmoearth_pretrain.nn.pooling import PoolingType, pool_unmasked_tokens
 
             fast_pass = not (sample.sentinel2_l2a_mask == MaskValue.MISSING.value).any().item()
-            tokens = self._model.encoder(sample, fast_pass=fast_pass, patch_size=eff_patch)["tokens_and_masks"]
+            tokens = self._model.model(sample, fast_pass=fast_pass, patch_size=eff_patch)["tokens_and_masks"]
             pooled = pool_unmasked_tokens(tokens, PoolingType.MEAN)
             out.append(pooled.detach().cpu().numpy().astype(np.float32))
 
@@ -279,7 +278,7 @@ class OlmoEarthEncoder:
         from olmoearth_pretrain.data.normalize import Normalizer, Strategy
         from olmoearth_pretrain.datatypes import MaskedOlmoEarthSample, MaskValue
 
-        from dataio.get_input import PASTIS_S2_BANDS
+        from evals.benchmarks.pastis_r import PASTIS_S2_BANDS
 
         height, width, timesteps = tile.height, tile.width, tile.s2.shape[0]
         values = np.zeros((1, height, width, timesteps, OLMOEARTH_NUM_S2_BANDS), dtype=np.float32)
@@ -293,11 +292,11 @@ class OlmoEarthEncoder:
         values[:, :, :, :, ~mapped] = 0.0
         values *= tile.s2_mask[None, None, None, :, None]
 
-        tokenization = self._model.encoder.tokenization_config
+        tokenization = self._model.model.tokenization_config
         band_sets = tokenization.get_num_bandsets("sentinel2_l2a")
         mask = np.where(
             tile.s2_mask[None, None, None, :, None] > 0,
-            float(MaskValue.ONLINE_ENCODER.value),
+            float(MaskValue.ONLINE_MODEL.value),
             float(MaskValue.MISSING.value),
         )
         mask = np.broadcast_to(mask, (1, height, width, timesteps, band_sets)).copy().astype(np.float32)
@@ -310,7 +309,7 @@ class OlmoEarthEncoder:
             sentinel2_l2a_mask=torch.from_numpy(mask).to(self.device),
             timestamps=torch.from_numpy(timestamps).to(self.device),
         )
-        output = self._model.encoder(sample, fast_pass=False, patch_size=8)["tokens_and_masks"]
+        output = self._model.model(sample, fast_pass=False, patch_size=8)["tokens_and_masks"]
         tokens = output.sentinel2_l2a
         observed = (output.sentinel2_l2a_mask != MaskValue.MISSING.value).unsqueeze(-1)
         spatial_tokens = (tokens * observed).sum(dim=(3, 4)) / observed.sum(dim=(3, 4)).clamp_min(1)

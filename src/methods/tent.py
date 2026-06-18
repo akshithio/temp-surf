@@ -70,5 +70,5 @@ class Tent:
         return adapted.astype(np.float32, copy=False)
 
 
-def variants(task_kind: str) -> dict[str, dict]:
-    return {} if task_kind == "regression" else {"tent": {}}
+def variants(label_kind: str) -> dict[str, dict]:
+    return {} if label_kind == "regression" else {"tent": {}}
