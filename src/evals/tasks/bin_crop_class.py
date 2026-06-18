@@ -17,6 +17,7 @@ import numpy as np
 BENCHMARK = "cropharvest"
 TASK_KIND = "binary"
 HOLDOUTS = None  # use evals.STRICT_HOLDOUTS (togo, ethiopia, lem-brazil, rwanda, togo-eval)
+                   # set to e.g. ["togo"] to restrict
 
 
 def make_targets(bench) -> tuple[np.ndarray, np.ndarray]:

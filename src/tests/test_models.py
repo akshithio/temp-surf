@@ -1,63 +1,99 @@
 from __future__ import annotations
 
-from pathlib import Path
-from types import SimpleNamespace
-
 import numpy as np
-import torch
 
-from models.agrifm import AGRIFM_S2_BANDS, AgriFMEncoder
+from dataio.get_input import Benchmark
+from models.agrifm import AgriFMEncoder
+from models.olmoearth import OlmoEarthEncoder
+from models.presto import PrestoEncoder
+from models.tessera import TESSERA_S2_BANDS, TesseraEncoder
 from utils import cacheutils
 
 
-class FakeAgriFM(torch.nn.Module):
-    def forward(self, x):
-        pooled = x.mean(dim=(1, 3, 4))
-        return {"encoder_features": pooled[:, :, None, None]}
+class FakePrestoModel:
+    pass
 
 
-def _agrifm_bench() -> SimpleNamespace:
-    bands = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12", "NDVI"]
-    s2 = np.zeros((2, 4, len(bands)), dtype=np.float32)
-    for idx, band in enumerate(bands):
-        s2[:, :, idx] = idx + 1
-    s2_mask = np.ones((2, 4), dtype=np.float32)
-    s2_mask[1, 2:] = 0.0
-    return SimpleNamespace(s2=s2, s2_mask=s2_mask, s2_bands=bands)
+def test_presto_is_registered_without_loading_external_weights() -> None:
+    enc = cacheutils.build_encoder("presto", load_model=lambda weights_path: FakePrestoModel())
+
+    assert isinstance(enc, PrestoEncoder)
 
 
-def test_agrifm_series_uses_official_s2_band_order_and_masks_missing_frames() -> None:
-    enc = AgriFMEncoder(load_model=lambda repo, weights, device: FakeAgriFM())
-
-    series = enc.to_agrifm_series(_agrifm_bench())
-
-    assert series.shape == (2, 32, 10)
-    assert AGRIFM_S2_BANDS == ["B2", "B3", "B4", "B8", "B5", "B6", "B7", "B8A", "B11", "B12"]
-    assert np.all(series[1, -1] == 0.0)
-    assert np.any(series[0, -1] != 0.0)
+def test_model_pool_wrappers_are_registered_without_loading_external_weights() -> None:
+    assert AgriFMEncoder.name == "agrifm"
+    assert TesseraEncoder.name == "tessera"
+    assert cacheutils.ENCODERS["agrifm"] == ("models.agrifm", "AgriFMEncoder")
+    assert cacheutils.ENCODERS["tessera"] == ("models.tessera", "TesseraEncoder")
 
 
-def test_agrifm_encode_pools_mocked_encoder_features() -> None:
-    enc = AgriFMEncoder(
-        load_model=lambda repo, weights, device: FakeAgriFM(),
-        batch_size=2,
-        tile_size=2,
-        device="cpu",
+def _benchmark() -> Benchmark:
+    n, t = 2, 12
+    return Benchmark(
+        name="test",
+        task="binary",
+        s2=np.arange(n * t * 11, dtype=np.float32).reshape(n, t, 11) + 1000,
+        s1=np.full((n, t, 2), -12.0, dtype=np.float32),
+        climate=np.zeros((n, t, 0), dtype=np.float32),
+        s2_mask=np.array([[1] * t, [1] * 6 + [0] * 6], dtype=np.float32),
+        s1_mask=np.array([[1] * t, [0] * t], dtype=np.float32),
+        climate_mask=np.zeros((n, t), dtype=np.float32),
+        doy=np.tile(np.arange(15, 360, 30, dtype=np.float32)[:t], (n, 1)),
+        labels=np.array([0, 1]),
+        groups=np.array(["a", "b"]),
+        latlon=np.zeros((n, 2), dtype=np.float32),
+        s2_bands=["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12", "NDVI"],
+        s1_bands=["VV", "VH"],
+        climate_bands=[],
+        years=np.array([2020, 2021]),
     )
 
-    emb = enc.encode(_agrifm_bench())
 
-    assert emb.shape == (2, 10)
-    assert enc.embedding_dim == 10
-    np.testing.assert_allclose(emb[1], enc.to_agrifm_series(_agrifm_bench())[1].mean(axis=0), atol=1e-6)
+def test_tessera_uses_v11_band_order_and_buckets_only_valid_observations() -> None:
+    encoder = TesseraEncoder()
+    groups = encoder._prepare_streams(_benchmark())
+
+    assert TESSERA_S2_BANDS == ["B4", "B2", "B3", "B8", "B8A", "B5", "B6", "B7", "B11", "B12"]
+    assert set(groups) == {(16, 16), (8, 8)}
+    assert sum(len(indices) for indices, _s2, _s1 in groups.values()) == 2
 
 
-def test_agrifm_is_registered_without_loading_external_weights() -> None:
-    enc = cacheutils.build_encoder(
-        "agrifm",
-        repo_path=Path("/tmp/no-load"),
-        weights_path=Path("/tmp/no-load.pth"),
-        load_model=lambda repo, weights, device: FakeAgriFM(),
+def test_olmoearth_builds_one_timestamp_and_mask_per_observation(monkeypatch) -> None:
+    class MaskValue:
+        class _Value:
+            def __init__(self, value):
+                self.value = value
+
+        ONLINE_ENCODER = _Value(0)
+        MISSING = _Value(3)
+
+    class Modality:
+        SENTINEL2_L2A = object()
+
+    class Strategy:
+        COMPUTED = object()
+
+    class Normalizer:
+        def __init__(self, _strategy):
+            pass
+
+        def normalize(self, _modality, values):
+            return values
+
+    import sys
+    import types
+
+    monkeypatch.setitem(sys.modules, "olmoearth_pretrain.datatypes", types.SimpleNamespace(MaskValue=MaskValue))
+    monkeypatch.setitem(sys.modules, "olmoearth_pretrain.data.constants", types.SimpleNamespace(Modality=Modality))
+    monkeypatch.setitem(
+        sys.modules,
+        "olmoearth_pretrain.data.normalize",
+        types.SimpleNamespace(Normalizer=Normalizer, Strategy=Strategy),
     )
+    images, masks, timestamps = OlmoEarthEncoder()._bench_to_olmoearth(_benchmark())
 
-    assert isinstance(enc, AgriFMEncoder)
+    assert images.shape == (2, 1, 1, 12, 12)
+    assert masks.shape == (2, 1, 1, 12, 1)
+    assert timestamps.shape == (2, 12, 3)
+    assert np.all(masks[1, :, :, 6:, :] == 3)
+    assert np.array_equal(timestamps[:, :, 2], np.array([[2020] * 12, [2021] * 12]))

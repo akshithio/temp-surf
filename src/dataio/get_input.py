@@ -3,27 +3,19 @@
 Loads raw agricultural EO benchmarks into a single dense in-memory container
 (:class:`Benchmark`) that every encoder in ``src/models/*`` can consume: each
 encoder applies the stress conditions (sensor-off / temporal-drop) to these
-arrays and produces embeddings. Nothing here touches a model or a corruption op.
+arrays and produces embeddings. Nothing here touches a model or a degradation op.
 
-Expected layout under ``data/input/`` (datasets staged here by you):
+Expected layout under ``data/input/benchmarks/`` (datasets staged here by you)::
 
-    data/input/cropharvest/
+    data/input/benchmarks/cropharvest/
         labels.geojson
         features/arrays/<index>_<dataset>.h5      # one (T, C) array per sample
-    data/input/eurocropsml/
+    data/input/benchmarks/eurocropsml/
         preprocess/*.npz                          # one (T, 13) array per parcel
         split/latvia_portugal_vs_estonia/...      # official transnational split
-    data/input/sickle/
-        sickle_dataset_tabular.csv                # phenology / yield annotations
-        images/{S2,S1}/npy/<uid>/*.npz            # per-acquisition band chips
-        masks/10m/<uid>.tif                       # plot / phenology / yield rasters
-    data/input/yieldsat/
-        preprocessed-24-ts/<Country>/merge_s2-soil-dem-weather-coords.nc
 
 CropHarvest is rebuilt from the raw per-sample h5 arrays (band layout below);
-EuroCropsML is read from the preprocessed npz parcels. SICKLE is read from the
-per-plot acquisition chips, with phenology-date targets from its tabular CSV.
-YieldSAT is read from the ML-ready NetCDFs and aggregated from pixels to fields.
+EuroCropsML is read from the preprocessed npz parcels.
 
 Band layouts follow the nasaharvest/cropharvest convention and the EuroCropsML
 13-band ordering so embeddings stay comparable across pipelines.
@@ -31,57 +23,42 @@ Band layouts follow the nasaharvest/cropharvest convention and the EuroCropsML
 
 from __future__ import annotations
 
-import csv
-import glob
 import json
-import os
-import re
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import h5py
 import numpy as np
-import rasterio
-from joblib import Parallel, delayed
 from sklearn.preprocessing import LabelEncoder
 
-DEFAULT_ROOT = Path("data/input")
+DEFAULT_ROOT = Path("data/input/benchmarks")
 
 # --- CropHarvest band layout (raw array column indices) ---------------------
-# Raw array columns: [S1 VV,VH] + [S2 11 bands] + [ERA5 2] + [SRTM 2] + [NDVI].
+# Raw 18-col array: [S1 VV,VH] + [S2: B2..B8A, B9, B11, B12] + [ERA5 temp,precip]
+#   + [SRTM elevation(15), slope(16)] + [NDVI(17)].
 CH_S1_IDXS = [0, 1]
 CH_S2_IDXS = [2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 17]  # B2..B12 (no B1/B10) + NDVI (col 17)
-CH_CLIMATE_IDXS = [13, 14, 15]
+CH_CLIMATE_IDXS = [13, 14, 15, 16]  # temperature, precipitation, elevation, slope (slope = Presto's SRTM band)
 CH_MIN_CHANNELS = max(CH_S1_IDXS + CH_S2_IDXS + CH_CLIMATE_IDXS) + 1
 CH_S1_BANDS = ["VV", "VH"]
 CH_S2_BANDS = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12", "NDVI"]
-CH_CLIMATE_BANDS = ["temperature", "precipitation", "elevation"]
+CH_CLIMATE_BANDS = ["temperature", "precipitation", "elevation", "slope"]
 CH_TIMESTEPS = 12
 
 # --- EuroCropsML band layout (raw npz column indices) -----------------------
-# 13-band ordering: B1,B2,B3,B4,B5,B6,B7,B8,B8A,B9,B11,B12,SCL. Keep B2..B8A,B11,B12
-# and append a computed NDVI. No native S1 / climate.
-EC_S2_IDXS = [1, 2, 3, 4, 5, 6, 7, 8, 10, 11]
-EC_B4_IDX = 3
-EC_B8_IDX = 7
+# VERIFIED (2026-06-14) against the staged npz: the 13 columns are the native Sentinel-2
+# bands B1,B2,B3,B4,B5,B6,B7,B8,B8A,B9,B10,B11,B12 -- there is NO SCL column (the last
+# column is B12: range 0-~3800 with thousands of unique values, not 0-11 class labels),
+# and col 10 is B10/cirrus (mean ~34, median 15, >90% < 100 -- the near-zero giveaway).
+# So from B10 on, the old assumed order (.,B9,B11,B12,SCL) was shifted by one band. Keep
+# B2..B8A (idx 1-8) + B11,B12 (idx 11,12) and append a computed NDVI. B1/B9/B10 are dropped
+# (no encoder uses them). No native S1 / climate.
+EC_S2_IDXS = [1, 2, 3, 4, 5, 6, 7, 8, 11, 12]
+EC_B4_IDX = 3  # B4 (red), native order
+EC_B8_IDX = 7  # B8 (NIR), native order
 EC_S2_BANDS = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12", "NDVI"]
 EC_COUNTRY_PREFIX = {"EE": "Estonia", "LV": "Latvia", "PT": "Portugal"}
-
-# --- YieldSAT band layout (ML-ready NetCDF band coordinate names) -----------
-YS_COUNTRIES = ["Argentina", "Brazil", "Germany", "Uruguay"]
-YS_NETCDF_NAME = "merge_s2-soil-dem-weather-coords.nc"
-YS_S2_SOURCE_BANDS = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"]
-YS_S2_BANDS = CH_S2_BANDS
-YS_CLIMATE_SOURCE_BANDS = ["temp_mean", "total_prec", "dem"]
-YS_CLIMATE_BANDS = CH_CLIMATE_BANDS
-YS_COORD_BANDS = ["coord_x", "coord_y", "coord_z"]
-YS_COUNTRY_CENTROID = {
-    "Argentina": (-34.0, -64.0),
-    "Brazil": (-14.2, -51.9),
-    "Germany": (51.2, 10.4),
-    "Uruguay": (-32.5, -55.8),
-}
 
 
 @dataclass
@@ -90,9 +67,9 @@ class Benchmark:
 
     Modality arrays are ``(N, T, C)`` with the spatial 1x1 dimension squeezed out.
     ``*_mask`` are ``(N, T)`` per-timestep availability (1 = observed). ``doy`` is
-    ``(N, T)`` day-of-year. ``labels`` are the task target (binary is_crop,
-    encoded class id, or regression value); ``groups`` are the strict-holdout
-    group (dataset for CropHarvest, country for EuroCropsML/YieldSAT).
+    ``(N, T)`` day-of-year. ``labels`` are the task target (binary is_crop or
+    encoded class id); ``groups`` are the strict-holdout group (dataset for
+    CropHarvest, country for EuroCropsML).
     """
 
     name: str
@@ -111,6 +88,7 @@ class Benchmark:
     s1_bands: list[str]
     climate_bands: list[str]
     label_names: list[str] | None = None  # class id -> name, for multiclass
+    years: np.ndarray | None = None  # (N,) calendar year of each sample's observation window
 
     @property
     def n_samples(self) -> int:
@@ -121,18 +99,169 @@ class Benchmark:
         return int(self.s2.shape[1])
 
 
+@dataclass
+class SpatialBenchmark:
+    """Dense, in-memory multimodal *patch* time series for a segmentation benchmark.
+
+    Unlike :class:`Benchmark` (1x1 pixel/parcel series, ``(N, T, C)``), modality arrays
+    here keep the spatial dimensions: ``(N, T, C, H, W)`` patches. ``labels`` is a
+    per-pixel class mask ``(N, H, W)``; ``ignore_index`` is the class id excluded from the
+    probe and from mIoU (background / void). ``groups`` is the per-patch fold id used for
+    the geographic-style holdout (PASTIS ships 5 spatially-disjoint folds). ``*_mask`` are
+    ``(N, T)`` per-timestep availability. Consumed by encoders' ``encode_dense``.
+    """
+
+    name: str
+    task: str  # "segmentation"
+    s2: np.ndarray  # (N, T, C2, H, W)
+    s1: np.ndarray  # (N, T, C1, H, W)  (empty C1=0 if absent)
+    s2_mask: np.ndarray  # (N, T)
+    s1_mask: np.ndarray  # (N, T)
+    doy: np.ndarray  # (N, T)
+    labels: np.ndarray  # (N, H, W) per-pixel class id
+    groups: np.ndarray  # (N,) fold id per patch
+    s2_bands: list[str]
+    s1_bands: list[str]
+    label_names: list[str] | None = None  # class id -> name
+    ignore_index: int = 0  # class excluded from probe + mIoU (PASTIS: 0=background, 19=void)
+    void_index: int | None = None  # second class to drop (PASTIS void)
+    years: np.ndarray | None = None  # (N,) calendar year per patch
+
+    @property
+    def n_samples(self) -> int:
+        return int(self.s2.shape[0])
+
+    @property
+    def timesteps(self) -> int:
+        return int(self.s2.shape[1])
+
+    @property
+    def hw(self) -> tuple[int, int]:
+        return (int(self.s2.shape[-2]), int(self.s2.shape[-1]))
+
+
+@dataclass(frozen=True)
+class PastisPatch:
+    """Paths and temporal metadata for one lazily loaded PASTIS-R patch."""
+
+    patch_id: int
+    fold: int
+    s2_path: Path
+    s1_path: Path
+    target_path: Path
+    s2_months: np.ndarray
+    s1_months: np.ndarray
+
+
+@dataclass(frozen=True)
+class PastisTile:
+    """One monthly 64x64 PASTIS-R tile passed to dense encoders."""
+
+    s2: np.ndarray
+    s1: np.ndarray
+    s2_mask: np.ndarray
+    s1_mask: np.ndarray
+    labels: np.ndarray
+    valid: np.ndarray
+    fold: int
+
+    @property
+    def height(self) -> int:
+        return int(self.labels.shape[0])
+
+    @property
+    def width(self) -> int:
+        return int(self.labels.shape[1])
+
+    def pixel_benchmark(self) -> Benchmark:
+        return _pastis_pixel_benchmark(
+            self.s2,
+            self.s1,
+            self.s2_mask,
+            self.s1_mask,
+            self.labels.reshape(-1),
+            self.valid.reshape(-1),
+            self.fold,
+        )
+
+
+@dataclass(frozen=True)
+class PastisBenchmark:
+    """Lazy PASTIS-R release descriptor.
+
+    The release is roughly 69 GB and its monthly S2 tensor alone would occupy
+    about 19 GB in memory.  This object therefore stores only file records.
+    ``iter_tiles`` materializes one 64x64 tile at a time.
+    """
+
+    name: str
+    task: str
+    patches: tuple[PastisPatch, ...]
+    tile_size: int = 64
+    sensor_off: str = "none"
+    temporal_drop: float = 0.0
+    degradation_seed: int = 0
+    ignore_index: int = 19
+
+    @property
+    def n_samples(self) -> int:
+        tiles_per_axis = 128 // self.tile_size
+        return len(self.patches) * tiles_per_axis * tiles_per_axis
+
+    @property
+    def groups(self) -> np.ndarray:
+        tiles_per_patch = (128 // self.tile_size) ** 2
+        return np.repeat([patch.fold for patch in self.patches], tiles_per_patch).astype(np.int64)
+
+    def iter_tiles(self, folds: set[int] | None = None):
+        """Yield ``(tile_id, fold, pixel_benchmark, labels)`` lazily.
+
+        Pixels with the PASTIS void label (19) are removed. Background (0) is
+        retained because it is an evaluated class in the published protocol.
+        """
+        for patch in self.patches:
+            if folds is not None and patch.fold not in folds:
+                continue
+            s2 = np.load(patch.s2_path, mmap_mode="r")
+            s1 = np.load(patch.s1_path, mmap_mode="r")
+            target = np.load(patch.target_path, mmap_mode="r")[0]
+            s2_monthly, s2_mask = _monthly_patch(s2, patch.s2_months)
+            s1_monthly, s1_mask = _monthly_patch(s1, patch.s1_months)
+
+            for row in range(0, target.shape[0], self.tile_size):
+                for col in range(0, target.shape[1], self.tile_size):
+                    ys = slice(row, row + self.tile_size)
+                    xs = slice(col, col + self.tile_size)
+                    labels = np.asarray(target[ys, xs], dtype=np.int64)
+                    valid = labels != self.ignore_index
+                    tile_id = f"{patch.patch_id}_{row // self.tile_size}_{col // self.tile_size}"
+                    tile = PastisTile(
+                        s2=s2_monthly[:, :, ys, xs],
+                        s1=s1_monthly[:, :, ys, xs],
+                        s2_mask=s2_mask,
+                        s1_mask=s1_mask,
+                        labels=labels,
+                        valid=valid,
+                        fold=patch.fold,
+                    )
+                    if self.sensor_off != "none" or self.temporal_drop:
+                        tile_seed = self.degradation_seed + patch.patch_id + row * 128 + col
+                        tile = _degrade_pastis_tile(tile, self.sensor_off, self.temporal_drop, tile_seed)
+                    yield tile_id, patch.fold, tile, labels[valid]
+
+
 # --------------------------------------------------------------------------- #
-# Stress corruption
+# Stress degradation
 # --------------------------------------------------------------------------- #
 
 
-def corrupt(
-    bench: Benchmark,
+def degrade(
+    bench: Benchmark | PastisBenchmark,
     sensor_off: str = "none",
     temporal_drop: float = 0.0,
     seed: int = 0,
-) -> Benchmark:
-    """Apply a stress condition to a benchmark, returning a corrupted copy.
+) -> Benchmark | PastisBenchmark:
+    """Apply a stress condition to a benchmark, returning a degraded copy.
 
     This realizes the protocol conditions defined in ``src/evals/evals.py`` but
     takes the primitives directly (``sensor_off`` in {none, s2, s1, climate};
@@ -142,8 +271,18 @@ def corrupt(
     * sensor-off zeros the modality and its availability mask.
     * temporal-drop randomly zeros a fraction of timesteps across *all* modalities
       (timestep 0 is always kept, and at least two timesteps survive), mirroring
-      the extraction-time corruption so embeddings stay comparable.
+      the extraction-time degradation so embeddings stay comparable.
     """
+    if isinstance(bench, PastisBenchmark):
+        if sensor_off not in {"none", "s2", "s1"}:
+            raise ValueError(f"PASTIS-R does not provide modality {sensor_off!r}")
+        return replace(
+            bench,
+            sensor_off=sensor_off,
+            temporal_drop=temporal_drop,
+            degradation_seed=seed,
+        )
+
     s2, s1, climate = bench.s2.copy(), bench.s1.copy(), bench.climate.copy()
     s2_mask, s1_mask, climate_mask = bench.s2_mask.copy(), bench.s1_mask.copy(), bench.climate_mask.copy()
 
@@ -197,16 +336,33 @@ def _synthetic_month_doy(timesteps: int) -> np.ndarray:
     return np.asarray(days, dtype=np.float32)
 
 
-def _load_ch_labels(labels_geojson: Path) -> dict[tuple[int, str], tuple[int, float, float]]:
-    """Map (index, dataset) -> (is_crop, lat, lon)."""
+def _ch_window_year(export_end_date: str | None) -> int:
+    """Calendar year at the MIDDLE of CropHarvest's 12-month window ending at
+    ``export_end_date``.
+
+    CropHarvest windows end ~Feb 1, so the 12 months (prev-Feb .. Jan) sit mostly in the
+    prior calendar year; the window midpoint (~183 days before the end) selects that
+    majority year principledly (e.g. export_end 2021-02-01 -> 2020). 0 if unknown.
+    """
+    if not export_end_date:
+        return 0
+    try:
+        end = datetime.fromisoformat(str(export_end_date).replace("Z", ""))
+    except ValueError:
+        return 0
+    return int((end - timedelta(days=183)).year)
+
+
+def _load_ch_labels(labels_geojson: Path) -> dict[tuple[int, str], tuple[int, float, float, int]]:
+    """Map (index, dataset) -> (is_crop, lat, lon, window_year)."""
     geo = json.loads(labels_geojson.read_text())
-    out: dict[tuple[int, str], tuple[int, float, float]] = {}
+    out: dict[tuple[int, str], tuple[int, float, float, int]] = {}
     for f in geo["features"]:
         p = f["properties"]
         key = (int(p["index"]), str(p["dataset"]))
         lat = float(p["lat"]) if p.get("lat") is not None else float("nan")
         lon = float(p["lon"]) if p.get("lon") is not None else float("nan")
-        out[key] = (int(p["is_crop"]), lat, lon)
+        out[key] = (int(p["is_crop"]), lat, lon, _ch_window_year(p.get("export_end_date")))
     return out
 
 
@@ -241,7 +397,7 @@ def load_cropharvest(
     files = _select_files([p for p in arrays_dir.glob("*.h5") if p.is_file()], shuffle, seed, max_samples)
 
     s2_list, s1_list, clim_list = [], [], []
-    labels, groups, latlons = [], [], []
+    labels, groups, latlons, years = [], [], [], []
     for path in files:
         idx_str, dataset = path.stem.split("_", 1)
         key = (int(idx_str), dataset)
@@ -257,13 +413,14 @@ def load_cropharvest(
         if arr.ndim != 2 or arr.shape[0] != CH_TIMESTEPS or arr.shape[1] < CH_MIN_CHANNELS:
             continue
         arr = np.nan_to_num(arr, nan=0.0)
-        is_crop, lat, lon = label_map[key]
+        is_crop, lat, lon, year = label_map[key]
         s2_list.append(arr[:, CH_S2_IDXS])
         s1_list.append(arr[:, CH_S1_IDXS])
         clim_list.append(arr[:, CH_CLIMATE_IDXS])
         labels.append(is_crop)
         groups.append(dataset)
         latlons.append((lat, lon))
+        years.append(year)
 
     if not s2_list:
         raise ValueError(f"No valid CropHarvest arrays parsed from {arrays_dir}")
@@ -290,6 +447,7 @@ def load_cropharvest(
         s2_bands=CH_S2_BANDS,
         s1_bands=CH_S1_BANDS,
         climate_bands=CH_CLIMATE_BANDS,
+        years=np.asarray(years, dtype=np.int64),
     )
 
 
@@ -324,14 +482,43 @@ def _resample_to(arr: np.ndarray, dates_ns: np.ndarray, timesteps: int) -> tuple
     return values, mask, doy
 
 
+EC_N_MONTHS = 12  # EuroCropsML is harmonized to 12 monthly composites (see _monthly_composite)
+
+
+def _monthly_composite(arr: np.ndarray, dates: np.ndarray, n_months: int = EC_N_MONTHS):
+    """Bin a variable-length parcel series into calendar-month composites (mean per month).
+
+    Returns (values (n_months, C), mask (n_months,), doy (n_months,)). This is the harmonized
+    temporal protocol: it matches the **monthly cadence Presto/CropHarvest assume** -- Presto's
+    positional encoding treats each timestep as one consecutive month, so a sub-monthly grid
+    (e.g. 96 acquisitions in a year) would be mis-read as 96 *months*. Month-mean uses ALL
+    observations (no lossy linspace subsample); empty months are masked; doy is mid-month.
+    EuroCropsML parcels range 1-216 acquisitions/yr (median ~45), so monthly aggregation is
+    the principled common grid; encoders that prefer raw observations get this harmonized
+    input as a documented limitation (see README).
+    """
+    months = np.asarray(dates, dtype="datetime64[M]").astype(np.int64) % 12
+    c = arr.shape[1]
+    values = np.zeros((n_months, c), np.float32)
+    mask = np.zeros(n_months, np.float32)
+    for m in range(n_months):
+        sel = months == m
+        if sel.any():
+            values[m] = arr[sel].mean(axis=0)
+            mask[m] = 1.0
+    return values, mask, _synthetic_month_doy(n_months)
+
+
 def load_eurocropsml(
     root: Path = DEFAULT_ROOT,
-    timesteps: int = 96,
     max_samples: int | None = None,
     shuffle: bool = True,
     seed: int = 0,
 ) -> Benchmark:
-    """Load EuroCropsML crop-type parcels (S2 only; S1/climate absent).
+    """Load EuroCropsML crop-type parcels as 12 monthly composites (S2 only; S1/climate absent).
+
+    Temporal protocol: each parcel's irregular Sentinel-2 series is aggregated to 12 calendar-
+    month composites (``_monthly_composite``) -- the monthly cadence Presto/CropHarvest expect.
 
     Shuffling matters here: npz filenames sort by country prefix (EE/LV/PT), so a
     sorted max_samples subset would be all-Estonia. Shuffling spans countries,
@@ -346,7 +533,7 @@ def load_eurocropsml(
         raise ValueError(f"No EuroCropsML npz files in {preprocess_dir}")
 
     s2_list, mask_list, doy_list = [], [], []
-    label_codes, groups, latlons = [], [], []
+    label_codes, groups, latlons, years = [], [], [], []
     for path in files:
         with np.load(str(path)) as data:
             raw = data["data"].astype(np.float32)
@@ -357,13 +544,15 @@ def load_eurocropsml(
         b4, b8 = raw[:, EC_B4_IDX], raw[:, EC_B8_IDX]
         ndvi = np.divide(b8 - b4, b8 + b4, out=np.zeros_like(b4), where=(b8 + b4) > 0)
         s2_full = np.concatenate([raw[:, EC_S2_IDXS], ndvi[:, None]], axis=1)
-        values, mask, doy = _resample_to(s2_full, np.asarray(dates), timesteps)
+        dates_arr = np.asarray(dates)
+        values, mask, doy = _monthly_composite(s2_full, dates_arr)
         s2_list.append(values)
         mask_list.append(mask)
         doy_list.append(doy)
         label_codes.append(path.stem.split("_")[-1])
         groups.append(_ec_country(path.stem))
         latlons.append((float(center[1]), float(center[0])) if center is not None else (float("nan"), float("nan")))
+        years.append(int(str(dates_arr.ravel()[0])[:4]) if dates_arr.size else 0)
 
     if not s2_list:
         raise ValueError(f"No valid EuroCropsML parcels parsed from {preprocess_dir}")
@@ -374,9 +563,9 @@ def load_eurocropsml(
     s2 = np.stack(s2_list).astype(np.float32)
     s2_mask = np.stack(mask_list).astype(np.float32)
     doy = np.stack(doy_list).astype(np.float32)
-    empty_s1 = np.zeros((n, timesteps, 2), np.float32)
-    empty_clim = np.zeros((n, timesteps, 0), np.float32)
-    zeros_mask = np.zeros((n, timesteps), np.float32)
+    empty_s1 = np.zeros((n, EC_N_MONTHS, 2), np.float32)
+    empty_clim = np.zeros((n, EC_N_MONTHS, 0), np.float32)
+    zeros_mask = np.zeros((n, EC_N_MONTHS), np.float32)
     return Benchmark(
         name="eurocropsml",
         task="multiclass",
@@ -394,364 +583,282 @@ def load_eurocropsml(
         s1_bands=["VV", "VH"],
         climate_bands=[],
         label_names=list(encoder.classes_),
+        years=np.asarray(years, dtype=np.int64),
     )
 
 
 # --------------------------------------------------------------------------- #
-# SICKLE (paddy phenology: sowing / transplanting / harvesting day-of-season)
+# BreizhCrops  (Brittany crop-type classification, Sentinel-2 L1C, 9 classes)
 # --------------------------------------------------------------------------- #
 
-SICKLE_S2_SRC = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12"]  # B4=red, B8=nir
-SICKLE_S2_BANDS = SICKLE_S2_SRC + ["NDVI"]
-SICKLE_S1_SRC = ["VV", "VH"]
-SICKLE_CENTROID = (10.95, 79.4)  # Cauvery Delta, Tamil Nadu (lat, lon); SICKLE tifs aren't geo-referenced
-SICKLE_TARGET_COL = {"sowing": "SOWING_DAY", "transplanting": "TRANSPLANTING_DAY", "harvesting": "HARVESTING_DAY"}
-_SICKLE_DATE_RE = re.compile(r"(\d{8})T\d{6}")
+# The breizhcrops package returns L1C ``X`` as (T, 13) with bands in THIS order
+# (alphabetical), from which we keep the 10 S2 spectral bands + a computed NDVI.
+BZ_X_BANDS = ["B1", "B10", "B11", "B12", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9"]
+BZ_S2_KEEP = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12"]
+BZ_S2_BANDS = BZ_S2_KEEP + ["NDVI"]
+BZ_REGIONS = ["frh01", "frh02", "frh03", "frh04", "belle-ile"]
+BZ_TIMESTEPS = 12
 
 
-def _sickle_date(filename: str) -> datetime:
-    match = _SICKLE_DATE_RE.search(filename)
-    stamp = match.group(1) if match else filename.split("_")[0][:8]
-    return datetime.strptime(stamp, "%Y%m%d")
+def _resample_fixed(arr: np.ndarray, t: int) -> np.ndarray:
+    """Linspace-resample a (T, C) series to exactly ``t`` timesteps (subsample or repeat)."""
+    n = arr.shape[0]
+    if n == t:
+        return arr.astype(np.float32, copy=False)
+    idx = np.linspace(0, max(n - 1, 0), t).round().astype(np.int64)
+    return arr[idx].astype(np.float32, copy=False)
 
 
-def _resize_bool(mask: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
-    """Nearest-neighbour resize of a boolean mask (SICKLE chips are clipped at image borders)."""
-    if mask.shape == shape:
-        return mask
-    yi = np.linspace(0, mask.shape[0] - 1, shape[0]).round().astype(int)
-    xi = np.linspace(0, mask.shape[1] - 1, shape[1]).round().astype(int)
-    return mask[np.ix_(yi, xi)]
-
-
-def _sickle_plot_mean(arr: np.ndarray, sel: np.ndarray) -> float:
-    """Mean of one band over plot pixels, resizing the mask to the band's native resolution."""
-    band_sel = _resize_bool(sel, arr.shape)
-    if not band_sel.any():
-        band_sel = np.ones_like(band_sel)
-    return float(np.nanmean(arr[band_sel]))
-
-
-def _sickle_series(uid_dir: Path, src_bands: list[str], sel: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Plot-mean band vectors over time -> (ordinals (K,), values (K, C)), sorted by date."""
-    ords, vecs = [], []
-    for path in sorted(glob.glob(str(uid_dir / "*.npz"))):
-        try:
-            data = np.load(path)
-        except (OSError, ValueError):
-            continue
-        if not all(b in data for b in src_bands):
-            continue
-        # Bands are at native S2 resolution (10m bands 33x33, 20m bands ~17x17),
-        # so the plot mask is resized to each band's own shape.
-        vecs.append([_sickle_plot_mean(data[b], sel) for b in src_bands])
-        ords.append(_sickle_date(os.path.basename(path)).toordinal())
-    if not ords:
-        return np.empty(0), np.empty((0, len(src_bands)), np.float32)
-    order = np.argsort(ords)
-    return np.asarray(ords)[order], np.asarray(vecs, np.float32)[order]
-
-
-def _sickle_resample(ords: np.ndarray, vals: np.ndarray, grid: np.ndarray) -> np.ndarray:
-    """Nearest-acquisition resample of (K, C) onto the (T,) ordinal grid -> (T, C)."""
-    idx = np.abs(ords[None, :] - grid[:, None]).argmin(axis=1)
-    return vals[idx]
-
-
-def _sickle_one_sample(row: dict, base: Path, timesteps: int, col: str):
-    """Parse one SICKLE plot -> (s2, s1, doy, s1_mask, target, group), or None to skip."""
-    uid = int(float(row["UNIQUE_ID"]))
+def _bz_class_names(base: Path) -> list[str] | None:
+    """classmapping.csv (cols: ,id,classname,code) -> class names ordered by class id."""
+    p = base / "classmapping.csv"
+    if not p.exists():
+        return None
     try:
-        plot_id = int(float(row["PLOT_ID"]))
-    except (ValueError, KeyError, TypeError):
-        plot_id = -1
-    mask_path = base / "masks" / "10m" / f"{uid}.tif"
-    s2_dir = base / "images" / "S2" / "npy" / str(uid)
-    if not mask_path.exists() or not s2_dir.exists():
+        id_to_name: dict[int, str] = {}
+        for line in p.read_text().splitlines()[1:]:
+            r = line.split(",")
+            if len(r) >= 3 and r[1].strip().isdigit():
+                id_to_name.setdefault(int(r[1]), r[2])
+        return [id_to_name[i] for i in sorted(id_to_name)] if id_to_name else None
+    except (OSError, ValueError):
         return None
-    with rasterio.open(mask_path) as src:
-        plot = src.read(1)
-    sel = plot == plot_id
-    if sel.sum() == 0:
-        sel = plot > 0
-    if sel.sum() == 0:
-        sel = np.ones_like(plot, bool)
-
-    s2_ords, s2_vals = _sickle_series(s2_dir, SICKLE_S2_SRC, sel)
-    if len(s2_ords) < 2:
-        return None
-    grid = np.linspace(s2_ords.min(), s2_ords.max(), timesteps)
-    s2g = _sickle_resample(s2_ords, s2_vals, grid)
-    b8, b4 = s2g[:, 6], s2g[:, 2]
-    denom = b8 + b4
-    ndvi = np.where(denom > 0, (b8 - b4) / np.where(denom > 0, denom, 1.0), 0.0)
-    s2g = np.concatenate([s2g, ndvi[:, None]], axis=1).astype(np.float32)
-    doy = np.asarray([datetime.fromordinal(int(round(g))).timetuple().tm_yday for g in grid], np.float32)
-
-    s1_ords, s1_vals = _sickle_series(base / "images" / "S1" / "npy" / str(uid), SICKLE_S1_SRC, sel)
-    if len(s1_ords) >= 1:
-        s1g = _sickle_resample(s1_ords, s1_vals, grid).astype(np.float32)
-        s1_mask = np.ones(timesteps, np.float32)
-    else:
-        s1g = np.zeros((timesteps, 2), np.float32)
-        s1_mask = np.zeros(timesteps, np.float32)
-    group = (row.get("RIVER_PART") or "").strip() or "unknown"
-    return s2g, s1g, doy, s1_mask, float(row[col]), group
 
 
-def load_sickle(
+def load_breizhcrops(
     root: Path = DEFAULT_ROOT,
-    target: str = "harvesting",
-    timesteps: int = 12,
     max_samples: int | None = None,
     shuffle: bool = True,
     seed: int = 0,
+    regions: list[str] | None = None,
 ) -> Benchmark:
-    """Load SICKLE paddy phenology as a regression benchmark.
+    """Load BreizhCrops L1C S2 time series as 12-step parcels (crop-type classification).
 
-    Target (``target`` in {sowing, transplanting, harvesting}) is the day-of-season
-    of that event, read from ``sickle_dataset_tabular.csv`` (an external field
-    annotation -- not derived from the imagery). Each pixel time series is the
-    plot-pixel mean (mask plot == PLOT_ID) of the S2/S1 chips, nearest-resampled
-    onto a fixed ``timesteps`` grid spanning that plot's acquisition season.
-    SICKLE tifs are not geo-referenced, so a fixed Cauvery-Delta centroid is used
-    for ``latlon``; there is no climate modality.
+    Uses the ``breizhcrops`` package to read each NUTS-3 region's variable-length L1C
+    parcels, keeps the 10 S2 bands + a computed NDVI, rescales reflectance to DN (x1e4,
+    matching the other benchmarks), and linspace-resamples each parcel to 12 timesteps with
+    a synthetic monthly DOY. ``groups`` = region (geographic holdout; frh04 is the paper's
+    test region). S2-only (no S1 / climate).
     """
-    base = Path(root) / "sickle"
-    csv_path = base / "sickle_dataset_tabular.csv"
-    if not csv_path.exists():
-        raise FileNotFoundError(f"SICKLE tabular CSV not found: {csv_path}")
-    if target not in SICKLE_TARGET_COL:
-        raise ValueError(f"target must be one of {sorted(SICKLE_TARGET_COL)}; got {target!r}")
-    col = SICKLE_TARGET_COL[target]
-
-    def _valid(row: dict) -> bool:
-        try:
-            return int(float(row["PADDY_BIN"])) == 1 and float(row[col]) > 0
-        except (ValueError, KeyError):
-            return False
-
-    rows = [r for r in csv.DictReader(csv_path.open()) if _valid(r)]
-    if shuffle:
-        order = np.random.default_rng(seed).permutation(len(rows))
-        rows = [rows[i] for i in order]
-    if max_samples:
-        rows = rows[:max_samples]
-
-    # Each plot reads ~50 npz + a mask; the zip/npz parsing is GIL-bound, so parse
-    # plots across processes (loky) -- ~3x on 12 cores, more on the 32-core box.
-    # (The assembled bench is then pickle-cached upstream, so this is a cold-path cost.)
-    parsed = Parallel(n_jobs=-1)(delayed(_sickle_one_sample)(row, base, timesteps, col) for row in rows)
-    parsed = [p for p in parsed if p is not None]
-    if not parsed:
-        raise ValueError(f"No usable SICKLE samples parsed under {base}")
-
-    s2_list = [p[0] for p in parsed]
-    s1_list = [p[1] for p in parsed]
-    doy_list = [p[2] for p in parsed]
-    s1m_list = [p[3] for p in parsed]
-    labels = [p[4] for p in parsed]
-    groups = [p[5] for p in parsed]
-    s2m_list = [np.ones(timesteps, np.float32) for _ in parsed]
-    n = len(s2_list)
-    return Benchmark(
-        name="sickle",
-        task="regression",
-        s2=np.stack(s2_list).astype(np.float32),
-        s1=np.stack(s1_list).astype(np.float32),
-        climate=np.zeros((n, timesteps, 0), np.float32),
-        s2_mask=np.stack(s2m_list).astype(np.float32),
-        s1_mask=np.stack(s1m_list).astype(np.float32),
-        climate_mask=np.zeros((n, timesteps), np.float32),
-        doy=np.stack(doy_list).astype(np.float32),
-        labels=np.asarray(labels, np.float32),
-        groups=np.asarray(groups, dtype=object),
-        latlon=np.tile(np.asarray(SICKLE_CENTROID, np.float32), (n, 1)),
-        s2_bands=SICKLE_S2_BANDS,
-        s1_bands=SICKLE_S1_SRC,
-        climate_bands=[],
-    )
-
-
-# --------------------------------------------------------------------------- #
-# YieldSAT (field-level crop yield regression from ML-ready NetCDFs)
-# --------------------------------------------------------------------------- #
-
-def _decode_attrs(attrs: dict) -> dict[int, str]:
-    """Decode integer-code attrs used by YieldSAT categorical variables."""
-    out: dict[int, str] = {}
-    for key, value in attrs.items():
-        try:
-            out[int(key)] = str(value)
-        except (TypeError, ValueError):
-            continue
-    return out
-
-
-def _decode_values(values: np.ndarray, attrs: dict) -> np.ndarray:
-    mapping = _decode_attrs(attrs)
-    if not mapping:
-        return values.astype(str)
-    return np.asarray([mapping.get(int(v), str(int(v))) for v in values], dtype=object)
-
-
-def _ys_doy(times: np.ndarray) -> np.ndarray:
-    dates = times.astype("datetime64[ns]").astype("datetime64[D]")
-    years = dates.astype("datetime64[Y]").astype("datetime64[D]")
-    return (dates - years).astype(np.int64).astype(np.float32) + 1.0
-
-
-def _ys_latlon_from_unit_xyz(x: float, y: float, z: float, fallback: tuple[float, float]) -> tuple[float, float]:
-    vec = np.asarray([x, y, z], dtype=np.float64)
-    norm = np.linalg.norm(vec)
-    if not np.isfinite(norm) or norm == 0:
-        return fallback
-    vec = vec / norm
-    lat = np.degrees(np.arcsin(np.clip(vec[2], -1.0, 1.0)))
-    lon = np.degrees(np.arctan2(vec[1], vec[0]))
-    if not np.isfinite(lat) or not np.isfinite(lon):
-        return fallback
-    return float(lat), float(lon)
-
-
-def _ys_existing_band_names(ds, names: list[str]) -> list[str]:
-    bands = {str(b) for b in ds["band"].values}
-    missing = [name for name in names if name not in bands]
-    if missing:
-        raise ValueError(f"YieldSAT file is missing expected bands: {missing}")
-    return names
-
-
-def _ys_field_records(path: Path, country_name: str, field_limit: set[str] | None):
-    import xarray as xr
-
-    ds = xr.open_dataset(path)
     try:
-        fields = _decode_values(ds["field_shared_name"].values, ds["field_shared_name"].attrs)
-        unique_fields = np.unique(fields)
-        if field_limit is not None:
-            unique_fields = np.asarray([f for f in unique_fields if str(f) in field_limit], dtype=object)
-        if len(unique_fields) == 0:
-            return []
+        import breizhcrops as bzh
+    except ImportError as exc:
+        raise ImportError("BreizhCrops needs the `breizhcrops` package (uv pip install breizhcrops).") from exc
 
-        s2_names = _ys_existing_band_names(ds, YS_S2_SOURCE_BANDS)
-        climate_names = _ys_existing_band_names(ds, YS_CLIMATE_SOURCE_BANDS)
-        coord_names = [b for b in YS_COORD_BANDS if b in {str(v) for v in ds["band"].values}]
-        fallback_latlon = YS_COUNTRY_CENTROID.get(country_name, (0.0, 0.0))
-        records = []
-        for field_name in unique_fields:
-            idx = np.flatnonzero(fields == field_name)
-            if len(idx) == 0:
+    base = Path(root) / "breizhcrops"
+    regions = regions or BZ_REGIONS
+    col = {b: i for i, b in enumerate(BZ_X_BANDS)}
+    keep_idx = [col[b] for b in BZ_S2_KEEP]
+    b4i, b8i = col["B4"], col["B8"]
+
+    s2_list: list[np.ndarray] = []
+    labels: list[int] = []
+    groups: list[str] = []
+    for region in regions:
+        ds = bzh.BreizhCrops(region, root=str(base), level="L1C", load_timeseries=True, verbose=False)
+        for i in range(len(ds)):
+            x, y, _ = ds[i]
+            x = np.asarray(x, dtype=np.float32)
+            if x.ndim != 2 or x.shape[1] < len(BZ_X_BANDS) or x.shape[0] < 1:
                 continue
-            s2_raw = ds["sample"].isel(index=idx).sel(band=s2_names).values.astype(np.float32)
-            target = ds["target"].isel(index=idx).values.astype(np.float32)
-            if s2_raw.ndim != 3 or len(target) == 0 or not np.isfinite(target).any():
-                continue
-            s2_mean = np.nanmean(s2_raw, axis=0)
-            b4, b8 = s2_mean[:, s2_names.index("B04")], s2_mean[:, s2_names.index("B08")]
-            ndvi = np.divide(b8 - b4, b8 + b4, out=np.zeros_like(b4), where=(b8 + b4) > 0)
-            s2 = np.concatenate([s2_mean, ndvi[:, None]], axis=1).astype(np.float32)
+            x = x[:, : len(BZ_X_BANDS)] * 1e4  # reflectance (0-1) -> DN, like the other benchmarks
+            b4, b8 = x[:, b4i], x[:, b8i]
+            denom = b8 + b4
+            ndvi = np.divide(b8 - b4, denom, out=np.zeros_like(b4), where=denom != 0)
+            s2 = np.concatenate([x[:, keep_idx], ndvi[:, None]], axis=1)  # (T, 11)
+            s2_list.append(_resample_fixed(s2, BZ_TIMESTEPS))
+            labels.append(int(y))
+            groups.append(region)
 
-            climate_raw = ds["sample"].isel(index=idx).sel(band=climate_names).values.astype(np.float32)
-            climate = np.nanmean(climate_raw, axis=0).astype(np.float32)
+    if not s2_list:
+        raise ValueError(f"No BreizhCrops parcels parsed from {base}")
 
-            times = ds["times"].isel(index=int(idx[0])).values
-            doy = _ys_doy(np.asarray(times))
-            if len(doy) != s2.shape[0]:
-                doy = np.linspace(1, 365, s2.shape[0]).astype(np.float32)
-
-            latlon = fallback_latlon
-            if len(coord_names) == 3:
-                coords = ds["sample"].isel(index=idx).sel(band=coord_names).values.astype(np.float32)
-                xyz = np.nanmean(coords, axis=(0, 1))
-                latlon = _ys_latlon_from_unit_xyz(float(xyz[0]), float(xyz[1]), float(xyz[2]), fallback_latlon)
-
-            records.append((s2, climate, doy, float(np.nanmean(target)), country_name, latlon, str(field_name)))
-        return records
-    finally:
-        ds.close()
-
-
-def load_yieldsat(
-    root: Path = DEFAULT_ROOT,
-    timesteps: int = 24,
-    max_samples: int | None = None,
-    shuffle: bool = True,
-    seed: int = 0,
-) -> Benchmark:
-    """Load YieldSAT as field-level yield regression.
-
-    YieldSAT's ML-ready release is pixel-level: one row per 10 m pixel, with
-    ``sample(index,time_step,band)`` and ``target(index)`` yield. This loader
-    groups all pixels belonging to the same ``field_shared_name`` and averages
-    both inputs and yield targets, producing one field-level sample per field.
-    That keeps this frozen-embedding pipeline tractable while preserving an
-    externally measured yield regression target.
-    """
-    base = Path(root) / "yieldsat"
-    preprocessed = base / "preprocessed-24-ts"
-    if not preprocessed.exists():
-        raise FileNotFoundError(f"YieldSAT preprocessed directory not found: {preprocessed}")
-
-    country_paths = [(country, preprocessed / country / YS_NETCDF_NAME) for country in YS_COUNTRIES]
-    missing = [str(path) for _, path in country_paths if not path.exists()]
-    if missing:
-        raise FileNotFoundError("Missing YieldSAT NetCDF files:\n  " + "\n  ".join(missing))
-
-    field_names_by_country: dict[str, list[str]] = {}
-    for country, path in country_paths:
-        import xarray as xr
-
-        ds = xr.open_dataset(path)
-        try:
-            fields = _decode_values(ds["field_shared_name"].values, ds["field_shared_name"].attrs)
-            field_names_by_country[country] = sorted(np.unique(fields).astype(str).tolist())
-        finally:
-            ds.close()
-
-    selected = [(country, field) for country in YS_COUNTRIES for field in field_names_by_country[country]]
+    order = np.arange(len(s2_list))
     if shuffle:
-        order = np.random.default_rng(seed).permutation(len(selected))
-        selected = [selected[i] for i in order]
+        order = np.random.default_rng(seed).permutation(order)
     if max_samples:
-        selected = selected[:max_samples]
-    wanted: dict[str, set[str]] = {}
-    for country, field in selected:
-        wanted.setdefault(country, set()).add(field)
+        order = order[:max_samples]
+    s2 = np.stack([s2_list[i] for i in order]).astype(np.float32)
+    labels_arr = np.asarray([labels[i] for i in order], dtype=np.int64)
+    groups_arr = np.asarray([groups[i] for i in order], dtype=object)
 
-    parsed = []
-    for country, path in country_paths:
-        parsed.extend(_ys_field_records(path, country, wanted.get(country, set())))
-    if not parsed:
-        raise ValueError(f"No usable YieldSAT fields parsed under {preprocessed}")
-
-    if timesteps != parsed[0][0].shape[0]:
-        raise ValueError(f"YieldSAT preprocessed files are 24-step; got timesteps={timesteps}")
-
-    s2_list = [p[0] for p in parsed]
-    clim_list = [p[1] for p in parsed]
-    doy_list = [p[2] for p in parsed]
-    labels = [p[3] for p in parsed]
-    groups = [p[4] for p in parsed]
-    latlons = [p[5] for p in parsed]
-    n = len(parsed)
-    ones = np.ones((n, timesteps), dtype=np.float32)
+    n = len(s2)
+    doy = np.tile(_synthetic_month_doy(BZ_TIMESTEPS), (n, 1))
+    ones = np.ones((n, BZ_TIMESTEPS), dtype=np.float32)
+    zeros = np.zeros((n, BZ_TIMESTEPS), np.float32)
     return Benchmark(
-        name="yieldsat",
-        task="regression",
-        s2=np.stack(s2_list).astype(np.float32),
-        s1=np.zeros((n, timesteps, 2), np.float32),
-        climate=np.stack(clim_list).astype(np.float32),
+        name="breizhcrops",
+        task="multiclass",
+        s2=s2,
+        s1=np.zeros((n, BZ_TIMESTEPS, 2), np.float32),
+        climate=np.zeros((n, BZ_TIMESTEPS, 0), np.float32),
         s2_mask=ones.copy(),
-        s1_mask=np.zeros((n, timesteps), np.float32),
-        climate_mask=ones.copy(),
-        doy=np.stack(doy_list).astype(np.float32),
-        labels=np.asarray(labels, np.float32),
-        groups=np.asarray(groups, dtype=object),
-        latlon=np.asarray(latlons, dtype=np.float32),
-        s2_bands=YS_S2_BANDS,
-        s1_bands=CH_S1_BANDS,
-        climate_bands=YS_CLIMATE_BANDS,
+        s1_mask=zeros.copy(),
+        climate_mask=zeros.copy(),
+        doy=doy,
+        labels=labels_arr,
+        groups=groups_arr,
+        latlon=np.full((n, 2), np.nan, np.float32),
+        s2_bands=BZ_S2_BANDS,
+        s1_bands=["VV", "VH"],
+        climate_bands=[],
+        label_names=_bz_class_names(base),
+        years=np.full(n, 2017, np.int64),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# PASTIS-R  (crop-type mapping / semantic segmentation, 128x128 patch time series)
+# --------------------------------------------------------------------------- #
+
+# PASTIS DATA_S2 is (T, 10, 128, 128) in this 10-band order. DATA_S1A is
+# (T, 3, 128, 128) as VV, VH, VV/VH. The semantic target is channel 0 of
+# ANNOTATIONS/TARGET_<id>.npy (20 classes: 0=background, 1-18 crops, 19=void).
+PASTIS_S2_BANDS = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12"]
+PASTIS_S1_BANDS = ["VV", "VH", "VV/VH"]
+PASTIS_N_CLASSES = 20
+PASTIS_IGNORE = 19
+PASTIS_TIMESTEPS = 12
+PASTIS_TILE_SIZE = 64
+
+
+def _pastis_months(dates_field) -> np.ndarray:
+    """dates-S2 {idx: YYYYMMDD} -> 0-indexed calendar month per timestep."""
+    d = dates_field if isinstance(dates_field, dict) else json.loads(dates_field)
+    items = sorted(d.items(), key=lambda kv: int(kv[0]))
+    return np.array([((int(v) // 100) % 100) - 1 for _, v in items], dtype=np.int64)
+
+
+def _monthly_patch(values: np.ndarray, months: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Aggregate a variable-length ``(T,C,H,W)`` patch into calendar months."""
+    if len(months) != values.shape[0]:
+        raise ValueError(f"Date count {len(months)} does not match observations {values.shape[0]}")
+    out = np.zeros((PASTIS_TIMESTEPS,) + values.shape[1:], dtype=np.float32)
+    mask = np.zeros(PASTIS_TIMESTEPS, dtype=np.float32)
+    for month in range(PASTIS_TIMESTEPS):
+        selected = months == month
+        if selected.any():
+            out[month] = np.asarray(values[selected], dtype=np.float32).mean(axis=0)
+            mask[month] = 1.0
+    return out, mask
+
+
+def _degrade_pastis_tile(tile: PastisTile, sensor_off: str, temporal_drop: float, seed: int) -> PastisTile:
+    s2, s1 = tile.s2.copy(), tile.s1.copy()
+    s2_mask, s1_mask = tile.s2_mask.copy(), tile.s1_mask.copy()
+    if sensor_off == "s2":
+        s2.fill(0)
+        s2_mask.fill(0)
+    elif sensor_off == "s1":
+        s1.fill(0)
+        s1_mask.fill(0)
+    elif sensor_off != "none":
+        raise ValueError(f"PASTIS-R does not provide modality {sensor_off!r}")
+    if temporal_drop:
+        rng = np.random.default_rng(seed)
+        keep = rng.binomial(1, 1.0 - temporal_drop, size=PASTIS_TIMESTEPS).astype(np.float32)
+        keep[0] = 1.0
+        if keep.sum() < 2:
+            keep[1] = 1.0
+        s2 *= keep[:, None, None, None]
+        s1 *= keep[:, None, None, None]
+        s2_mask *= keep
+        s1_mask *= keep
+    return replace(tile, s2=s2, s1=s1, s2_mask=s2_mask, s1_mask=s1_mask)
+
+
+def _pastis_pixel_benchmark(
+    s2: np.ndarray,
+    s1: np.ndarray,
+    s2_mask: np.ndarray,
+    s1_mask: np.ndarray,
+    labels: np.ndarray,
+    valid: np.ndarray,
+    fold: int,
+) -> Benchmark:
+    """Convert one spatial tile to a bounded batch of valid pixel time series."""
+    _, _, height, width = s2.shape
+    s2_pixels = s2.transpose(2, 3, 0, 1).reshape(height * width, PASTIS_TIMESTEPS, -1)[valid]
+    s1_pixels = s1.transpose(2, 3, 0, 1).reshape(height * width, PASTIS_TIMESTEPS, -1)[valid]
+    red = s2_pixels[:, :, PASTIS_S2_BANDS.index("B4")]
+    nir = s2_pixels[:, :, PASTIS_S2_BANDS.index("B8")]
+    ndvi = np.divide(nir - red, nir + red, out=np.zeros_like(red), where=(nir + red) != 0)
+    s2_pixels = np.concatenate([s2_pixels, ndvi[:, :, None]], axis=2).astype(np.float32)
+    n = int(valid.sum())
+    return Benchmark(
+        name="pastis",
+        task="segmentation",
+        s2=s2_pixels,
+        s1=s1_pixels.astype(np.float32),
+        climate=np.zeros((n, PASTIS_TIMESTEPS, 0), dtype=np.float32),
+        s2_mask=np.broadcast_to(s2_mask, (n, PASTIS_TIMESTEPS)).copy(),
+        s1_mask=np.broadcast_to(s1_mask, (n, PASTIS_TIMESTEPS)).copy(),
+        climate_mask=np.zeros((n, PASTIS_TIMESTEPS), dtype=np.float32),
+        doy=np.broadcast_to(_synthetic_month_doy(PASTIS_TIMESTEPS), (n, PASTIS_TIMESTEPS)).copy(),
+        labels=labels[valid].astype(np.int64),
+        groups=np.full(n, fold, dtype=np.int64),
+        latlon=np.zeros((n, 2), dtype=np.float32),
+        s2_bands=PASTIS_S2_BANDS + ["NDVI"],
+        s1_bands=PASTIS_S1_BANDS,
+        climate_bands=[],
+        years=np.full(n, 2019, dtype=np.int64),
+    )
+
+
+def load_pastis(
+    root: Path = DEFAULT_ROOT,
+    max_samples: int | None = None,
+    shuffle: bool = True,
+    seed: int = 0,
+    folds: list[int] | None = None,
+) -> PastisBenchmark:
+    """Build a lazy PASTIS-R descriptor using the official five folds.
+
+    S2 and ascending-orbit S1 are monthly aggregated only when a 64x64 tile is
+    requested. ``max_samples`` limits source patches, not pixels or tiles.
+    """
+    base = Path(root) / "pastis"
+    if not (base / "metadata.geojson").exists():
+        raise FileNotFoundError(f"PASTIS metadata not found: {base / 'metadata.geojson'}")
+    geo = json.loads((base / "metadata.geojson").read_text())
+    rows = [feature["properties"] for feature in geo["features"]]
+    if folds:
+        rows = [row for row in rows if int(row["Fold"]) in folds]
+    order = np.arange(len(rows))
+    if shuffle:
+        order = np.random.default_rng(seed).permutation(order)
+    if max_samples:
+        order = order[:max_samples]
+
+    patches: list[PastisPatch] = []
+    for i in order:
+        r = rows[int(i)]
+        pid = int(r["ID_PATCH"])
+        s2_path = base / "DATA_S2" / f"S2_{pid}.npy"
+        s1_path = base / "DATA_S1A" / f"S1A_{pid}.npy"
+        target_path = base / "ANNOTATIONS" / f"TARGET_{pid}.npy"
+        if not (s2_path.exists() and s1_path.exists() and target_path.exists()):
+            continue
+        patches.append(
+            PastisPatch(
+                patch_id=pid,
+                fold=int(r["Fold"]),
+                s2_path=s2_path,
+                s1_path=s1_path,
+                target_path=target_path,
+                s2_months=_pastis_months(r["dates-S2"]),
+                s1_months=_pastis_months(r["dates-S1A"]),
+            )
+        )
+
+    if not patches:
+        raise ValueError(f"No PASTIS patches parsed from {base}")
+    return PastisBenchmark(
+        name="pastis",
+        task="segmentation",
+        patches=tuple(patches),
+        tile_size=PASTIS_TILE_SIZE,
+        ignore_index=PASTIS_IGNORE,
     )
 
 
@@ -762,12 +869,12 @@ def load_yieldsat(
 LOADERS = {
     "cropharvest": load_cropharvest,
     "eurocropsml": load_eurocropsml,
-    "sickle": load_sickle,
-    "yieldsat": load_yieldsat,
+    "breizhcrops": load_breizhcrops,
+    "pastis": load_pastis,
 }
 
 
-def get_input(name: str, root: Path = DEFAULT_ROOT, **kwargs) -> Benchmark:
+def get_input(name: str, root: Path = DEFAULT_ROOT, **kwargs) -> Benchmark | PastisBenchmark:
     """Load a benchmark by name."""
     if name not in LOADERS:
         raise KeyError(f"Unknown benchmark {name!r}. Known: {sorted(LOADERS)}")

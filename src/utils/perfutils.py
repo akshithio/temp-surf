@@ -3,7 +3,7 @@
 Records wall-clock, user-CPU, system-CPU time, MAC estimates, data
 dimensions, and GPU utilization at every stage.  Use as a context manager::
 
-    with measure("encode/clean", n_samples=128, n_features=128):
+    with measure("encode/baseline", n_samples=128, n_features=128):
         ...
 
 Every event is tagged with a thread-local **identity** (seed, holdout,
@@ -26,11 +26,10 @@ import resource
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from threading import Lock
 from typing import Any
-
 
 try:
     import pynvml

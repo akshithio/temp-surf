@@ -6,7 +6,6 @@ GPU via ``CUDA_VISIBLE_DEVICES`` and handed a disjoint, round-robin subset of th
 pairs. The fan-out launcher does this for you::
 
     cd src && python utils/gputils.py        # one process per detected GPU, in parallel
-    # or choose a count:  python utils/gputils.py 2
 
 Inside main.py only two hooks are needed (already wired)::
 
@@ -35,6 +34,7 @@ REPO = Path(__file__).resolve().parents[2]
 
 SHARD_ENV = "RB_SHARD"
 NUM_SHARDS_ENV = "RB_NUM_SHARDS"
+FORCED_NUM_SHARDS: int | None = None
 
 
 def gpu_count() -> int:
@@ -77,7 +77,7 @@ def fan_out(num_shards: int | None = None) -> int:
     GPUs are visible.
     """
     n = num_shards or max(1, gpu_count())
-    scratch = Path(os.environ.get("ROBUSTNESS_SCRATCH", REPO / "data"))
+    scratch = REPO / "data"
     log_dir = scratch / "output" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     per_shard_cores = max(1, (os.cpu_count() or 2) // n)
@@ -109,4 +109,4 @@ def fan_out(num_shards: int | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(fan_out(int(sys.argv[1]) if len(sys.argv) > 1 else None))
+    raise SystemExit(fan_out(FORCED_NUM_SHARDS))
