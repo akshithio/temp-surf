@@ -7,7 +7,7 @@ from evals import evals as EV
 
 def test_filter_conditions_by_axes() -> None:
     conditions = [
-        ("clean", "none", 0.0),
+        ("baseline", "none", 0.0),
         ("sensor_off_s2", "s2", 0.0),
         ("temporal_drop_50", "none", 0.5),
         ("s2_off_tdrop50", "s2", 0.5),
@@ -16,8 +16,8 @@ def test_filter_conditions_by_axes() -> None:
     sensorial = EV.filter_conditions_by_axes(conditions, ["sensorial"])
     both = EV.filter_conditions_by_axes(conditions, ["sensorial", "temporal"])
 
-    assert [c[0] for c in sensorial] == ["clean", "sensor_off_s2"]
-    assert [c[0] for c in both] == ["clean", "sensor_off_s2", "temporal_drop_50", "s2_off_tdrop50"]
+    assert [c[0] for c in sensorial] == ["baseline", "sensor_off_s2"]
+    assert [c[0] for c in both] == ["baseline", "sensor_off_s2", "temporal_drop_50", "s2_off_tdrop50"]
 
 
 def test_make_strict_holdout_splits() -> None:
@@ -32,6 +32,17 @@ def test_make_strict_holdout_splits() -> None:
     assert set(train_val.tolist()) == {0, 1, 2, 3, 6, 7}
     assert np.all(groups[train] != "hold")
     assert np.all(groups[val] != "hold")
+
+
+def test_make_splits_falls_back_when_a_class_is_singleton() -> None:
+    y = np.array([0, 0, 0, 1, 1, 2, 3, 4, 5, 6])
+
+    train, val, test = EV.make_splits(y, seed=0)
+
+    assert len(set(train) & set(val)) == 0
+    assert len(set(train) & set(test)) == 0
+    assert len(set(val) & set(test)) == 0
+    assert sorted(np.concatenate([train, val, test]).tolist()) == list(range(len(y)))
 
 
 def test_subset_indices() -> None:
@@ -51,51 +62,90 @@ def test_expected_calibration_error() -> None:
     assert EV.expected_calibration_error(y, prob, n_bins=2) == 0.0
 
 
-def test_regression_source_budget_rows_include_budget_metadata() -> None:
-    rng = np.random.default_rng(2)
-    x_train = rng.normal(size=(12, 4)).astype(np.float32)
-    x_test = rng.normal(size=(5, 4)).astype(np.float32)
-    y_train = np.linspace(0, 11, 12, dtype=np.float32)
-    y_test = np.linspace(2, 6, 5, dtype=np.float32)
-
+def test_binary_probe_writes_predictions_for_each_source_budget() -> None:
+    rng = np.random.default_rng(0)
+    x_train = rng.normal(size=(40, 4))
+    y_train = np.array([0, 1] * 20)
+    x_train[y_train == 1, 0] += 2.0
+    x_test = rng.normal(size=(6, 4))
+    y_test = np.array([0, 1, 0, 1, 0, 1])
     rows: list[dict] = []
-    EV.run_probes_regression(
+    preds: list[dict] = []
+
+    EV.run_probes(
         rows,
         x_train,
         x_test,
         y_train,
         y_test,
         seed=0,
-        budgets=[0.25, 1.0],
-        meta={"task": "unit", "method": "erm"},
+        budgets=[0.5, 1.0],
+        meta={"encoder": "e", "task": "t", "method": "erm", "split_regime": "random_id", "condition": "baseline"},
+        predictions=preds,
+        sample_ids_test=np.arange(100, 106),
+        groups_test=np.array(["g"] * 6),
     )
 
-    assert [r["budget_type"] for r in rows] == ["source", "source"]
-    assert [r["label_budget"] for r in rows] == [0.25, 1.0]
-    assert [r["n_train_sub"] for r in rows] == [3, 12]
-    assert all("rmse" in r and "mae" in r and "r2" in r for r in rows)
+    assert [r["label_budget"] for r in rows] == [0.5, 1.0]
+    assert len(preds) == 12
+    assert {p["label_budget"] for p in preds} == {0.5, 1.0}
+    assert {p["sample_id"] for p in preds} == set(range(100, 106))
+    assert {"prob", "pred_default", "pred_calibrated"}.issubset(preds[0])
 
 
-def test_regression_target_budget_moves_target_labels_out_of_test_set() -> None:
-    rng = np.random.default_rng(3)
-    x_source = rng.normal(size=(10, 3)).astype(np.float32)
-    x_target = rng.normal(size=(6, 3)).astype(np.float32)
-    y_source = np.linspace(0, 9, 10, dtype=np.float32)
-    y_target = np.linspace(10, 15, 6, dtype=np.float32)
+def test_multiclass_probe_writes_prediction_vectors() -> None:
+    rng = np.random.default_rng(1)
+    y_train = np.array([0, 1, 2] * 12)
+    x_train = rng.normal(size=(36, 5))
+    x_train[np.arange(len(y_train)), y_train] += 2.0
+    y_test = np.array([0, 1, 2, 0, 1, 2])
+    x_test = rng.normal(size=(6, 5))
+    rows: list[dict] = []
+    preds: list[dict] = []
+
+    EV.run_probes_multiclass(
+        rows,
+        x_train,
+        x_test,
+        y_train,
+        y_test,
+        seed=0,
+        budgets=[1.0],
+        meta={"encoder": "e", "task": "t", "method": "erm", "split_regime": "random_id", "condition": "baseline"},
+        predictions=preds,
+        sample_ids_test=np.arange(200, 206),
+        groups_test=np.array(["g"] * 6),
+    )
+
+    assert len(rows) == 1
+    assert len(preds) == 6
+    assert {"pred", "prob_true", "prob_pred", "classes", "probs"}.issubset(preds[0])
+
+
+def test_segmentation_probe_reports_official_validation_and_test_splits() -> None:
+    rng = np.random.default_rng(7)
+    y_train = np.tile(np.arange(3), 30)
+    y_val = np.tile(np.arange(3), 8)
+    y_test = np.tile(np.arange(3), 8)
+
+    def features(labels):
+        values = rng.normal(size=(len(labels), 6))
+        values[np.arange(len(labels)), labels] += 4.0
+        return values
 
     rows: list[dict] = []
-    EV.run_probes_regression_target(
+    EV.run_probes_segmentation(
         rows,
-        x_source,
-        x_target,
-        y_source,
-        y_target,
+        features(y_train),
+        features(y_val),
+        features(y_test),
+        y_train,
+        y_val,
+        y_test,
         seed=0,
-        budgets=[0, 2],
-        meta={"task": "unit", "method": "erm"},
+        budgets=[1.0],
+        meta={"task": "pastis-crop-seg"},
     )
 
-    assert [r["budget_type"] for r in rows] == ["target", "target"]
-    assert [r["label_budget"] for r in rows] == [0, 2]
-    assert [r["n_train_sub"] for r in rows] == [10, 12]
-    assert [r["n_test"] for r in rows] == [6, 4]
+    assert {row["evaluation_split"] for row in rows} == {"validation", "test"}
+    assert all({"miou", "pixel_accuracy", "macro_f1", "weighted_f1"}.issubset(row) for row in rows)

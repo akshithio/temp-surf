@@ -2,13 +2,13 @@
 
 Presto (Tseng et al., "Lightweight, Pre-trained Transformers for Remote Sensing
 Timeseries") is the lightweight pixel-timeseries baseline -- the model WorldCereal
-actually deploys. We use it frozen: corrupt a :class:`Benchmark`, run it through
+actually deploys. We use it frozen: degrade a :class:`Benchmark`, run it through
 ``PrestoEncoder.encode``, get ``(N, 128)`` embeddings, and feed those to the
 robustness methods + probe like any other encoder.
 
-Install (not on PyPI)::
+Install through the project environment::
 
-    pip install git+https://github.com/nasaharvest/presto.git
+    uv pip install --no-deps git+https://github.com/nasaharvest/presto.git
 
 Authoritative input contract (from Presto's single_file_presto.py):
   * ``x``            : (B, T, 17) float, band order = PRESTO_BANDS below
@@ -18,8 +18,9 @@ Authoritative input contract (from Presto's single_file_presto.py):
   * ``month``        : (B,) long start month (0-11), Presto cycles it over T
   * encoder(..., eval_task=True) -> (B, 128) = norm(mean over time tokens)
 
-Our Benchmark provides all 17 bands except ``slope`` (SRTM idx 15), which is
-always marked missing in the mask. Two pieces live only in the full Presto
+Our Benchmark provides all 17 bands for CropHarvest (including SRTM ``slope``);
+EuroCropsML has no climate/SRTM modality, so those bands are marked missing there.
+Any band a benchmark lacks is zeroed and flagged in the mask. Two pieces live only in the full Presto
 package and so are exposed as overridable hooks here (with safe defaults +
 warnings), because they cannot be verified offline:
   * ``normalizer``  : per-band (mean, std) Presto expects on inputs.
@@ -28,13 +29,18 @@ warnings), because they cannot be verified offline:
 
 from __future__ import annotations
 
+import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Callable
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import thop
 import torch
+
+from utils.ioutils import hf_download_to
 
 try:
     from presto import Presto
@@ -65,6 +71,21 @@ PRESTO_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 PRESTO_BATCH_SIZE = 2048
 PRESTO_WEIGHTS_PATH = None
 PRESTO_NORMALIZER = None  # None = use built-in PRESTO_ADD / PRESTO_DIVIDE
+PRESTO_HF_REPO = "torchgeo/presto"
+PRESTO_HF_FILENAME = "model-f317d103.pth"
+
+_REPO = Path(__file__).resolve().parents[2]
+_INPUT = Path(os.environ.get("ROBUSTNESS_INPUT", _REPO / "data" / "input"))
+DEFAULT_PRESTO_WEIGHTS = _INPUT / "models" / "presto" / PRESTO_HF_FILENAME
+
+# Calendar month (0=Jan) of timestep 0, per benchmark. Presto's month embedding is keyed
+# to the absolute start month, so timestep 0 must be labeled with the right calendar month.
+# Presto's own CropHarvest benchmark fixes this to February: every CropHarvest sample is the
+# 2020-2021 agricultural year (export_end_date = Feb 1, so the 12-month series begins in
+# February). This is start_month=1 verbatim from presto/eval/cropharvest_eval.py. Benchmarks
+# absent from this map (e.g. EuroCropsML, harmonized to calendar Jan-Dec monthly composites
+# whose timestep 0 really is January) fall back to deriving the start month from day-of-year.
+PRESTO_START_MONTH: dict[str, int] = {"cropharvest": 1}
 
 # Which Benchmark modality supplies each Presto band (None = never available).
 _BAND_MODALITY: dict[str, str | None] = {
@@ -72,7 +93,7 @@ _BAND_MODALITY: dict[str, str | None] = {
     "B2": "s2", "B3": "s2", "B4": "s2", "B5": "s2", "B6": "s2", "B7": "s2",
     "B8": "s2", "B8A": "s2", "B11": "s2", "B12": "s2", "NDVI": "s2",
     "temperature": "climate", "precipitation": "climate", "elevation": "climate",
-    "slope": None,
+    "slope": "climate",  # CropHarvest supplies slope (SRTM); EuroCropsML has no climate, so it stays masked there
 }
 
 # Presto's fixed per-band normalization in NORMED_BANDS order: norm = (x + ADD) / DIVIDE.
@@ -102,9 +123,15 @@ def _default_load_model(weights_path: str | None) -> Any:
     if Presto is None:
         raise ImportError(
             "Presto is not installed. Install it with:\n"
-            "  pip install git+https://github.com/nasaharvest/presto.git"
+            "  uv pip install --no-deps git+https://github.com/nasaharvest/presto.git"
         )
-    model = Presto.load_pretrained() if weights_path is None else Presto.load_pretrained(weights_path)
+    path = Path(weights_path).expanduser() if weights_path is not None else DEFAULT_PRESTO_WEIGHTS
+    if not path.exists() and weights_path is None:
+        path = hf_download_to(PRESTO_HF_REPO, PRESTO_HF_FILENAME, DEFAULT_PRESTO_WEIGHTS)
+    elif not path.exists():
+        raise FileNotFoundError(f"Presto weights not found at {path}.")
+    model = Presto.construct()
+    model.load_state_dict(torch.load(path, map_location="cpu", weights_only=False))
     model.eval()
     return model.encoder
 
@@ -113,7 +140,7 @@ def _default_load_model(weights_path: str | None) -> Any:
 class PrestoEncoder:
     """Frozen Presto encoder: Benchmark -> (N, 128) embeddings.
 
-    ``encode`` expects an already-corrupted Benchmark (apply ``corrupt`` upstream);
+    ``encode`` expects an already-degraded Benchmark (apply ``degrade`` upstream);
     this class is condition-agnostic, exactly like every other encoder.
     """
 
@@ -135,7 +162,7 @@ class PrestoEncoder:
 
     # ---- input assembly (verifiable without Presto) ------------------------
     def to_presto_inputs(
-        self, bench: "Benchmark"
+        self, bench: Benchmark
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Assemble (x, mask, dynamic_world, latlons, months) as numpy arrays.
 
@@ -173,27 +200,65 @@ class PrestoEncoder:
 
         dynamic_world = np.full((n, t), DYNAMIC_WORLD_MISSING, dtype=np.int64)
         latlons = np.nan_to_num(bench.latlon.astype(np.float32), nan=0.0)
-        months = _doy_to_month(bench.doy[:, 0])
+        start_month = PRESTO_START_MONTH.get(getattr(bench, 'name', ''))
+        months = (
+            np.full(n, start_month, dtype=np.int64)
+            if start_month is not None
+            else _doy_to_month(bench.doy[:, 0])
+        )
         return x, mask, dynamic_world, latlons, months
 
     # ---- MAC estimate (thop) ---------------------------------------------
     def compute_macs(self) -> int:
         self._ensure_loaded()
         B, T = 1, 12
+        dev = next(self._encoder.parameters()).device  # dummies must match the model's device
         dummy = {
-            "x": torch.randn(B, T, PRESTO_NUM_BANDS),
-            "dynamic_world": torch.full((B, T), DYNAMIC_WORLD_MISSING, dtype=torch.long),
-            "latlons": torch.randn(B, 2),
-            "mask": torch.randn(B, T, PRESTO_NUM_BANDS),
-            "month": torch.zeros(B, dtype=torch.long),
+            "x": torch.randn(B, T, PRESTO_NUM_BANDS, device=dev),
+            "dynamic_world": torch.full((B, T), DYNAMIC_WORLD_MISSING, dtype=torch.long, device=dev),
+            "latlons": torch.randn(B, 2, device=dev),
+            "mask": torch.randn(B, T, PRESTO_NUM_BANDS, device=dev),
+            "month": torch.zeros(B, dtype=torch.long, device=dev),
             "eval_task": True,
         }
-        macs, _ = thop.profile(self._encoder, inputs=(dummy["x"],), kwargs=dummy, verbose=False)
+        # thop.profile only passes positional `inputs` to the model; wrap so the forward's
+        # remaining keyword args are supplied while thop still hooks the real encoder modules.
+        rest = {k: v for k, v in dummy.items() if k != "x"}
+        encoder = self._encoder
+
+        class _MacWrap(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.encoder = encoder
+
+            def forward(self, x):
+                return self.encoder(x, **rest)
+
+        macs, _ = thop.profile(_MacWrap(), inputs=(dummy["x"],), verbose=False)
         return int(macs)
 
     # ---- embedding extraction ---------------------------------------------
+    def forward_for_attribution(self, bench: Benchmark):
+        """Differentiable Benchmark -> embedding path for input saliency (AttributionBatch)."""
+        from diagnostics.interp import AttributionBatch, specs_for
+
+        self._ensure_loaded()
+        x, mask, dw, latlons, months = self.to_presto_inputs(bench)
+        x_t = torch.from_numpy(x).to(self.device).requires_grad_(True)
+        emb = self._encoder(
+            x=x_t,
+            dynamic_world=torch.from_numpy(dw).to(self.device),
+            latlons=torch.from_numpy(latlons).to(self.device),
+            mask=torch.from_numpy(mask).to(self.device),
+            month=torch.from_numpy(months).to(self.device),
+            eval_task=True,
+        )
+        # x_t channels are the 17 PRESTO_BANDS (S1+S2+ERA5+SRTM+NDVI), in that order.
+        specs = specs_for([(_BAND_MODALITY.get(b) or "s2", b) for b in PRESTO_BANDS])
+        return AttributionBatch(emb, {"presto": x_t}, {"presto": specs})
+
     @torch.no_grad()
-    def encode(self, bench: "Benchmark") -> np.ndarray:
+    def encode(self, bench: Benchmark) -> np.ndarray:
         self._ensure_loaded()
         x, mask, dw, latlons, months = self.to_presto_inputs(bench)
         n = x.shape[0]

@@ -1,30 +1,21 @@
 from __future__ import annotations
 
-from pathlib import Path
+import json
 
 import numpy as np
 import pytest
-import xarray as xr
 
 from dataio.get_input import (
-    Benchmark,
     CH_CLIMATE_BANDS,
     CH_S1_BANDS,
     CH_S2_BANDS,
-    YS_CLIMATE_BANDS,
-    YS_CLIMATE_SOURCE_BANDS,
-    YS_COORD_BANDS,
-    YS_COUNTRIES,
-    YS_NETCDF_NAME,
-    YS_S2_BANDS,
-    YS_S2_SOURCE_BANDS,
+    Benchmark,
+    PastisBenchmark,
     _resample_to,
-    _ys_doy,
-    _ys_latlon_from_unit_xyz,
-    corrupt,
+    degrade,
     get_input,
-    load_yieldsat,
 )
+from utils import ioutils
 
 
 def _tiny_benchmark() -> Benchmark:
@@ -34,7 +25,7 @@ def _tiny_benchmark() -> Benchmark:
         task="regression",
         s2=np.arange(n * t * 11, dtype=np.float32).reshape(n, t, 11),
         s1=np.ones((n, t, 2), dtype=np.float32),
-        climate=np.full((n, t, 3), 2.0, dtype=np.float32),
+        climate=np.full((n, t, len(CH_CLIMATE_BANDS)), 2.0, dtype=np.float32),
         s2_mask=np.ones((n, t), dtype=np.float32),
         s1_mask=np.ones((n, t), dtype=np.float32),
         climate_mask=np.ones((n, t), dtype=np.float32),
@@ -48,10 +39,10 @@ def _tiny_benchmark() -> Benchmark:
     )
 
 
-def test_corrupt_sensor_off() -> None:
+def test_degraded_sensor_off() -> None:
     bench = _tiny_benchmark()
 
-    out = corrupt(bench, sensor_off="s2")
+    out = degrade(bench, sensor_off="s2")
 
     assert np.all(out.s2 == 0)
     assert np.all(out.s2_mask == 0)
@@ -59,10 +50,10 @@ def test_corrupt_sensor_off() -> None:
     np.testing.assert_array_equal(out.climate, bench.climate)
 
 
-def test_corrupt_temporal_drop() -> None:
+def test_degraded_temporal_drop() -> None:
     bench = _tiny_benchmark()
 
-    out = corrupt(bench, temporal_drop=0.99, seed=3)
+    out = degrade(bench, temporal_drop=0.99, seed=3)
 
     assert np.all(out.s2_mask[:, 0] == 1)
     assert np.all(out.s1_mask[:, 0] == 1)
@@ -93,73 +84,47 @@ def test_get_input_rejects_unknown_benchmark() -> None:
         get_input("not-a-benchmark")
 
 
-def _write_yieldsat_country(path: Path, offset: float) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    bands = YS_S2_SOURCE_BANDS + YS_CLIMATE_SOURCE_BANDS + YS_COORD_BANDS
-    n_index, n_time = 3, 24
-    sample = np.zeros((n_index, n_time, len(bands)), dtype=np.float32)
-
-    for band_i, band in enumerate(bands):
-        sample[:, :, band_i] = offset + band_i
-    sample[:, :, bands.index("B04")] = 2.0
-    sample[:, :, bands.index("B08")] = 6.0
-    sample[:, :, bands.index("temp_mean")] = 280.0 + offset
-    sample[:, :, bands.index("total_prec")] = 0.2 + offset
-    sample[:, :, bands.index("dem")] = 100.0 + offset
-    sample[:, :, bands.index("coord_x")] = 1.0
-    sample[:, :, bands.index("coord_y")] = 0.0
-    sample[:, :, bands.index("coord_z")] = 0.0
-
-    times = np.tile(
-        np.arange("2021-01-01", "2021-01-25", dtype="datetime64[D]"),
-        (n_index, 1),
+def test_pastis_is_lazy_and_yields_64_pixel_tiles(tmp_path) -> None:
+    base = tmp_path / "pastis"
+    for directory in ("DATA_S2", "DATA_S1A", "ANNOTATIONS"):
+        (base / directory).mkdir(parents=True)
+    properties = {
+        "ID_PATCH": 10000,
+        "Fold": 1,
+        "dates-S2": {"0": 20190115, "1": 20190215},
+        "dates-S1A": {"0": 20190110, "1": 20190210},
+    }
+    (base / "metadata.geojson").write_text(
+        json.dumps({"type": "FeatureCollection", "features": [{"type": "Feature", "properties": properties}]})
     )
-    ds = xr.Dataset(
-        data_vars={
-            "sample": (("index", "time_step", "band"), sample),
-            "target": (("index",), np.array([2.0, 4.0, 10.0], dtype=np.float32) + offset),
-            "times": (("index", "time_step"), times),
-            "field_shared_name": (("index",), np.array([0, 0, 1], dtype=np.int32)),
-        },
-        coords={
-            "index": np.arange(n_index),
-            "time_step": np.arange(n_time),
-            "band": np.array(bands, dtype=object),
-        },
-    )
-    ds["field_shared_name"].attrs.update({"0": "field_a", "1": "field_b"})
-    ds.to_netcdf(path)
+    np.save(base / "DATA_S2" / "S2_10000.npy", np.ones((2, 10, 128, 128), dtype=np.int16))
+    np.save(base / "DATA_S1A" / "S1A_10000.npy", np.ones((2, 3, 128, 128), dtype=np.float16))
+    target = np.zeros((3, 128, 128), dtype=np.uint8)
+    target[0, 0, 0] = 19
+    np.save(base / "ANNOTATIONS" / "TARGET_10000.npy", target)
+
+    bench = get_input("pastis", root=tmp_path, shuffle=False)
+    tiles = list(bench.iter_tiles())
+
+    assert isinstance(bench, PastisBenchmark)
+    assert bench.n_samples == 4
+    assert len(tiles) == 4
+    pixels = tiles[0][2].pixel_benchmark()
+    assert pixels.n_samples == 64 * 64 - 1
+    assert pixels.s2.shape == (64 * 64 - 1, 12, 11)
+    assert pixels.s1.shape == (64 * 64 - 1, 12, 3)
+    assert 19 not in tiles[0][3]
 
 
-def test_yieldsat_loader_aggregates_pixels_to_fields(tmp_path: Path) -> None:
-    for i, country in enumerate(YS_COUNTRIES):
-        _write_yieldsat_country(
-            tmp_path / "yieldsat" / "preprocessed-24-ts" / country / YS_NETCDF_NAME,
-            offset=float(i),
-        )
+def test_summarize_rows_ignores_legacy_rows_missing_grouping_keys() -> None:
+    rows = [
+        {"encoder": "old", "f1": 0.0},
+        {"encoder": "new", "split_regime": "random_id", "f1": 1.0},
+    ]
 
-    bench = load_yieldsat(tmp_path, max_samples=2, shuffle=False)
+    summary = ioutils.summarize_rows(rows, keys=["encoder", "split_regime"], metrics=["f1"])
 
-    assert bench.name == "yieldsat"
-    assert bench.task == "regression"
-    assert bench.n_samples == 2
-    assert bench.timesteps == 24
-    assert bench.s2.shape == (2, 24, len(YS_S2_BANDS))
-    assert bench.s1.shape == (2, 24, 2)
-    assert bench.climate.shape == (2, 24, len(YS_CLIMATE_BANDS))
-    assert bench.s2_bands == YS_S2_BANDS
-    assert bench.climate_bands == YS_CLIMATE_BANDS
-    assert set(bench.groups.tolist()) == {"Argentina"}
-    np.testing.assert_allclose(bench.labels, np.array([3.0, 10.0], dtype=np.float32))
-    np.testing.assert_allclose(bench.s2[:, :, -1], 0.5)
-    np.testing.assert_array_equal(bench.s1_mask, np.zeros((2, 24), dtype=np.float32))
-    np.testing.assert_allclose(bench.latlon, np.zeros((2, 2), dtype=np.float32), atol=1e-6)
-
-
-def test_yieldsat_helpers_decode_doy_and_unit_xyz() -> None:
-    doy = _ys_doy(np.array(["2020-01-01", "2020-12-31"], dtype="datetime64[D]"))
-    assert doy.tolist() == [1.0, 366.0]
-    lat, lon = _ys_latlon_from_unit_xyz(0.0, 1.0, 0.0, fallback=(10.0, 20.0))
-    assert abs(lat) < 1e-6
-    assert abs(lon - 90.0) < 1e-6
-    assert _ys_latlon_from_unit_xyz(0.0, 0.0, 0.0, fallback=(10.0, 20.0)) == (10.0, 20.0)
+    assert len(summary) == 1
+    assert summary[0]["encoder"] == "new"
+    assert summary[0]["split_regime"] == "random_id"
+    assert summary[0]["mean_f1"] == 1.0

@@ -5,7 +5,74 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "robustness"
 version = "0.1.0"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "einops",
+    "earthengine-api",
+    "geopandas",
+    "h5py",
+    "huggingface-hub",
+    "hurry-filesize",
+    "joblib",
+    "mmengine",
+    "numpy>=1.26,<2",
+    "olmoearth-pretrain",
+    "openmapflow",
+    "scikit-learn",
+    "thop",
+    "timm",
+    "torch==2.7.1",
+    "torchvision==0.22.1",
+    "webdataset",
+    "xarray",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+notebooks = [
+    "ipykernel",
+    "jupyter",
+    "matplotlib",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+src = ["src"]
+extend-exclude = [
+    "notebooks",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+olmoearth-pretrain = { git = "https://github.com/allenai/olmoearth_pretrain.git", rev = "0e11e448946f8ca259593435194e9faa14a58c77" }
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

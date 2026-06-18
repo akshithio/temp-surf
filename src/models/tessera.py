@@ -1,44 +1,8 @@
-"""TESSERA frozen-encoder wrapper running the OPEN-SOURCE model on the time series.
+"""TESSERA v1.1 frozen encoder for benchmark pixel time series.
 
-TESSERA (Cambridge, ucam-eo) is a multimodal Sentinel-1 + Sentinel-2 pixel-timeseries
-SSL model that produces a 128-d per-pixel embedding. The model weights are released
-publicly (CC0). We load those weights and run the actual forward pass on each sample's
-(possibly corrupted) S2 / S1 time series. Because the embedding is computed FROM the
-input series, our sensor-off / temporal-drop corruptions change it: unlike the old
-geotessera precomputed-product path, this wrapper is condition-SENSITIVE and can be
-stress-tested the same way Presto / OlmoEarth are.
-
-Architecture (reproduced verbatim from ucam-eo/tessera so the published checkpoint
-loads strict=True):
-
-    S2 backbone : TransformerEncoder(band_num=10, latent_dim=128, nhead=8,
-                                     num_encoder_layers=8, dim_feedforward=4096)
-    S1 backbone : TransformerEncoder(band_num=2,  latent_dim=128, nhead=8,
-                                     num_encoder_layers=8, dim_feedforward=4096)
-    fusion      : concat(s2_repr[512], s1_repr[512]) -> dim_reducer Linear(1024, 128)
-
-Each backbone embeds bands to latent_dim*4 (=512), adds a sinusoidal day-of-year
-positional encoding, runs an 8-layer transformer, and temporal-attention-pools to a
-single 512-d vector. The SSL projection head is dropped at inference; the 128-d
-``dim_reducer`` output is the embedding.
-
-Weights:
-    The checkpoint is NOT redistributed here. Download it once (e.g. v1.0 float32
-    ``best_model_fsdp_20250427_084307.pt`` from the TESSERA release) and point the
-    wrapper at it via ``weights_path=`` or the ``TESSERA_WEIGHTS`` env var. On a miss
-    the wrapper raises with the expected location rather than silently degrading.
-
-Caveats (deployment, deliberately not reconciled here):
-  * S1 scale. TESSERA was trained on its own preprocessed S1 (linear-amplitude DN,
-    band means ~[5484, 3003]); our Benchmark carries S1 in dB. Feeding dB through the
-    TESSERA S1 normalization is a domain mismatch. The S2 path matches (raw reflectance,
-    same 10 bands). Until the S1 preprocessing is reconciled, read S1-driven TESSERA
-    numbers with that caveat -- the S2 channel still responds correctly to stress.
-  * DOY. We use ``bench.doy`` (real day-of-year where the dataset has it; CropHarvest's
-    is synthetic monthly).
-  * Sequence length. TESSERA's sampler caps at 40 steps; the modules are length-agnostic
-    (the positional encoding is computed analytically from DOY), so we feed the native
-    benchmark length directly.
+This wrapper matches the released v1.1 MPC encoder-only checkpoint. TESSERA v1.1
+uses separate S2 and merged-S1 temporal backbones, produces a 192-dimensional
+representation, and publishes the first 128 dimensions for downstream use.
 """
 
 from __future__ import annotations
@@ -58,130 +22,169 @@ if TYPE_CHECKING:
     from dataio.get_input import Benchmark
 
 TESSERA_EMBEDDING_DIM = 128
+TESSERA_REPRESENTATION_DIM = 192
+TESSERA_LATENT_DIM = 192
 
-# TESSERA's 10 Sentinel-2 bands (our Benchmark lists these first, then a trailing NDVI
-# we drop) and 2 Sentinel-1 bands, with the published per-band normalization constants.
-TESSERA_S2_BANDS = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12"]
+# The released checkpoints are bound to this non-wavelength-ordered S2 layout.
+TESSERA_S2_BANDS = ["B4", "B2", "B3", "B8", "B8A", "B5", "B6", "B7", "B11", "B12"]
 TESSERA_S1_BANDS = ["VV", "VH"]
-S2_BAND_MEAN = np.array([1711.0938, 1308.8511, 1546.4543, 3010.1293, 3106.5083,
-                         2068.3044, 2685.0845, 2931.5889, 2514.6928, 1899.4922], dtype=np.float32)
-S2_BAND_STD = np.array([1926.1026, 1862.9751, 1803.1792, 1741.7837, 1677.4543,
-                        1888.7862, 1736.3090, 1715.8104, 1514.5199, 1398.4779], dtype=np.float32)
-S1_BAND_MEAN = np.array([5484.0407, 3003.7812], dtype=np.float32)
-S1_BAND_STD = np.array([1871.2334, 1726.0670], dtype=np.float32)
 
-# Derived data (weights cache) goes on ROBUSTNESS_SCRATCH when set (a big/fast disk on
-# crowded boxes), else the repo's data/cache. Mirrors src/main.py.
-_SCRATCH = Path(os.environ.get("ROBUSTNESS_SCRATCH", Path(__file__).resolve().parents[2] / "data"))
-DEFAULT_WEIGHTS = _SCRATCH / "cache" / "tessera" / "best_model_fsdp_20250427_084307.pt"
+S2_BAND_MEAN = np.array(
+    [2683.4553, 2223.3630, 2432.0950, 3633.1970, 3602.1755, 3006.4324, 3400.2710, 3515.6392, 2456.9163, 1983.8783],
+    dtype=np.float32,
+)
+S2_BAND_STD = np.array(
+    [2739.5217, 2846.2993, 2690.8250, 2290.0439, 2088.8970, 2673.1106, 2381.4521, 2229.5225, 1601.0942, 1495.3545],
+    dtype=np.float32,
+)
+S1_ASC_MEAN = np.array([5588.3291, 3025.6270], dtype=np.float32)
+S1_ASC_STD = np.array([1713.4646, 1693.0471], dtype=np.float32)
+S1_DESC_MEAN = np.array([5552.9683, 2955.0520], dtype=np.float32)
+S1_DESC_STD = np.array([1685.5857, 1677.6414], dtype=np.float32)
+S1_BAND_MEAN = (S1_ASC_MEAN + S1_DESC_MEAN) / 2
+S1_BAND_STD = (S1_ASC_STD + S1_DESC_STD) / 2
+
+OBSERVATION_BUCKETS = tuple(range(8, 257, 8))
+
+_REPO = Path(__file__).resolve().parents[2]
+_INPUT = Path(os.environ.get("ROBUSTNESS_INPUT", _REPO / "data" / "input"))
+DEFAULT_WEIGHTS = _INPUT / "models" / "tessera" / "tessera_v1_1_mpc_encoder.pt"
 
 
-# --------------------------------------------------------------------------- #
-# Model definition (verbatim structure from ucam-eo/tessera, for strict load)
-# --------------------------------------------------------------------------- #
-def _build_torch_modules():
-    """Define the TESSERA modules (torch is imported at module level)."""
+class CustomGRUCell(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.W_ir = nn.Linear(input_size, hidden_size, bias=False)
+        self.W_iz = nn.Linear(input_size, hidden_size, bias=False)
+        self.W_ih = nn.Linear(input_size, hidden_size, bias=False)
+        self.W_hr = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W_hz = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W_hh = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.b_r = nn.Parameter(torch.zeros(hidden_size))
+        self.b_z = nn.Parameter(torch.zeros(hidden_size))
+        self.b_h = nn.Parameter(torch.zeros(hidden_size))
 
-    class TemporalPositionalEncoder(nn.Module):
-        def __init__(self, d_model):
-            super().__init__()
-            self.d_model = d_model
+    def forward(self, x_t: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
+        r_t = torch.sigmoid(self.W_ir(x_t) + self.W_hr(h_prev) + self.b_r)
+        z_t = torch.sigmoid(self.W_iz(x_t) + self.W_hz(h_prev) + self.b_z)
+        h_tilde = torch.tanh(self.W_ih(x_t) + self.W_hh(r_t * h_prev) + self.b_h)
+        return (1 - z_t) * h_prev + z_t * h_tilde
 
-        def forward(self, doy):  # doy: (B, T)
-            position = doy.unsqueeze(-1).float()
-            div_term = torch.exp(torch.arange(0, self.d_model, 2, dtype=torch.float)
-                                 * -(math.log(10000.0) / self.d_model)).to(doy.device)
-            pe = torch.zeros(doy.shape[0], doy.shape[1], self.d_model, device=doy.device)
-            pe[:, :, 0::2] = torch.sin(position * div_term)
-            pe[:, :, 1::2] = torch.cos(position * div_term)
-            return pe
 
-    class TemporalAwarePooling(nn.Module):
-        def __init__(self, input_dim):
-            super().__init__()
-            self.query = nn.Linear(input_dim, 1)
-            self.temporal_context = nn.GRU(input_dim, input_dim, batch_first=True)
+class CustomGRU(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.gru_cell = CustomGRUCell(input_size, hidden_size)
 
-        def forward(self, x):
-            x_context, _ = self.temporal_context(x)
-            w = torch.softmax(self.query(x_context), dim=1)
-            return (w * x).sum(dim=1)
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        h_t = torch.zeros(x.shape[0], self.hidden_size, device=x.device, dtype=x.dtype)
+        outputs = []
+        for step in range(x.shape[1]):
+            h_t = self.gru_cell(x[:, step], h_t)
+            outputs.append(h_t)
+        return torch.stack(outputs, dim=1), h_t
 
-    class TransformerEncoder(nn.Module):
-        def __init__(self, band_num, latent_dim, nhead=8, num_encoder_layers=8,
-                     dim_feedforward=4096, dropout=0.1):
-            super().__init__()
-            self.embedding = nn.Sequential(
-                nn.Linear(band_num, latent_dim * 4), nn.ReLU(),
-                nn.Linear(latent_dim * 4, latent_dim * 4))
-            self.temporal_encoder = TemporalPositionalEncoder(d_model=latent_dim * 4)
-            layer = nn.TransformerEncoderLayer(
-                d_model=latent_dim * 4, nhead=nhead, dim_feedforward=dim_feedforward,
-                dropout=dropout, activation="relu", batch_first=True)
-            self.transformer_encoder = nn.TransformerEncoder(layer, num_layers=num_encoder_layers)
-            self.attn_pool = TemporalAwarePooling(latent_dim * 4)
 
-        def forward(self, x):  # x: (B, T, band_num + 1); last column is DOY
-            bands, doy = x[:, :, :-1], x[:, :, -1]
-            x = self.embedding(bands) + self.temporal_encoder(doy)
-            x = self.transformer_encoder(x)
-            return self.attn_pool(x)
+class CustomTemporalAwarePooling(nn.Module):
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.temporal_context = CustomGRU(input_dim, input_dim)
+        self.query = nn.Linear(input_dim, 1)
+        self.layer_norm = nn.LayerNorm(input_dim)
 
-    class ProjectionHead(nn.Module):
-        # Present only so the SSL checkpoint loads strict=True; unused at inference.
-        def __init__(self, input_dim, hidden_dim, output_dim):
-            super().__init__()
-            blocks = []
-            d = input_dim
-            for _ in range(5):
-                blocks += [nn.Linear(d, hidden_dim), nn.BatchNorm1d(hidden_dim), nn.ReLU(inplace=False)]
-                d = hidden_dim
-            blocks += [nn.Linear(hidden_dim, output_dim)]
-            self.net = nn.Sequential(*blocks)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[1] == 1:
+            return x[:, 0]
+        context, _ = self.temporal_context(x)
+        weights = torch.softmax(self.query(self.layer_norm(context)), dim=1)
+        return (weights * x).sum(dim=1)
 
-        def forward(self, x):
-            return self.net(x)
 
-    class MultimodalBTModel(nn.Module):
-        def __init__(self, s2_backbone, s1_backbone, projector, fusion_method="concat", latent_dim=128):
-            super().__init__()
-            self.s2_backbone = s2_backbone
-            self.s1_backbone = s1_backbone
-            self.projector = projector
-            self.fusion_method = fusion_method
-            in_dim = 8 * latent_dim if fusion_method == "concat" else 4 * latent_dim
-            self.dim_reducer = nn.Sequential(nn.Linear(in_dim, latent_dim))
+class TemporalPositionalEncoder(nn.Module):
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.d_model = d_model
 
-        def forward(self, s2_x, s1_x):
-            s2_repr, s1_repr = self.s2_backbone(s2_x), self.s1_backbone(s1_x)
-            fused = (torch.cat([s2_repr, s1_repr], dim=-1)
-                     if self.fusion_method == "concat" else s2_repr + s1_repr)
-            return self.dim_reducer(fused)
+    def forward(self, doy: torch.Tensor) -> torch.Tensor:
+        position = doy.unsqueeze(-1).float()
+        div_term = torch.exp(
+            torch.arange(0, self.d_model, 2, dtype=torch.float32, device=doy.device)
+            * -(math.log(10000.0) / self.d_model)
+        )
+        out = torch.zeros(*doy.shape, self.d_model, device=doy.device)
+        out[:, :, 0::2] = torch.sin(position * div_term)
+        out[:, :, 1::2] = torch.cos(position * div_term)
+        return out
 
-    return MultimodalBTModel, TransformerEncoder, ProjectionHead
+
+class TransformerEncoder(nn.Module):
+    def __init__(self, band_num: int):
+        super().__init__()
+        width = TESSERA_LATENT_DIM * 4
+        self.embedding = nn.Sequential(nn.Linear(band_num, width), nn.ReLU(), nn.Linear(width, width))
+        self.temporal_encoder = TemporalPositionalEncoder(width)
+        layer = nn.TransformerEncoderLayer(
+            d_model=width,
+            nhead=4,
+            dim_feedforward=2048,
+            dropout=0.1,
+            activation="relu",
+            batch_first=True,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(layer, num_layers=4)
+        self.attn_pool = CustomTemporalAwarePooling(width)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bands, doy = x[:, :, :-1], x[:, :, -1]
+        encoded = self.embedding(bands) + self.temporal_encoder(doy)
+        return self.attn_pool(self.transformer_encoder(encoded))
+
+
+class TesseraV11Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        width = TESSERA_LATENT_DIM * 4
+        self.s2_backbone = TransformerEncoder(10)
+        self.s1_backbone = TransformerEncoder(2)
+        self.dim_reducer = nn.Sequential(
+            nn.Linear(width * 2, width * 4),
+            nn.LayerNorm(width * 4),
+            nn.ReLU(inplace=False),
+            nn.Dropout(0.2),
+            nn.Linear(width * 4, TESSERA_REPRESENTATION_DIM),
+        )
+
+    def forward(self, s2_x: torch.Tensor, s1_x: torch.Tensor) -> torch.Tensor:
+        return self.dim_reducer(torch.cat([self.s2_backbone(s2_x), self.s1_backbone(s1_x)], dim=-1))
+
+
+def _resample_indices(valid_len: int, target_size: int) -> np.ndarray:
+    if valid_len == target_size:
+        return np.arange(valid_len, dtype=np.int64)
+    if target_size < valid_len:
+        chunks = np.array_split(np.arange(valid_len), target_size)
+        return np.asarray([chunk[len(chunk) // 2] for chunk in chunks], dtype=np.int64)
+    extras = np.rint(np.linspace(0, valid_len - 1, target_size - valid_len + 2)[1:-1]).astype(np.int64)
+    return np.concatenate([np.arange(valid_len, dtype=np.int64), extras])
+
+
+def _bucket_size(valid_len: int) -> int:
+    return next((size for size in OBSERVATION_BUCKETS if valid_len <= size), OBSERVATION_BUCKETS[-1])
 
 
 @dataclass
 class TesseraEncoder:
-    """Frozen TESSERA encoder running the published model on each sample's time series."""
+    """Frozen TESSERA v1.1 MPC encoder."""
 
     name: str = "tessera"
     embedding_dim: int = TESSERA_EMBEDDING_DIM
-    weights_path: str | Path | None = None  # None -> TESSERA_WEIGHTS env or DEFAULT_WEIGHTS
-    device: str = "cpu"
-    batch_size: int = 4096
-    latent_dim: int = 128
-    fusion_method: str = "concat"
-    condition_invariant: bool = False  # runs the model on the (corrupted) input -> stress-testable
+    weights_path: str | Path | None = None
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"  # align with the other encoders' default
+    batch_size: int = 256
+    condition_invariant: bool = False
     _model: Any = field(default=None, repr=False)
-
-    def compute_macs(self) -> int:
-        self._ensure_loaded()
-        B, T = 1, 12
-        s2_b = torch.randn(B, T, len(TESSERA_S2_BANDS) + 1, device=self.device)
-        s1_b = torch.randn(B, T, len(TESSERA_S1_BANDS) + 1, device=self.device)
-        macs, _ = thop.profile(self._model, inputs=(s2_b, s1_b), verbose=False)
-        return int(macs)
 
     def _ensure_loaded(self) -> None:
         if self._model is not None:
@@ -189,43 +192,89 @@ class TesseraEncoder:
         path = Path(self.weights_path or os.environ.get("TESSERA_WEIGHTS") or DEFAULT_WEIGHTS)
         if not path.exists():
             raise FileNotFoundError(
-                f"TESSERA weights not found at {path}. Download the published checkpoint "
-                f"(e.g. best_model_fsdp_20250427_084307.pt) and set weights_path= or the "
-                f"TESSERA_WEIGHTS env var."
+                f"TESSERA v1.1 MPC weights not found at {path}. Download "
+                "tessera_v1_1_mpc_encoder.pt and set TESSERA_WEIGHTS or weights_path."
             )
-        MultimodalBTModel, TransformerEncoder, ProjectionHead = _build_torch_modules()
-        s2 = TransformerEncoder(band_num=10, latent_dim=self.latent_dim)
-        s1 = TransformerEncoder(band_num=2, latent_dim=self.latent_dim)
-        proj = ProjectionHead(self.latent_dim, 2048, 2048)
-        model = MultimodalBTModel(s2, s1, proj, fusion_method=self.fusion_method, latent_dim=self.latent_dim)
-
-        ckpt = torch.load(path, map_location=self.device)
-        state = ckpt.get("model_state", ckpt.get("model_state_dict", ckpt))
-        state = {(k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v for k, v in state.items()}
-        model.load_state_dict(state, strict=True)  # exact match validates the reproduced architecture
+        model = TesseraV11Model()
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        state = checkpoint.get("model_state", checkpoint.get("model_state_dict", checkpoint))
+        cleaned = {}
+        for key, value in state.items():
+            key = key.removeprefix("_orig_mod.")
+            if key.startswith(("projector.", "segmented_matryoshka_projector.")):
+                continue
+            cleaned[key] = value
+        missing, unexpected = model.load_state_dict(cleaned, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(f"TESSERA v1.1 checkpoint mismatch: missing={missing}, unexpected={unexpected}")
         model.to(self.device).eval()
-        for p in model.parameters():
-            p.requires_grad = False
+        for parameter in model.parameters():
+            parameter.requires_grad = False
         self._model = model
 
-    def _modality_input(self, modality, bands, src_bands, mean, std, doy):
-        """Select TESSERA's bands by name, normalize, append DOY -> (N, T, len(bands)+1)."""
-        col = {b: i for i, b in enumerate(src_bands)}
-        idx = [col[b] for b in bands]  # all three benchmarks list these exact names
-        x = modality[:, :, idx].astype(np.float32)
-        x = (x - mean) / (std + 1e-9)
-        return np.concatenate([x, doy[:, :, None].astype(np.float32)], axis=2)
+    @staticmethod
+    def _select_bands(modality: np.ndarray, wanted: list[str], available: list[str]) -> np.ndarray:
+        columns = {band: index for index, band in enumerate(available)}
+        missing = [band for band in wanted if band not in columns]
+        if missing:
+            raise ValueError(f"Benchmark is missing TESSERA bands: {missing}")
+        return modality[:, :, [columns[band] for band in wanted]].astype(np.float32)
 
-    def encode(self, bench: "Benchmark") -> np.ndarray:
+    @staticmethod
+    def _scale_s1(values: np.ndarray) -> np.ndarray:
+        finite = values[np.isfinite(values)]
+        if finite.size and np.nanpercentile(np.abs(finite), 95) < 100:
+            return np.clip((values + 50.0) * 200.0, 0.0, 32767.0)
+        return values
+
+    def _prepare_streams(self, bench: Benchmark) -> dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        s2_raw = self._select_bands(bench.s2, TESSERA_S2_BANDS, bench.s2_bands)
+        s1_raw = self._scale_s1(self._select_bands(bench.s1, TESSERA_S1_BANDS, bench.s1_bands))
+        groups: dict[tuple[int, int], list[tuple[int, np.ndarray, np.ndarray]]] = {}
+
+        for index in range(bench.n_samples):
+            streams = []
+            for values, mask, mean, std in (
+                (s2_raw[index], bench.s2_mask[index], S2_BAND_MEAN, S2_BAND_STD),
+                (s1_raw[index], bench.s1_mask[index], S1_BAND_MEAN, S1_BAND_STD),
+            ):
+                valid = np.flatnonzero(np.asarray(mask) > 0)
+                target = _bucket_size(max(1, len(valid)))
+                if len(valid) == 0:
+                    stream = np.zeros((target, values.shape[1] + 1), dtype=np.float32)
+                else:
+                    take = valid[_resample_indices(len(valid), target)]
+                    normalized = (values[take] - mean) / (std + 1e-9)
+                    stream = np.concatenate([normalized, np.asarray(bench.doy[index])[take, None]], axis=1).astype(np.float32)
+                streams.append(stream)
+            key = (streams[0].shape[0], streams[1].shape[0])
+            groups.setdefault(key, []).append((index, streams[0], streams[1]))
+
+        return {
+            key: (
+                np.asarray([item[0] for item in items], dtype=np.int64),
+                np.stack([item[1] for item in items]),
+                np.stack([item[2] for item in items]),
+            )
+            for key, items in groups.items()
+        }
+
+    def compute_macs(self) -> int:
         self._ensure_loaded()
-        doy = np.asarray(bench.doy, dtype=np.float32)  # (N, T) day-of-year
-        s2 = self._modality_input(bench.s2, TESSERA_S2_BANDS, bench.s2_bands, S2_BAND_MEAN, S2_BAND_STD, doy)
-        s1 = self._modality_input(bench.s1, TESSERA_S1_BANDS, bench.s1_bands, S1_BAND_MEAN, S1_BAND_STD, doy)
+        s2 = torch.randn(1, 16, 11, device=self.device)
+        s1 = torch.randn(1, 16, 3, device=self.device)
+        macs, _ = thop.profile(self._model, inputs=(s2, s1), verbose=False)
+        return int(macs)
 
-        out = []
-        with torch.no_grad():
-            for i in range(0, s2.shape[0], self.batch_size):
-                s2_b = torch.from_numpy(s2[i:i + self.batch_size]).to(self.device)
-                s1_b = torch.from_numpy(s1[i:i + self.batch_size]).to(self.device)
-                out.append(self._model(s2_b, s1_b).cpu().numpy())
-        return np.concatenate(out, axis=0).astype(np.float32)
+    @torch.no_grad()
+    def encode(self, bench: Benchmark) -> np.ndarray:
+        self._ensure_loaded()
+        output = np.empty((bench.n_samples, self.embedding_dim), dtype=np.float32)
+        for indices, s2, s1 in self._prepare_streams(bench).values():
+            for start in range(0, len(indices), self.batch_size):
+                sl = slice(start, start + self.batch_size)
+                s2_tensor = torch.from_numpy(s2[sl]).to(self.device)
+                s1_tensor = torch.from_numpy(s1[sl]).to(self.device)
+                embedding = self._model(s2_tensor, s1_tensor)[:, : self.embedding_dim]
+                output[indices[sl]] = embedding.cpu().numpy().astype(np.float32)
+        return output

@@ -20,7 +20,7 @@ Two flavors of "nuisance", set by ``matching``:
   *different groups* (CropHarvest dataset / EuroCropsML country). The removed
   subspace is geographic spurious structure. This mirrors the GRIT paper's
   conditional and nearest-neighbour matching, with "domain" = our ``groups``.
-* missingness ("view_drop"): pairs are clean vs corrupted (sensor-off /
+* missingness ("view_drop"): pairs are clean vs degraded (sensor-off /
   temporal-drop) views of the *same* sample. The removed subspace is the
   distribution shift induced by missing inputs. This flavor is specific to the
   multimodal-EO robustness setting and has no analogue in the original paper.
@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
 
-from utils import perf
+from utils import perfutils as perf
 
 MATCHINGS = ("conditional", "nearest", "view_drop")
 
@@ -113,14 +113,14 @@ def nearest_diffs(
 
 def view_drop_diffs(
     emb_clean: np.ndarray,
-    emb_corrupt: np.ndarray,
+    emb_degraded: np.ndarray,
     max_pairs: int,
     seed: int,
 ) -> np.ndarray:
-    """Clean-vs-corrupted-view differences of the same samples (missingness flavor)."""
-    if emb_clean.shape != emb_corrupt.shape:
-        raise ValueError("view_drop requires clean and corrupted embeddings of the same samples.")
-    diffs = (emb_clean - emb_corrupt).astype(np.float32)
+    """Clean-vs-degraded-view differences of the same samples (missingness flavor)."""
+    if emb_clean.shape != emb_degraded.shape:
+        raise ValueError("view_drop requires clean and degraded embeddings of the same samples.")
+    diffs = (emb_clean - emb_degraded).astype(np.float32)
     if max_pairs and len(diffs) > max_pairs:
         sel = np.random.default_rng(seed).choice(len(diffs), size=max_pairs, replace=False)
         diffs = diffs[sel]
@@ -168,7 +168,7 @@ class Grit:
         y: np.ndarray | None = None,
         groups: np.ndarray | None = None,
         x_paired: np.ndarray | None = None,
-    ) -> "Grit":
+    ) -> Grit:
         x = np.asarray(x, dtype=np.float32)
         if self.standardize:
             self._mean = x.mean(axis=0)
