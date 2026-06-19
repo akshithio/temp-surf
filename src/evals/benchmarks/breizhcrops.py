@@ -22,6 +22,9 @@ from dataio.get_input import (
 BENCHMARK = "breizhcrops"
 LABEL_KIND = "multiclass"
 HOLDOUTS = ["frh04"]  # paper's test region (train on frh01/frh02/frh03/belle-ile)
+# Only ~4-5 NUTS-3 domains -> random group folds ≈ leave-one-region-out, so grouped_ood
+# is omitted here (redundant with geographic_ood).
+SPLIT_REGIMES = ["random_id", "geographic_ood", "phenology_ood"]
 
 # The breizhcrops package returns L1C ``X`` as (T, 13) with bands in THIS order
 # (alphabetical), from which we keep the 10 S2 spectral bands + a computed NDVI.

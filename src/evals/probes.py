@@ -17,6 +17,8 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from sklearn.model_selection import train_test_split
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -30,6 +32,62 @@ PROBE_SOLVER = "liblinear"
 PROBE_MULTICLASS_SOLVER = "lbfgs"
 PROBE_MAX_ITER = 20000
 PROBE_TOL = 1e-5
+
+# --------------------------------------------------------------------------- #
+# Probe families (the probe-capacity ablation axis)
+# --------------------------------------------------------------------------- #
+# The primary protocol is `logistic` (the canonical frozen-feature linear probe).
+# `mlp` (higher-capacity head) and `knn` (probe-free, OlmoEarth-style) exist to test
+# whether an observed geographic gap is caused by the *linear probe* or by the
+# *encoder*: if the gap persists under mlp/knn it is an encoder property; if it
+# vanishes under mlp it is a "linearly inaccessible from source-only" finding.
+PROBE_FAMILIES: list[str] = ["logistic", "mlp", "knn"]
+
+# Per-family hyperparameter grid, each selected on the regime's val set. Same SIZE (5)
+# across families so no family gets a larger search budget (WILDS hyperparameter
+# fairness). Set a grid to a single value to disable that family's tuning.
+PROBE_GRIDS: dict[str, list[float]] = {
+    "logistic": [0.01, 0.1, 1.0, 10.0, 100.0],  # C (inverse L2 strength)
+    "mlp": [1e-4, 1e-3, 1e-2, 1e-1, 1.0],        # alpha (L2), fixed 2-layer arch below
+    "knn": [5, 10, 20, 50, 100],                  # n_neighbors (cosine distance)
+}
+PROBE_DEFAULT_HP: dict[str, float] = {"logistic": 1.0, "mlp": 1e-3, "knn": 20}
+PROBE_C_GRID: list[float] = PROBE_GRIDS["logistic"]  # backward-compat alias
+
+MLP_HIDDEN: tuple[int, ...] = (256, 128)  # 2-layer head (≈ TESSERA's PASTIS MLP capacity)
+PROBE_MLP_MAX_ITER: int = 500
+
+
+def _build_probe(family: str, hp: float, *, solver: str, seed: int, n_fit: int):
+    """Build a standardized probe pipeline for ``family`` at hyperparameter ``hp``.
+
+    Only ``logistic`` uses ``solver``/``class_weight``; ``mlp`` and ``knn`` (which lack
+    a class-weight option) rely on the binary threshold calibration / balanced metrics
+    downstream. ``knn`` neighbors are clamped to the training size.
+    """
+    if family == "logistic":
+        clf = LogisticRegression(
+            C=hp, max_iter=PROBE_MAX_ITER, class_weight="balanced", solver=solver, tol=PROBE_TOL, random_state=seed,
+        )
+    elif family == "mlp":
+        clf = MLPClassifier(hidden_layer_sizes=MLP_HIDDEN, alpha=hp, max_iter=PROBE_MLP_MAX_ITER, random_state=seed)
+    elif family == "knn":
+        clf = KNeighborsClassifier(n_neighbors=max(1, min(int(hp), n_fit - 1)), metric="cosine", weights="distance")
+    else:
+        raise ValueError(f"Unknown probe family {family!r}; known: {PROBE_FAMILIES}")
+    return make_pipeline(StandardScaler(), clf)
+
+
+def _fit_probe(x: np.ndarray, y: np.ndarray, *, family: str, hp: float, solver: str, seed: int):
+    """Fit a probe of ``family`` at ``hp``; return ``(clf, n_iter, convergence_warnings)``."""
+    clf = _build_probe(family, hp, solver=solver, seed=seed, n_fit=len(y))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ConvergenceWarning)
+        clf.fit(x, y)
+    convergence_warnings = [w for w in caught if issubclass(w.category, ConvergenceWarning)]
+    estimator = clf.steps[-1][1]
+    n_iter = int(np.max(estimator.n_iter_)) if hasattr(estimator, "n_iter_") else -1
+    return clf, n_iter, convergence_warnings
 
 # --------------------------------------------------------------------------- #
 # Feature-transform hook
@@ -77,52 +135,70 @@ def fit_probe_with_calibration(
     x_train: np.ndarray,
     y_train: np.ndarray,
     seed: int,
+    x_cal: np.ndarray | None = None,
+    y_cal: np.ndarray | None = None,
+    family: str = "logistic",
 ) -> tuple[Any, float, int, int, dict[str, Any]]:
-    """Fit a standardized logistic probe and a source-validation F1 threshold."""
-    idx = np.arange(len(y_train))
-    if len(idx) >= 20 and len(np.unique(y_train)) == 2 and min(np.bincount(y_train)) >= 4:
-        fit_idx, cal_idx = train_test_split(
-            idx,
-            test_size=0.20,
-            random_state=seed,
-            stratify=y_train,
-        )
-    else:
-        fit_idx = idx
-        cal_idx = idx
-    n_classes = len(np.unique(y_train))
+    """Fit a binary probe of ``family`` and an F1 threshold on a validation set.
+
+    The hyperparameter (``C`` for logistic, ``alpha`` for mlp, ``n_neighbors`` for knn)
+    is swept over ``PROBE_GRIDS[family]`` and selected by val AUC; the probe is fit on
+    all of ``x_train`` and the threshold calibrated on ``x_cal``. With no usable val it
+    falls back to the legacy 80/20 internal split at the family's default hyperparameter.
+    """
+    grid = PROBE_GRIDS[family]
+    use_external = (
+        x_cal is not None and len(x_cal) > 0 and y_cal is not None and len(np.unique(y_cal)) == 2
+    )
     with perf.measure(
-        "probe.fit/binary",
-        n_samples=len(fit_idx), n_features=x_train.shape[1], n_classes=n_classes,
+        f"probe.fit/binary/{family}",
+        n_samples=len(y_train), n_features=x_train.shape[1], n_classes=len(np.unique(y_train)),
     ):
-        clf = make_pipeline(
-            StandardScaler(),
-            LogisticRegression(
-                max_iter=PROBE_MAX_ITER,
-                class_weight="balanced",
-                solver=PROBE_SOLVER,
-                tol=PROBE_TOL,
-                random_state=seed,
-            ),
-        )
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always", ConvergenceWarning)
-            clf.fit(x_train[fit_idx], y_train[fit_idx])
-    convergence_warnings = [warning for warning in caught if issubclass(warning.category, ConvergenceWarning)]
-    logistic = clf.named_steps["logisticregression"]
-    n_iter = int(np.max(logistic.n_iter_)) if hasattr(logistic, "n_iter_") else -1
+        if use_external:
+            # Fit on ALL of train at each grid point, pick by val AUC (threshold-free),
+            # then calibrate the threshold on the same val.
+            best = None
+            for hp in grid:
+                clf, n_iter, cw = _fit_probe(x_train, y_train, family=family, hp=hp, solver=PROBE_SOLVER, seed=seed)
+                val_auc = float(roc_auc_score(y_cal, clf.predict_proba(x_cal)[:, 1]))
+                if best is None or val_auc > best[0]:
+                    best = (val_auc, hp, clf, n_iter, cw)
+            _, chosen_hp, clf, n_iter, convergence_warnings = best
+            cal_x, cal_y = x_cal, y_cal
+            n_fit, n_cal = len(y_train), len(y_cal)
+            calibration_source = "regime_val"
+            grid_size = len(grid)
+        else:
+            idx = np.arange(len(y_train))
+            if len(idx) >= 20 and len(np.unique(y_train)) == 2 and min(np.bincount(y_train)) >= 4:
+                fit_idx, cal_idx = train_test_split(idx, test_size=0.20, random_state=seed, stratify=y_train)
+            else:
+                fit_idx = cal_idx = idx
+            chosen_hp = PROBE_DEFAULT_HP[family]
+            clf, n_iter, convergence_warnings = _fit_probe(
+                x_train[fit_idx], y_train[fit_idx], family=family, hp=chosen_hp, solver=PROBE_SOLVER, seed=seed
+            )
+            cal_x, cal_y = x_train[cal_idx], y_train[cal_idx]
+            n_fit, n_cal = len(fit_idx), len(cal_idx)
+            calibration_source = "train_subsplit"
+            grid_size = 1
     probe_meta = {
-        "probe_solver": PROBE_SOLVER,
+        "probe_family": family,
+        "probe_solver": PROBE_SOLVER if family == "logistic" else family,
         "probe_max_iter": PROBE_MAX_ITER,
         "probe_tol": PROBE_TOL,
         "probe_n_iter": n_iter,
         "probe_converged": int(len(convergence_warnings) == 0),
         "probe_convergence_warnings": len(convergence_warnings),
         "probe_warning_message": str(convergence_warnings[0].message) if convergence_warnings else "",
+        "calibration_source": calibration_source,
+        "probe_hp": chosen_hp,
+        "probe_C": chosen_hp if family == "logistic" else float("nan"),
+        "probe_grid_size": grid_size,
     }
-    cal_prob = clf.predict_proba(x_train[cal_idx])[:, 1]
-    threshold = best_f1_threshold(y_train[cal_idx], cal_prob)
-    return clf, threshold, int(len(fit_idx)), int(len(cal_idx)), probe_meta
+    cal_prob = clf.predict_proba(cal_x)[:, 1]
+    threshold = best_f1_threshold(cal_y, cal_prob)
+    return clf, threshold, int(n_fit), int(n_cal), probe_meta
 
 
 def expected_calibration_error(y_true: np.ndarray, prob: np.ndarray, n_bins: int = 10) -> float:
@@ -189,35 +265,54 @@ def score_binary(
 # --------------------------------------------------------------------------- #
 
 
-def fit_probe_multiclass(x_train: np.ndarray, y_train: np.ndarray, seed: int) -> tuple[Any, dict[str, Any]]:
-    """Fit a standardized multinomial logistic probe (no threshold calibration)."""
+def fit_probe_multiclass(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    seed: int,
+    x_val: np.ndarray | None = None,
+    y_val: np.ndarray | None = None,
+    family: str = "logistic",
+) -> tuple[Any, dict[str, Any]]:
+    """Fit a multiclass probe of ``family`` (no threshold calibration).
+
+    When a validation set ``(x_val, y_val)`` is supplied, the family's hyperparameter is
+    swept over ``PROBE_GRIDS[family]`` and selected by val balanced accuracy (the same
+    equal-budget grid used by the binary probe). Otherwise the default is used.
+    """
+    grid = PROBE_GRIDS[family]
+    use_val = x_val is not None and len(x_val) > 0 and y_val is not None and len(y_val) > 0
     with perf.measure(
-        "probe.fit/multiclass",
+        f"probe.fit/multiclass/{family}",
         n_samples=len(y_train), n_features=x_train.shape[1], n_classes=len(np.unique(y_train)),
     ):
-        clf = make_pipeline(
-            StandardScaler(),
-            LogisticRegression(
-                max_iter=PROBE_MAX_ITER,
-                class_weight="balanced",
-                solver=PROBE_MULTICLASS_SOLVER,
-                tol=PROBE_TOL,
-                random_state=seed,
-            ),
-        )
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always", ConvergenceWarning)
-            clf.fit(x_train, y_train)
-    convergence_warnings = [w for w in caught if issubclass(w.category, ConvergenceWarning)]
-    logistic = clf.named_steps["logisticregression"]
-    n_iter = int(np.max(logistic.n_iter_)) if hasattr(logistic, "n_iter_") else -1
+        if use_val:
+            best = None
+            for hp in grid:
+                clf, n_iter, cw = _fit_probe(
+                    x_train, y_train, family=family, hp=hp, solver=PROBE_MULTICLASS_SOLVER, seed=seed
+                )
+                val_score = float(balanced_accuracy_score(y_val, clf.predict(x_val)))
+                if best is None or val_score > best[0]:
+                    best = (val_score, hp, clf, n_iter, cw)
+            _, chosen_hp, clf, n_iter, convergence_warnings = best
+            grid_size = len(grid)
+        else:
+            chosen_hp = PROBE_DEFAULT_HP[family]
+            clf, n_iter, convergence_warnings = _fit_probe(
+                x_train, y_train, family=family, hp=chosen_hp, solver=PROBE_MULTICLASS_SOLVER, seed=seed
+            )
+            grid_size = 1
     probe_meta = {
-        "probe_solver": PROBE_MULTICLASS_SOLVER,
+        "probe_family": family,
+        "probe_solver": PROBE_MULTICLASS_SOLVER if family == "logistic" else family,
         "probe_max_iter": PROBE_MAX_ITER,
         "probe_n_iter": n_iter,
         "probe_converged": int(len(convergence_warnings) == 0),
         "probe_convergence_warnings": len(convergence_warnings),
-        "n_classes_train": int(len(logistic.classes_)),
+        "n_classes_train": int(len(clf.classes_)),
+        "probe_hp": chosen_hp,
+        "probe_C": chosen_hp if family == "logistic" else float("nan"),
+        "probe_grid_size": grid_size,
     }
     return clf, probe_meta
 

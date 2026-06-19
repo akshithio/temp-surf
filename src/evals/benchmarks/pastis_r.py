@@ -23,6 +23,9 @@ TRAIN_FOLDS = {1, 2, 3}
 VAL_FOLDS = {4}
 TEST_FOLDS = {5}
 HOLDOUTS = [5]
+# Fold-based geographic regimes (run via the dense path, not the classification sweep):
+# official_folds = published 1-3/4/5 (comparability); geographic_ood = leave-one-fold-out.
+SPLIT_REGIMES = ["official_folds", "geographic_ood"]
 IGNORE_INDEX = 19
 
 # PASTIS DATA_S2 is (T, 10, 128, 128) in this 10-band order. DATA_S1A is

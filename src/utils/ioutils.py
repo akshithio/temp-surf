@@ -298,7 +298,9 @@ def compute_deltas(
     if isinstance(metrics, str):
         metrics = [metrics]
     rng = np.random.default_rng(seed)
-    keys = ("model", "benchmark", "method")
+    keys = ("model", "benchmark", "method", "probe_family") if any("probe_family" in r for r in rows) else (
+        "model", "benchmark", "method"
+    )
 
     def vals(split_regime: str, budget_type: str, budget: float, combo: tuple, metric: str) -> list[float]:
         out: list[float] = []

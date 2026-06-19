@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from evals.regimes.base import geography_domains
+from evals.regimes.base import Split, geography_domains, holdout_val
 
 NAME = "grouped_ood"
 GROUP_KIND = "geography"
@@ -43,5 +43,7 @@ def make_grouped_holdout_folds(y: np.ndarray, groups: np.ndarray, seed: int, n_f
 
 
 def iter_splits(y, groups, *, seed, holdouts=None, n_folds=N_FOLDS, **_):
-    """Yield ``(fold_label, train_idx, test_idx)`` for each random group fold."""
-    yield from make_grouped_holdout_folds(y, groups, seed, n_folds=n_folds)
+    """Yield one :class:`Split` per random group fold (val carved from the train pool)."""
+    for fold_label, train, test in make_grouped_holdout_folds(y, groups, seed, n_folds=n_folds):
+        train, val = holdout_val(train, y, seed)
+        yield Split(fold_label, train, test, val)

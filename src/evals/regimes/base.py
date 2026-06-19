@@ -1,9 +1,9 @@
 """Shared types for split regimes.
 
-A *regime* owns two things (see the individual regime files): the **domain basis**
-— how each sample is assigned a domain label (``assign_domains(bench)``, tagged by
-``GROUP_KIND``) — and the **split strategy** — how those domains become
-train/val/test (``iter_splits(...)``). ``iter_splits`` yields :class:`Split`.
+A *regime* owns two things:
+
+    (1) the domain basis: how each sample is assigned a domain label
+    (2) the split strategy — how those domains become train/val/test
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
+from sklearn.model_selection import train_test_split
 
 
 def _empty() -> np.ndarray:
@@ -37,44 +38,22 @@ def geography_domains(bench) -> np.ndarray:
     return np.asarray(bench.groups, dtype=object)
 
 
-def phenology_domains(bench) -> np.ndarray:
-    """Assign samples to coarse NDVI phenology domains.
+def holdout_val(train: np.ndarray, y: np.ndarray, seed: int, frac: float = 0.10) -> tuple[np.ndarray, np.ndarray]:
+    """Carve a stratified validation set out of a training index array.
 
-    This is intentionally simple and benchmark-agnostic: use the loaded S2 NDVI
-    channel, respect the S2 observation mask, mark low-amplitude samples, and
-    otherwise group by peak-NDVI timing (early/mid/late season). All current
-    classification benchmarks expose an NDVI channel in ``bench.s2``.
+    Returns ``(train_minus_val, val)``. Used by regimes whose split strategy does
+    not already produce a held-out val (grouped/hybrid) so every regime yields a
+    real train/val/test triple. Falls back to non-stratified, then to an empty val,
+    when the training pool is too small or single-class to split.
     """
-    bands = list(getattr(bench, "s2_bands", []))
-    if "NDVI" not in bands:
-        raise ValueError(f"{getattr(bench, 'name', 'benchmark')} does not expose an NDVI band")
-    ndvi = np.asarray(bench.s2[:, :, bands.index("NDVI")], dtype=np.float32)
-    mask = np.asarray(getattr(bench, "s2_mask", np.ones(ndvi.shape, dtype=np.float32))) > 0
-    valid_counts = mask.sum(axis=1)
-    if ndvi.ndim != 2:
-        raise ValueError(f"Expected NDVI as (N,T), got {ndvi.shape}")
+    train = np.asarray(train)
+    if len(train) < 10 or len(np.unique(y[train])) < 2:
+        return np.sort(train), _empty()
+    try:
+        tr, val = train_test_split(train, test_size=frac, random_state=seed, stratify=y[train])
+    except ValueError:
+        tr, val = train_test_split(train, test_size=frac, random_state=seed, stratify=None)
+    return np.sort(tr), np.sort(val)
 
-    safe_max = np.where(mask, ndvi, -np.inf)
-    safe_min = np.where(mask, ndvi, np.inf)
-    peak = np.argmax(safe_max, axis=1)
-    max_ndvi = np.max(safe_max, axis=1)
-    min_ndvi = np.min(safe_min, axis=1)
-    amplitude = max_ndvi - min_ndvi
-    finite_amp = amplitude[np.isfinite(amplitude)]
-    low_threshold = float(np.quantile(finite_amp, 0.25)) if finite_amp.size else 0.0
 
-    domains = np.empty(ndvi.shape[0], dtype=object)
-    domains[:] = "phenology_missing"
-    usable = valid_counts > 0
-    low_amp = usable & np.isfinite(amplitude) & (amplitude <= low_threshold)
-    domains[low_amp] = "phenology_low_amplitude"
 
-    seasonal = usable & ~low_amp
-    t = max(1, ndvi.shape[1])
-    early = seasonal & (peak < t / 3)
-    mid = seasonal & (peak >= t / 3) & (peak < 2 * t / 3)
-    late = seasonal & (peak >= 2 * t / 3)
-    domains[early] = "phenology_early_peak"
-    domains[mid] = "phenology_mid_peak"
-    domains[late] = "phenology_late_peak"
-    return domains

@@ -9,9 +9,11 @@ Scope:
 from __future__ import annotations
 
 import os
+import warnings
 from typing import Any
 
 import numpy as np
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
 from sklearn.model_selection import train_test_split
 
 from evals.probes import (  # noqa: F401
@@ -89,7 +91,7 @@ ALL_TARGET_BUDGETS: list[int] = [0, *TARGET_BUDGETS, TARGET_ID_UPPER_BOUND]
 
 # Reported metrics per label family. calibrated_* use a source-validation threshold
 # rather than 0.5 -- default-0.5 F1 misrepresents transfer under distribution shift.
-METRICS: list[str] = [
+METRICS_BINARY_BASE: list[str] = [
     "f1",
     "auc",
     "balanced_accuracy",
@@ -101,18 +103,56 @@ METRICS: list[str] = [
     "brier",  # proper scoring rule: mean squared prob error (lower better)
     "nll",    # negative log-likelihood / log-loss (lower better)
 ]
-METRICS_BINARY: list[str] = METRICS
-METRICS_MULTICLASS: list[str] = [
+METRICS_BINARY_WORST_GROUP: list[str] = [
+    "worst_group_f1",
+    "worst_group_balanced_accuracy",
+    "worst_group_calibrated_f1",
+    "worst_group_calibrated_balanced_accuracy",
+    "worst_group_score",
+]
+METRICS: list[str] = METRICS_BINARY_BASE
+METRICS_BINARY: list[str] = [*METRICS_BINARY_BASE, *METRICS_BINARY_WORST_GROUP]
+METRICS_MULTICLASS_BASE: list[str] = [
     "macro_f1",
     "weighted_f1",
     "balanced_accuracy",
     "accuracy",
     "macro_auc",
 ]
+METRICS_MULTICLASS_WORST_GROUP: list[str] = [
+    "worst_group_macro_f1",
+    "worst_group_weighted_f1",
+    "worst_group_balanced_accuracy",
+    "worst_group_accuracy",
+    "worst_group_score",
+]
+METRICS_MULTICLASS: list[str] = [*METRICS_MULTICLASS_BASE, *METRICS_MULTICLASS_WORST_GROUP]
 METRICS_SEGMENTATION: list[str] = [
     "miou", "pixel_accuracy", "macro_f1", "weighted_f1",
     "mean_per_tile_miou", "worst_tile_miou", "n_tiles_scored",
 ]
+METRIC_ROLES: dict[str, dict[str, list[str]]] = {
+    "binary": {
+        "deployment": [
+            "calibrated_f1",
+            "calibrated_balanced_accuracy",
+            "worst_group_calibrated_f1",
+            "worst_group_calibrated_balanced_accuracy",
+        ],
+        "diagnostic": [
+            "f1", "auc", "balanced_accuracy", "calibrated_f1_target_optimal",
+            "optimal_threshold_test", "ece", "brier", "nll",
+        ],
+    },
+    "multiclass": {
+        "deployment": ["macro_f1", "balanced_accuracy", "worst_group_macro_f1", "worst_group_balanced_accuracy"],
+        "diagnostic": ["weighted_f1", "accuracy", "macro_auc"],
+    },
+    "segmentation": {
+        "deployment": ["miou", "mean_per_tile_miou", "worst_tile_miou"],
+        "diagnostic": ["pixel_accuracy", "macro_f1", "weighted_f1", "n_tiles_scored"],
+    },
+}
 
 # --------------------------------------------------------------------------- #
 # Shared budget sweep + per-benchmark runners
@@ -181,6 +221,89 @@ def _append_prediction_rows(
         })
 
 
+def _safe_balanced_accuracy(y_true: np.ndarray, pred: np.ndarray) -> float:
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="y_pred contains classes not in y_true")
+        return float(balanced_accuracy_score(y_true, pred))
+
+
+def _score_binary_group(per_sample: dict[str, np.ndarray], mask: np.ndarray) -> dict[str, float]:
+    y = np.asarray(per_sample["y_true"])[mask]
+    pred_default = np.asarray(per_sample["pred_default"])[mask]
+    pred_cal = np.asarray(per_sample["pred_calibrated"])[mask]
+    return {
+        "f1": float(f1_score(y, pred_default, zero_division=0)),
+        "balanced_accuracy": _safe_balanced_accuracy(y, pred_default),
+        "calibrated_f1": float(f1_score(y, pred_cal, zero_division=0)),
+        "calibrated_balanced_accuracy": _safe_balanced_accuracy(y, pred_cal),
+    }
+
+
+def _score_multiclass_group(per_sample: dict[str, np.ndarray], mask: np.ndarray) -> dict[str, float]:
+    y = np.asarray(per_sample["y_true"])[mask]
+    pred = np.asarray(per_sample["pred"])[mask]
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="y_pred contains classes not in y_true")
+        return {
+            "macro_f1": float(f1_score(y, pred, average="macro", zero_division=0)),
+            "weighted_f1": float(f1_score(y, pred, average="weighted", zero_division=0)),
+            "balanced_accuracy": _safe_balanced_accuracy(y, pred),
+            "accuracy": float(accuracy_score(y, pred)),
+        }
+
+
+def _worst_group_scores(
+    per_sample: dict[str, np.ndarray] | None,
+    groups_test: np.ndarray | None,
+) -> dict[str, Any]:
+    """Compute first-class subpopulation worst-group metrics for one evaluated split.
+
+    This is the WILDS-style "average can hide a bad deployment subgroup" view. For
+    ``random_id`` rows it is a true subpopulation metric: train/test include all
+    domains, and the row also reports the worst test domain. For strict OOD rows
+    with one target domain, worst-group equals the target-domain score.
+    """
+    if per_sample is None or groups_test is None:
+        return {}
+    groups_arr = np.asarray(groups_test, dtype=object)
+    y_true = np.asarray(per_sample["y_true"])
+    if len(groups_arr) != len(y_true) or len(y_true) == 0:
+        return {}
+
+    if "prob" in per_sample:
+        scorer = _score_binary_group
+        metric_names = ["f1", "balanced_accuracy", "calibrated_f1", "calibrated_balanced_accuracy"]
+        primary = "calibrated_f1"
+    else:
+        scorer = _score_multiclass_group
+        metric_names = ["macro_f1", "weighted_f1", "balanced_accuracy", "accuracy"]
+        primary = "macro_f1"
+
+    by_metric: dict[str, list[tuple[str, float]]] = {name: [] for name in metric_names}
+    for group in sorted({str(g) for g in groups_arr.tolist()}):
+        mask = np.array([str(g) == group for g in groups_arr], dtype=bool)
+        if not mask.any():
+            continue
+        scores = scorer(per_sample, mask)
+        for name, value in scores.items():
+            if np.isfinite(value):
+                by_metric[name].append((group, value))
+
+    out: dict[str, Any] = {"n_groups_scored": int(len({str(g) for g in groups_arr.tolist()}))}
+    for name, values in by_metric.items():
+        if not values:
+            continue
+        group, value = min(values, key=lambda item: item[1])
+        out[f"worst_group_{name}"] = float(value)
+        out[f"worst_group_name_{name}"] = group
+    if primary in by_metric and by_metric[primary]:
+        group, value = min(by_metric[primary], key=lambda item: item[1])
+        out["worst_group"] = group
+        out["worst_group_metric"] = primary
+        out["worst_group_score"] = float(value)
+    return out
+
+
 def _sweep_budgets(
     rows: list[dict[str, Any]],
     x_train: np.ndarray,
@@ -198,17 +321,23 @@ def _sweep_budgets(
     predictions: list[dict[str, Any]] | None = None,
     sample_ids_test: np.ndarray | None = None,
     groups_test: np.ndarray | None = None,
+    x_val: np.ndarray | None = None,
+    y_val: np.ndarray | None = None,
+    family: str = "logistic",
 ) -> None:
     """Apply the fitted transform, then sweep source-fraction budgets, appending one
     row each.
 
-    ``fit_score(x_tr_sub, y_tr_sub, x_test, y_test, probe_seed) -> (scores, extra)``
-    is the only benchmark-specific piece; everything else (transform application,
-    budget sub-sampling, metadata, bookkeeping) is shared.
+    ``fit_score(x_tr_sub, y_tr_sub, x_test, y_test, probe_seed, x_cal, y_cal) ->
+    (scores, extra)`` is the only benchmark-specific piece; everything else
+    (transform application, budget sub-sampling, metadata, bookkeeping) is shared.
+    ``x_val``/``y_val`` is the regime's held-out validation set, used by the binary
+    probe to calibrate its threshold (ignored by the multiclass probe).
     """
     meta = dict(meta or {})
     x_train = _apply(transform, x_train)
     x_test = _apply(transform, x_test)
+    x_val = _apply(transform, x_val) if x_val is not None and len(x_val) else None
     for budget in budgets:
         sub_seed = seed + int(round(budget * 1000))
         if transform is not None and hasattr(transform, "subset_indices"):
@@ -227,7 +356,8 @@ def _sweep_budgets(
         with perf.measure(f"probe.sweep.source/{meta.get('benchmark', '?')}/{meta.get('method', '?')}",
                           n_train=len(sub), n_test=len(y_test)):
             result = fit_score(
-                x_train[sub], y_train[sub], x_test, y_test, seed + int(round(budget * 1000)) + 17
+                x_train[sub], y_train[sub], x_test, y_test, seed + int(round(budget * 1000)) + 17,
+                x_val, y_val,
             )
             if len(result) == 3:
                 scores, extra, per_sample = result
@@ -235,6 +365,7 @@ def _sweep_budgets(
                 scores, extra = result
                 per_sample = None
         perf.set_identity(None)
+        scores = {**scores, **_worst_group_scores(per_sample, groups_test)}
 
         rows.append(
             {
@@ -283,6 +414,9 @@ def _sweep_target_budgets(
     predictions: list[dict[str, Any]] | None = None,
     sample_ids_target: np.ndarray | None = None,
     groups_target: np.ndarray | None = None,
+    x_val: np.ndarray | None = None,
+    y_val: np.ndarray | None = None,
+    family: str = "logistic",
 ) -> None:
     """Sweep target-region label budgets (absolute counts).
 
@@ -291,10 +425,16 @@ def _sweep_target_budgets(
     80 % of target, test on remaining 20 %; no source used).
     Budget > 0 → sample that many *target* labels for training, keep the
     remaining target samples for testing.
+
+    ``x_val``/``y_val`` is the regime's source-side held-out validation set, used by
+    the binary probe to calibrate its threshold without peeking at the target.
     """
     meta = dict(meta or {})
     x_source_t = _apply(transform, x_source)
     x_target_t = _apply(transform, x_target_full)
+    x_val_t = _apply(transform, x_val) if x_val is not None and len(x_val) else None
+    sample_ids_full = np.asarray(sample_ids_target if sample_ids_target is not None else np.arange(len(y_target_full)))
+    groups_full = np.asarray(groups_target) if groups_target is not None else None
 
     for budget in budgets:
         if budget == 0:
@@ -353,13 +493,15 @@ def _sweep_target_budgets(
         perf.set_identity(identity)
         with perf.measure(f"probe.sweep.target/{meta.get('benchmark', '?')}/{meta.get('method', '?')}",
                           n_train=n_tr, n_test=len(y_te)):
-            result = fit_score(x_tr, y_tr, x_te, y_te, sub_seed)
+            result = fit_score(x_tr, y_tr, x_te, y_te, sub_seed, x_val_t, y_val)
             if len(result) == 3:
                 scores, extra, per_sample = result
             else:
                 scores, extra = result
                 per_sample = None
         perf.set_identity(None)
+        current_groups = groups_full[test_idx] if groups_full is not None else None
+        scores = {**scores, **_worst_group_scores(per_sample, current_groups)}
 
         rows.append({
             **meta,
@@ -371,8 +513,6 @@ def _sweep_target_budgets(
             **extra,
             **scores,
         })
-        sample_ids_full = np.asarray(sample_ids_target if sample_ids_target is not None else np.arange(len(y_target_full)))
-        groups_full = np.asarray(groups_target) if groups_target is not None else None
         _append_prediction_rows(
             predictions,
             meta=meta,
@@ -381,7 +521,7 @@ def _sweep_target_budgets(
             label_budget=budget,
             n_train_sub=n_tr,
             sample_ids=sample_ids_full[test_idx],
-            groups_test=groups_full[test_idx] if groups_full is not None else None,
+            groups_test=current_groups,
             per_sample=per_sample,
         )
 
@@ -401,29 +541,33 @@ def run_probes(
     predictions: list[dict[str, Any]] | None = None,
     sample_ids_test: np.ndarray | None = None,
     groups_test: np.ndarray | None = None,
+    x_val: np.ndarray | None = None,
+    y_val: np.ndarray | None = None,
+    family: str = "logistic",
 ) -> None:
     """Binary calibrated-probe budget sweep (source-fraction budgets)."""
 
-    def fit_score(x_tr: np.ndarray, y_tr: np.ndarray, x_te: np.ndarray, y_te: np.ndarray, probe_seed: int):
-        clf, threshold, n_fit, n_cal, probe_meta = fit_probe_with_calibration(x_tr, y_tr, probe_seed)
+    def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None):
+        clf, threshold, n_fit, n_cal, probe_meta = fit_probe_with_calibration(
+            x_tr, y_tr, probe_seed, x_cal=x_cal, y_cal=y_cal, family=family
+        )
         extra = {
             "n_probe_fit": n_fit,
             "n_probe_calibration": n_cal,
-            "threshold_source": "source_validation",
+            "threshold_source": probe_meta["calibration_source"],
             "threshold": threshold,
             **probe_meta,
         }
         if transform is not None and hasattr(transform, "adapt_test_features"):
             x_te = transform.adapt_test_features(clf, x_te)
-        if predictions is not None:
-            scores, per_sample = score_binary(clf, threshold, x_te, y_te, return_per_sample=True)
-            return scores, extra, per_sample
-        return score_binary(clf, threshold, x_te, y_te), extra
+        scores, per_sample = score_binary(clf, threshold, x_te, y_te, return_per_sample=True)
+        return scores, extra, per_sample
 
     _sweep_budgets(
         rows, x_train, x_test, y_train, y_test, seed, fit_score,
         transform=transform, budgets=budgets, meta=meta, stratify=True, groups_train=groups_train,
         predictions=predictions, sample_ids_test=sample_ids_test, groups_test=groups_test,
+        x_val=x_val, y_val=y_val,
     )
 
 
@@ -442,6 +586,9 @@ def run_probes_target(
     predictions: list[dict[str, Any]] | None = None,
     sample_ids_target: np.ndarray | None = None,
     groups_target: np.ndarray | None = None,
+    x_val: np.ndarray | None = None,
+    y_val: np.ndarray | None = None,
+    family: str = "logistic",
 ) -> None:
     """Binary calibrated-probe *target-budget* sweep.
 
@@ -450,26 +597,27 @@ def run_probes_target(
     (target-ID upper bound, train on 80 % of target only).
     """
 
-    def fit_score(x_tr: np.ndarray, y_tr: np.ndarray, x_te: np.ndarray, y_te: np.ndarray, probe_seed: int):
-        clf, threshold, n_fit, n_cal, probe_meta = fit_probe_with_calibration(x_tr, y_tr, probe_seed)
+    def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None):
+        clf, threshold, n_fit, n_cal, probe_meta = fit_probe_with_calibration(
+            x_tr, y_tr, probe_seed, x_cal=x_cal, y_cal=y_cal, family=family
+        )
         extra = {
             "n_probe_fit": n_fit,
             "n_probe_calibration": n_cal,
-            "threshold_source": "source_validation",
+            "threshold_source": probe_meta["calibration_source"],
             "threshold": threshold,
             **probe_meta,
         }
         if transform is not None and hasattr(transform, "adapt_test_features"):
             x_te = transform.adapt_test_features(clf, x_te)
-        if predictions is not None:
-            scores, per_sample = score_binary(clf, threshold, x_te, y_te, return_per_sample=True)
-            return scores, extra, per_sample
-        return score_binary(clf, threshold, x_te, y_te), extra
+        scores, per_sample = score_binary(clf, threshold, x_te, y_te, return_per_sample=True)
+        return scores, extra, per_sample
 
     _sweep_target_budgets(
         rows, x_source, x_target_full, y_source, y_target_full, seed, fit_score,
         transform=transform, budgets=budgets, meta=meta, stratify=True, groups_source=groups_source,
         predictions=predictions, sample_ids_target=sample_ids_target, groups_target=groups_target,
+        x_val=x_val, y_val=y_val,
     )
 
 
@@ -488,22 +636,28 @@ def run_probes_multiclass(
     predictions: list[dict[str, Any]] | None = None,
     sample_ids_test: np.ndarray | None = None,
     groups_test: np.ndarray | None = None,
+    x_val: np.ndarray | None = None,
+    y_val: np.ndarray | None = None,
+    family: str = "logistic",
 ) -> None:
-    """Multiclass logistic-probe source-budget sweep (crop-type classification)."""
+    """Multiclass logistic-probe source-budget sweep (crop-type classification).
 
-    def fit_score(x_tr: np.ndarray, y_tr: np.ndarray, x_te: np.ndarray, y_te: np.ndarray, probe_seed: int):
-        clf, probe_meta = fit_probe_multiclass(x_tr, y_tr, probe_seed)
+    The multiclass probe has no threshold to calibrate, but ``x_val``/``y_val`` (the
+    regime's held-out val) are used to select the L2 strength on a fixed grid.
+    """
+
+    def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None):
+        clf, probe_meta = fit_probe_multiclass(x_tr, y_tr, probe_seed, x_val=x_cal, y_val=y_cal, family=family)
         if transform is not None and hasattr(transform, "adapt_test_features"):
             x_te = transform.adapt_test_features(clf, x_te)
-        if predictions is not None:
-            scores, per_sample = score_multiclass(clf, x_te, y_te, return_per_sample=True)
-            return scores, probe_meta, per_sample
-        return score_multiclass(clf, x_te, y_te), probe_meta
+        scores, per_sample = score_multiclass(clf, x_te, y_te, return_per_sample=True)
+        return scores, probe_meta, per_sample
 
     _sweep_budgets(
         rows, x_train, x_test, y_train, y_test, seed, fit_score,
         transform=transform, budgets=budgets, meta=meta, stratify=True, groups_train=groups_train,
         predictions=predictions, sample_ids_test=sample_ids_test, groups_test=groups_test,
+        x_val=x_val, y_val=y_val,
     )
 
 
@@ -522,27 +676,30 @@ def run_probes_multiclass_target(
     predictions: list[dict[str, Any]] | None = None,
     sample_ids_target: np.ndarray | None = None,
     groups_target: np.ndarray | None = None,
+    x_val: np.ndarray | None = None,
+    y_val: np.ndarray | None = None,
+    family: str = "logistic",
 ) -> None:
     """Multiclass target-budget sweep.
 
     Includes budgets 0 (strict geographic holdout, train on source only),
     TARGET_BUDGETS (few-shot target training), and TARGET_ID_UPPER_BOUND
-    (target-ID upper bound, train on 80 % of target only).
+    (target-ID upper bound, train on 80 % of target only). ``x_val``/``y_val`` (the
+    regime's source-side val) select the L2 strength on a fixed grid.
     """
 
-    def fit_score(x_tr: np.ndarray, y_tr: np.ndarray, x_te: np.ndarray, y_te: np.ndarray, probe_seed: int):
-        clf, probe_meta = fit_probe_multiclass(x_tr, y_tr, probe_seed)
+    def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None):
+        clf, probe_meta = fit_probe_multiclass(x_tr, y_tr, probe_seed, x_val=x_cal, y_val=y_cal, family=family)
         if transform is not None and hasattr(transform, "adapt_test_features"):
             x_te = transform.adapt_test_features(clf, x_te)
-        if predictions is not None:
-            scores, per_sample = score_multiclass(clf, x_te, y_te, return_per_sample=True)
-            return scores, probe_meta, per_sample
-        return score_multiclass(clf, x_te, y_te), probe_meta
+        scores, per_sample = score_multiclass(clf, x_te, y_te, return_per_sample=True)
+        return scores, probe_meta, per_sample
 
     _sweep_target_budgets(
         rows, x_source, x_target_full, y_source, y_target_full, seed, fit_score,
         transform=transform, budgets=budgets, meta=meta, stratify=True, groups_source=groups_source,
         predictions=predictions, sample_ids_target=sample_ids_target, groups_target=groups_target,
+        x_val=x_val, y_val=y_val,
     )
 
 
@@ -560,8 +717,9 @@ def run_probes_segmentation(
     budgets: list[float] = SOURCE_BUDGETS,
     meta: dict[str, Any] | None = None,
     tile_ids_test: np.ndarray | None = None,
+    family: str = "logistic",
 ) -> None:
-    """PASTIS-R linear-probe sweep using folds 1-3/4/5 as train/val/test.
+    """PASTIS-R probe sweep using folds 1-3/4/5 as train/val/test.
 
     When ``tile_ids_test`` is provided, per-tile metrics (mean per-tile mIoU,
     worst-tile mIoU) are computed for the test split in addition to the global
@@ -575,7 +733,10 @@ def run_probes_segmentation(
     for budget in budgets:
         sub_seed = seed + int(round(budget * 1000))
         sub = subset_indices(y_train, budget, sub_seed, stratify=True)
-        clf, probe_meta = fit_probe_multiclass(x_train[sub], y_train[sub], sub_seed)
+        # The official val fold doubles as the hyperparameter-selection set (no test peeking).
+        clf, probe_meta = fit_probe_multiclass(
+            x_train[sub], y_train[sub], sub_seed, x_val=x_val, y_val=y_val, family=family
+        )
         for split_name, x_eval, y_eval in (
             ("validation", x_val, y_val),
             ("test", x_test, y_test),
