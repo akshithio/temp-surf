@@ -32,6 +32,9 @@ from dataio.get_input import (
 BENCHMARK = "eurocropsml"
 LABEL_KIND = "multiclass"
 HOLDOUTS = ["Estonia"]  # train Latvia+Portugal -> test Estonia (official transnational split)
+# Only 3 country domains -> random group folds collapse into leave-one-country-out, so
+# grouped_ood is omitted here (redundant with geographic_ood).
+SPLIT_REGIMES = ["random_id", "geographic_ood", "phenology_ood"]
 HCAT_PREFIX = 6  # truncate the 10-digit HCAT code to this many leading digits (crop-type level)
 
 # --- Raw npz band layout ----------------------------------------------------

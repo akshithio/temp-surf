@@ -13,7 +13,7 @@ from __future__ import annotations
 import numpy as np
 from sklearn.model_selection import train_test_split
 
-from evals.regimes.base import geography_domains
+from evals.regimes.base import Split, geography_domains
 
 NAME = "geographic_ood"
 GROUP_KIND = "geography"
@@ -50,10 +50,10 @@ def make_strict_holdout_splits(
 
 
 def iter_splits(y, groups, *, seed, holdouts, n_folds=None, **_):
-    """Yield one ``(holdout, train_idx, test_idx)`` per curated holdout region."""
+    """Yield one :class:`Split` (train/val/test) per curated holdout region."""
     for holdout in holdouts:
         try:
-            train, _val, test, _train_val = make_strict_holdout_splits(y, groups, holdout, seed)
+            train, val, test, _train_val = make_strict_holdout_splits(y, groups, holdout, seed)
         except ValueError:
             continue  # one-class holdout or empty region -> skip
-        yield holdout, train, test
+        yield Split(str(holdout), train, test, val)

@@ -17,7 +17,7 @@ from __future__ import annotations
 import numpy as np
 from sklearn.model_selection import train_test_split
 
-from evals.regimes.base import geography_domains
+from evals.regimes.base import Split, geography_domains
 
 NAME = "random_id"
 GROUP_KIND = "geography"
@@ -50,6 +50,6 @@ def make_splits(y: np.ndarray, seed: int) -> tuple[np.ndarray, np.ndarray, np.nd
 
 
 def iter_splits(y, groups, *, seed, holdouts=None, n_folds=None, **_):
-    """Yield the single in-distribution split as ``(label, train_idx, test_idx)``."""
-    train, _val, test = make_splits(y, seed)
-    yield "random_id", train, test
+    """Yield the single in-distribution :class:`Split` (train/val/test)."""
+    train, val, test = make_splits(y, seed)
+    yield Split("random_id", train, test, val)

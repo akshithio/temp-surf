@@ -6,7 +6,7 @@ import numpy as np
 
 from evals import evals as EV
 from evals.regimes import phenology_ood
-from evals.regimes.base import phenology_domains
+from evals.regimes.phenology_ood import phenology_domains
 
 
 def test_make_strict_holdout_splits() -> None:
@@ -73,10 +73,11 @@ def test_phenology_ood_splits_by_assigned_domains() -> None:
 
     splits = list(phenology_ood.iter_splits(y, domains, seed=0))
 
-    assert {label for label, _train, _test in splits} == {"early", "mid", "late"}
-    for label, train, test in splits:
-        assert set(domains[test]) == {label}
-        assert set(train).isdisjoint(test)
+    assert {s.label for s in splits} == {"early", "mid", "late"}
+    for s in splits:
+        assert set(domains[s.test]) == {s.label}
+        assert set(s.train).isdisjoint(s.test)
+        assert set(s.val).isdisjoint(s.test)  # val is held out of test too
 
 
 def test_expected_calibration_error() -> None:
@@ -84,6 +85,13 @@ def test_expected_calibration_error() -> None:
     prob = np.array([0.0, 0.0, 1.0, 1.0])
 
     assert EV.expected_calibration_error(y, prob, n_bins=2) == 0.0
+
+
+def test_metric_roles_label_deployment_and_diagnostic_metrics() -> None:
+    assert "calibrated_f1" in EV.METRIC_ROLES["binary"]["deployment"]
+    assert "calibrated_f1_target_optimal" in EV.METRIC_ROLES["binary"]["diagnostic"]
+    assert "worst_group_macro_f1" in EV.METRIC_ROLES["multiclass"]["deployment"]
+    assert "worst_tile_miou" in EV.METRIC_ROLES["segmentation"]["deployment"]
 
 
 def test_binary_probe_writes_predictions_for_each_source_budget() -> None:
@@ -115,6 +123,35 @@ def test_binary_probe_writes_predictions_for_each_source_budget() -> None:
     assert {p["label_budget"] for p in preds} == {0.5, 1.0}
     assert {p["sample_id"] for p in preds} == set(range(100, 106))
     assert {"prob", "pred_default", "pred_calibrated"}.issubset(preds[0])
+    assert {"worst_group_calibrated_f1", "worst_group_score", "n_groups_scored"}.issubset(rows[0])
+    assert rows[0]["n_groups_scored"] == 1
+
+
+def test_binary_probe_reports_worst_group_on_mixed_domain_test_set() -> None:
+    rng = np.random.default_rng(2)
+    x_train = rng.normal(size=(50, 4))
+    y_train = np.array([0, 1] * 25)
+    x_train[y_train == 1, 0] += 2.0
+    x_test = rng.normal(size=(8, 4))
+    y_test = np.array([0, 1, 0, 1, 0, 1, 0, 1])
+    groups_test = np.array(["a", "a", "a", "a", "b", "b", "b", "b"], dtype=object)
+    rows: list[dict] = []
+
+    EV.run_probes(
+        rows,
+        x_train,
+        x_test,
+        y_train,
+        y_test,
+        seed=0,
+        budgets=[1.0],
+        meta={"model": "e", "benchmark": "t", "method": "erm", "split_regime": "random_id"},
+        groups_test=groups_test,
+    )
+
+    assert rows[0]["n_groups_scored"] == 2
+    assert rows[0]["worst_group"] in {"a", "b"}
+    assert rows[0]["worst_group_metric"] == "calibrated_f1"
 
 
 def test_multiclass_probe_writes_prediction_vectors() -> None:
@@ -144,6 +181,7 @@ def test_multiclass_probe_writes_prediction_vectors() -> None:
     assert len(rows) == 1
     assert len(preds) == 6
     assert {"pred", "prob_true", "prob_pred", "classes", "probs"}.issubset(preds[0])
+    assert {"worst_group_macro_f1", "worst_group_score", "n_groups_scored"}.issubset(rows[0])
 
 
 def test_segmentation_probe_reports_official_validation_and_test_splits() -> None:

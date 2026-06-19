@@ -22,6 +22,9 @@ from dataio.get_input import (
 BENCHMARK = "cropharvest"
 LABEL_KIND = "binary"
 HOLDOUTS = ["togo", "ethiopia", "lem-brazil", "rwanda", "togo-eval"]
+# CropHarvest has enough source datasets for random group folds to add value over the
+# curated holdouts, so grouped_ood is kept here (and dropped on the few-domain benchmarks).
+SPLIT_REGIMES = ["random_id", "grouped_ood", "geographic_ood", "phenology_ood"]
 
 # --- Raw array band layout --------------------------------------------------
 # Raw 18-col array: [S1 VV,VH] + [S2: B2..B8A, B9, B11, B12] + [ERA5 temp,precip]

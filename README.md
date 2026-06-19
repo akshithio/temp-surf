@@ -111,6 +111,15 @@ those domains become train/test splits:
 | `hybrid_ood` | geography | ≤5 holdouts × source folds | Geographic holdout × source group-folds: for each target region, train on different random subsets of the source regions and always test on the full target. |
 | `phenology_ood` | NDVI phenology | ≤4 practical domains | Assigns domains from loaded NDVI behavior (`low_amplitude`, `early_peak`, `mid_peak`, `late_peak`) and holds each phenology domain out in turn. |
 
+Each regime yields a train/val/test split; the binary probe calibrates its
+decision threshold on that held-out `val` (a source-side validation set for the
+OOD regimes), falling back to an internal split of the training pool only when a
+regime supplies no val. These regimes drive the classification benchmarks.
+**PASTIS-R (segmentation)** is scored on its published spatial folds (1-3 train /
+4 val / 5 test) — itself a geographic holdout, but implemented per-benchmark via
+the official folds rather than the regime sweep (logged as
+`split_regime=official_folds`, `domain_basis=geography`).
+
 **Budget types**
 
 | Type | Levels | Meaning |
@@ -120,6 +129,24 @@ those domains become train/test splits:
 
 Each budget level fits a calibrated logistic-regression probe and scores the
 metrics on the test set.
+
+**Metric roles**
+
+Every result directory writes `metric_roles.json`, separating deployment metrics
+from diagnostic metrics. Deployment metrics are the headline values that match
+the expected use case; diagnostic metrics explain why the deployment metric moved.
+
+| Label family | Deployment metrics | Diagnostic metrics |
+|---|---|---|
+| binary | `calibrated_f1`, `calibrated_balanced_accuracy`, `worst_group_calibrated_f1`, `worst_group_calibrated_balanced_accuracy` | default-threshold F1/balanced accuracy, AUROC, oracle target-optimal F1, threshold, ECE, Brier, NLL |
+| multiclass | `macro_f1`, `balanced_accuracy`, `worst_group_macro_f1`, `worst_group_balanced_accuracy` | weighted F1, accuracy, macro AUC |
+| segmentation | `miou`, `mean_per_tile_miou`, `worst_tile_miou` | pixel accuracy, macro/weighted F1, tile/class-count diagnostics |
+
+Classification probe rows also include first-class WILDS-style worst-group fields
+computed from the evaluated test domains (`worst_group`, `worst_group_metric`,
+`worst_group_score`, and metric-specific `worst_group_*` columns). On `random_id`
+rows this is the subpopulation shift view: train/test contain all domains, then
+the row reports the worst test domain rather than only the average.
 
 ---
 
@@ -202,9 +229,7 @@ data/input/models/tessera/tessera_v1_1_mpc_model.pt
 
 ## Usage
 
-### Environment
-
-#### Tooling
+### Tooling
 
 The project uses a conda + uv split:
 
@@ -343,7 +368,6 @@ match the official v1.1 inference code.
 ### Parallelism And Resumption
 
 Everything is cache-backed and resumable:
-
 - Assembled benchmarks are pickle-cached under `data/cache/benchmark/`.
 - Model embeddings are cached per `(benchmark, model, benchmark signature)`
   with atomic writes.
