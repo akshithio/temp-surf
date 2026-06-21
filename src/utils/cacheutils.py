@@ -37,6 +37,7 @@ BENCHMARK_MODULES: dict[str, str] = {
 }
 
 MODELS: dict[str, tuple[str, str]] = {
+    "raw": ("models.raw", "RawModel"),  # reality-check control (not a foundation model)
     "presto": ("models.presto", "PrestoModel"),
     "olmoearth": ("models.olmoearth", "OlmoEarthModel"),
     "galileo": ("models.galileo", "GalileoModel"),
@@ -45,6 +46,10 @@ MODELS: dict[str, tuple[str, str]] = {
 }
 
 EMB_DTYPE = "float16"
+
+
+class MissingEmbeddingCache(FileNotFoundError):
+    """Raised when a probing run requests an embedding cache that is absent."""
 
 
 def _hash_files(*paths: str | Path) -> str:
@@ -128,14 +133,46 @@ def _model_source_files(model_name: str) -> list[Path]:
     return [mod_src]
 
 
+def embedding_cache_path(bench: Any, benchmark: str, model_name: str, tag: str) -> Path:
+    """Path for one benchmark-level frozen embedding matrix."""
+    sig = f"n{bench.n_samples}_b{_hash_str(tag)}_e{_hash_files(*_model_source_files(model_name))}"
+    return EMBEDDINGS_DIR / benchmark / model_name / sig / "baseline.npy"
+
+
+def dense_embedding_cache_dir(bench: PastisBenchmark, benchmark: str, model_name: str, tag: str) -> Path:
+    """Root directory for one dense frozen-feature tile cache."""
+    sig = f"n{bench.n_samples}_b{_hash_str(tag)}_e{_hash_files(*_model_source_files(model_name))}"
+    return EMBEDDINGS_DIR / benchmark / model_name / sig / "baseline"
+
+
+def load_cached_embeddings(bench: Any, benchmark: str, model_name: str, tag: str) -> np.ndarray:
+    """Load an existing frozen embedding matrix, failing if it has not been built."""
+    path = embedding_cache_path(bench, benchmark, model_name, tag)
+    if not path.exists():
+        raise MissingEmbeddingCache(
+            f"Embedding cache not found for {model_name}/{benchmark}: {path}. "
+            "Run with RUN_STAGES including 'gen_embeddings' first."
+        )
+    return np.load(path).astype(np.float32, copy=False)
+
+
+def require_dense_cache(bench: PastisBenchmark, benchmark: str, model_name: str, tag: str) -> Path:
+    """Return an existing dense tile cache root, failing if it has not been built."""
+    root = dense_embedding_cache_dir(bench, benchmark, model_name, tag)
+    if not root.exists() or not any(root.glob("fold_*/*.labels.npy")):
+        raise MissingEmbeddingCache(
+            f"Dense embedding cache not found for {model_name}/{benchmark}: {root}. "
+            "Run with RUN_STAGES including 'gen_embeddings' first."
+        )
+    return root
+
+
 def extract_and_cache(
     bench: Any, benchmark, model_name, tag, overwrite="skip", **enc_kwargs
 ) -> np.ndarray:
     """Cache and return the frozen-model embedding matrix for a benchmark."""
-    sig = f"n{bench.n_samples}_b{_hash_str(tag)}_e{_hash_files(*_model_source_files(model_name))}"
-    out = EMBEDDINGS_DIR / benchmark / model_name / sig
-    out.mkdir(parents=True, exist_ok=True)
-    path = out / "baseline.npy"
+    path = embedding_cache_path(bench, benchmark, model_name, tag)
+    path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and overwrite != "override":
         return np.load(path).astype(np.float32, copy=False)
     model = build_model(model_name, **enc_kwargs)
@@ -175,8 +212,7 @@ def extract_dense_and_cache(
     the release or its complete feature tensor in memory and resumes at tile
     granularity after interruption.
     """
-    sig = f"n{bench.n_samples}_b{_hash_str(tag)}_e{_hash_files(*_model_source_files(model_name))}"
-    root = EMBEDDINGS_DIR / benchmark / model_name / sig / "baseline"
+    root = dense_embedding_cache_dir(bench, benchmark, model_name, tag)
     root.mkdir(parents=True, exist_ok=True)
     model = None
     for tile_id, fold, tile, labels in bench.iter_tiles():

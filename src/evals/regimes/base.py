@@ -54,6 +54,3 @@ def holdout_val(train: np.ndarray, y: np.ndarray, seed: int, frac: float = 0.10)
     except ValueError:
         tr, val = train_test_split(train, test_size=frac, random_state=seed, stratify=None)
     return np.sort(tr), np.sort(val)
-
-
-

@@ -44,8 +44,8 @@ PROBE_TOL = 1e-5
 PROBE_FAMILIES: list[str] = ["logistic", "mlp", "knn"]
 
 # Per-family hyperparameter grid, each selected on the regime's val set. Same SIZE (5)
-# across families so no family gets a larger search budget (WILDS hyperparameter
-# fairness). Set a grid to a single value to disable that family's tuning.
+# across families so no family gets a larger search budget.
+# Set a grid to a single value to disable that family's tuning.
 PROBE_GRIDS: dict[str, list[float]] = {
     "logistic": [0.01, 0.1, 1.0, 10.0, 100.0],  # C (inverse L2 strength)
     "mlp": [1e-4, 1e-3, 1e-2, 1e-1, 1.0],        # alpha (L2), fixed 2-layer arch below
@@ -61,9 +61,9 @@ PROBE_MLP_MAX_ITER: int = 500
 def _build_probe(family: str, hp: float, *, solver: str, seed: int, n_fit: int):
     """Build a standardized probe pipeline for ``family`` at hyperparameter ``hp``.
 
-    Only ``logistic`` uses ``solver``/``class_weight``; ``mlp`` and ``knn`` (which lack
-    a class-weight option) rely on the binary threshold calibration / balanced metrics
-    downstream. ``knn`` neighbors are clamped to the training size.
+    Only ``logistic`` uses ``solver``/``class_weight``; ``mlp`` and ``knn`` are class-
+    balanced upstream by resampling (see :func:`_class_balanced_resample`), so all three
+    train on balanced data. ``knn`` neighbors are clamped to the training size.
     """
     if family == "logistic":
         clf = LogisticRegression(
@@ -78,8 +78,36 @@ def _build_probe(family: str, hp: float, *, solver: str, seed: int, n_fit: int):
     return make_pipeline(StandardScaler(), clf)
 
 
+def _class_balanced_resample(x: np.ndarray, y: np.ndarray, seed: int):
+    """Resample ``(x, y)`` to a class-balanced set of ~the same total size.
+
+    Used for families with no ``class_weight`` option (``mlp``, ``knn``) so EVERY probe
+    family trains on class-balanced data: ``logistic`` balances via
+    ``class_weight="balanced"`` (the paper-faithful config), ``mlp``/``knn`` via this
+    resample. Bounded to the original size (each class drawn ``len(y) // n_classes``
+    times, with replacement only when oversampling), so many-class crop-type does not
+    blow up. Deterministic in ``seed`` so the grid sweep is stable.
+    """
+    rng = np.random.default_rng(seed)
+    classes = np.unique(y)
+    per_class = max(1, len(y) // len(classes))
+    parts = []
+    for c in classes:
+        c_idx = np.where(y == c)[0]
+        parts.append(rng.choice(c_idx, size=per_class, replace=per_class > len(c_idx)))
+    sel = np.concatenate(parts)
+    rng.shuffle(sel)
+    return x[sel], y[sel]
+
+
 def _fit_probe(x: np.ndarray, y: np.ndarray, *, family: str, hp: float, solver: str, seed: int):
-    """Fit a probe of ``family`` at ``hp``; return ``(clf, n_iter, convergence_warnings)``."""
+    """Fit a probe of ``family`` at ``hp``; return ``(clf, n_iter, convergence_warnings)``.
+
+    ``mlp``/``knn`` (no ``class_weight``) are fit on a class-balanced resample so every
+    family handles imbalance equivalently; ``logistic`` uses ``class_weight="balanced"``.
+    """
+    if family in ("mlp", "knn"):
+        x, y = _class_balanced_resample(x, y, seed)
     clf = _build_probe(family, hp, solver=solver, seed=seed, n_fit=len(y))
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", ConvergenceWarning)

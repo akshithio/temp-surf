@@ -23,9 +23,11 @@ TRAIN_FOLDS = {1, 2, 3}
 VAL_FOLDS = {4}
 TEST_FOLDS = {5}
 HOLDOUTS = [5]
-# Fold-based geographic regimes (run via the dense path, not the classification sweep):
-# official_folds = published 1-3/4/5 (comparability); geographic_ood = leave-one-fold-out.
-SPLIT_REGIMES = ["official_folds", "geographic_ood"]
+# Fold-based regimes (run via the dense path, not the classification sweep). Each regime
+# owns its fold logic in evals/regimes/<regime>.py (iter_fold_splits):
+#   random_id      = published 1-3/4/5 fold assignment -> PASTIS's in-distribution baseline.
+#   geographic_ood = leave-one-spatial-fold-out (the deployment regime, supports worst-region).
+SPLIT_REGIMES = ["random_id", "geographic_ood"]
 IGNORE_INDEX = 19
 
 # PASTIS DATA_S2 is (T, 10, 128, 128) in this 10-band order. DATA_S1A is

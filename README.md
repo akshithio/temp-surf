@@ -106,19 +106,18 @@ those domains become train/test splits:
 | Regime | Domain basis | Splits per benchmark | Description |
 |---|---|---:|---|
 | `random_id` | geography | 1 | Random stratified 80/10/10 split. Train and test share regions/domains (in-distribution upper bound). |
-| `grouped_ood` | geography | ≤5 folds | Assigns geographic domains to random folds, then holds each fold out in turn. |
 | `geographic_ood` | geography | 1 / ≤5 holdouts | Strict leave-region/source-out. CropHarvest: curated holdouts (togo, ethiopia, lem-brazil, rwanda, togo-eval). EuroCropsML: Estonia. BreizhCrops: frh04. |
-| `hybrid_ood` | geography | ≤5 holdouts × source folds | Geographic holdout × source group-folds: for each target region, train on different random subsets of the source regions and always test on the full target. |
 | `phenology_ood` | NDVI phenology | ≤4 practical domains | Assigns domains from loaded NDVI behavior (`low_amplitude`, `early_peak`, `mid_peak`, `late_peak`) and holds each phenology domain out in turn. |
 
 Each regime yields a train/val/test split; the binary probe calibrates its
 decision threshold on that held-out `val` (a source-side validation set for the
 OOD regimes), falling back to an internal split of the training pool only when a
 regime supplies no val. These regimes drive the classification benchmarks.
-**PASTIS-R (segmentation)** is scored on its published spatial folds (1-3 train /
-4 val / 5 test) — itself a geographic holdout, but implemented per-benchmark via
-the official folds rather than the regime sweep (logged as
-`split_regime=official_folds`, `domain_basis=geography`).
+**PASTIS-R (segmentation)** runs the same `random_id` and `geographic_ood` regimes,
+realized for the dense per-pixel path by each regime's `iter_fold_splits` (in
+`evals/regimes/`): `random_id` is the published spatial-fold assignment (1-3 train /
+4 val / 5 test) used as the in-distribution baseline, and `geographic_ood` is
+leave-one-spatial-fold-out. Both log `domain_basis=geography`.
 
 **Budget types**
 
@@ -142,7 +141,7 @@ the expected use case; diagnostic metrics explain why the deployment metric move
 | multiclass | `macro_f1`, `balanced_accuracy`, `worst_group_macro_f1`, `worst_group_balanced_accuracy` | weighted F1, accuracy, macro AUC |
 | segmentation | `miou`, `mean_per_tile_miou`, `worst_tile_miou` | pixel accuracy, macro/weighted F1, tile/class-count diagnostics |
 
-Classification probe rows also include first-class WILDS-style worst-group fields
+Classification probe rows also include first-class worst-group fields
 computed from the evaluated test domains (`worst_group`, `worst_group_metric`,
 `worst_group_score`, and metric-specific `worst_group_*` columns). On `random_id`
 rows this is the subpopulation shift view: train/test contain all domains, then
@@ -213,7 +212,7 @@ data/input/benchmarks/cropharvest/
 data/input/benchmarks/eurocropsml/
     preprocess/*.npz
     split/latvia_portugal_vs_estonia/...
-data/input/benchmarks/pastis/
+data/input/benchmarks/pastis_r/
     metadata.geojson
     DATA_S2/S2_<patch>.npy
     DATA_S1A/S1A_<patch>.npy
@@ -303,7 +302,7 @@ GPU smoke tests on cranberry use fixed in-file configuration:
 ```bash
 cd src
 python tests/smoke_models.py
-python tests/smoke_pastis.py
+python tests/smoke_pastis_r.py
 ```
 
 Edit the config block at the top of `src/main.py`, then run:
@@ -318,7 +317,8 @@ compatibility matrix decides which models run on each):
 ```python
 BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis_r"]
 ACTIVE_METHODS = []
-SPLIT_REGIMES = ["random_id", "grouped_ood", "geographic_ood", "hybrid_ood", "phenology_ood"]
+RUN_STAGES = ["gen_embeddings", "probing"]
+SPLIT_REGIMES = ["random_id", "geographic_ood", "phenology_ood"]
 SEEDS = [0, 1]
 ```
 
@@ -327,12 +327,17 @@ Configuration reference:
 ```python
 BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis_r"]
 ACTIVE_METHODS = []           # [] = ERM baseline only
-SPLIT_REGIMES = ["random_id", "grouped_ood", "geographic_ood", "hybrid_ood", "phenology_ood"]
+RUN_STAGES = ["gen_embeddings", "probing"]
+SPLIT_REGIMES = ["random_id", "geographic_ood", "phenology_ood"]
 MAX_SAMPLES = None            # None = all samples
 MAX_DENSE_PIXELS = 50_000     # sampled PASTIS pixels per fold partition
 SEEDS = [0, 1]
 OVERWRITE_MODE = "skip"       # "skip" resumes; "override" reruns cached outputs
 ```
+
+Set `RUN_STAGES = ["gen_embeddings"]` to build or refresh embedding caches without
+running probes. Set `RUN_STAGES = ["probing"]` to read existing embedding caches
+and run probes only; this fails loudly if the matching cache is missing.
 
 There is no model list to configure: `src/evals/compat.py` is the single source
 of truth for which models are eligible per benchmark.

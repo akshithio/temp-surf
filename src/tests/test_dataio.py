@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,7 +13,7 @@ from dataio.get_input import (
 from evals.benchmarks.cropharvest import CH_CLIMATE_BANDS, CH_S1_BANDS, CH_S2_BANDS
 from evals.benchmarks.eurocropsml import _resample_to
 from evals.benchmarks.pastis_r import PastisBenchmark
-from utils import ioutils
+from utils import cacheutils, ioutils
 
 
 def _tiny_benchmark() -> Benchmark:
@@ -101,3 +102,24 @@ def test_summarize_rows_ignores_legacy_rows_missing_grouping_keys() -> None:
     assert summary[0]["model"] == "new"
     assert summary[0]["split_regime"] == "random_id"
     assert summary[0]["mean_f1"] == 1.0
+
+
+def test_load_cached_embeddings_requires_existing_matrix(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(cacheutils, "EMBEDDINGS_DIR", tmp_path)
+    bench = SimpleNamespace(n_samples=2)
+
+    with pytest.raises(FileNotFoundError, match="Embedding cache not found"):
+        cacheutils.load_cached_embeddings(bench, "cropharvest", "presto", "tag")
+
+
+def test_load_cached_embeddings_reads_existing_matrix(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(cacheutils, "EMBEDDINGS_DIR", tmp_path)
+    bench = SimpleNamespace(n_samples=2)
+    path = cacheutils.embedding_cache_path(bench, "cropharvest", "presto", "tag")
+    path.parent.mkdir(parents=True)
+    expected = np.arange(6, dtype=np.float16).reshape(2, 3)
+    np.save(path, expected)
+
+    actual = cacheutils.load_cached_embeddings(bench, "cropharvest", "presto", "tag")
+
+    np.testing.assert_array_equal(actual, expected.astype(np.float32))

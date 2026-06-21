@@ -5,6 +5,11 @@ holdout reproduces the BreizhCrops paper's split direction: the held-out region 
 test set (``frh04`` in the paper) and the remaining regions train. ``groups`` is the
 region, so holding out ``frh04`` matches the published evaluation.
 
+Parcel coordinates are recovered from BreizhCrops' own parcel shapefile (see
+``_bz_parcel_latlon``) so location-aware encoders receive a real lat/lon rather than a
+NaN placeholder; the dataset is still S2-only and single-year, so coordinates do not
+unlock a climate or temporal regime (all of Brittany is one Köppen zone).
+
 LABEL_KIND = "multiclass" -> probes use run_probes_multiclass + multiclass metrics.
 """
 
@@ -22,9 +27,10 @@ from dataio.get_input import (
 BENCHMARK = "breizhcrops"
 LABEL_KIND = "multiclass"
 HOLDOUTS = ["frh04"]  # paper's test region (train on frh01/frh02/frh03/belle-ile)
-# Only ~4-5 NUTS-3 domains -> random group folds ≈ leave-one-region-out, so grouped_ood
-# is omitted here (redundant with geographic_ood).
-SPLIT_REGIMES = ["random_id", "geographic_ood", "phenology_ood"]
+# Region holdout is the only OOD axis here: crop-type task (phenology is label-confounded),
+# a single year 2017 (no forward-time split), and although parcels now carry real coordinates,
+# all of Brittany sits in one Köppen zone (no climate contrast to hold out).
+SPLIT_REGIMES = ["random_id", "geographic_ood"]
 
 # The breizhcrops package returns L1C ``X`` as (T, 13) with bands in THIS order
 # (alphabetical), from which we keep the 10 S2 spectral bands + a computed NDVI.
@@ -60,6 +66,29 @@ def _bz_class_names(base: Path) -> list[str] | None:
         return None
 
 
+def _bz_parcel_latlon(ds) -> dict[int, tuple[float, float]]:
+    """Parcel ``id`` -> ``(lat, lon)`` from BreizhCrops' own parcel shapefile.
+
+    ``geodataframe()`` downloads and caches the per-region RPG parcel polygons on first
+    call. We reproject from RGF93 / Lambert-93 to WGS84 and take a representative interior
+    point per parcel. Location-aware encoders (Presto, Galileo, OlmoEarth) consume lat/lon
+    as a model input, so feeding the true coordinate instead of a NaN/zero placeholder
+    honours their input contract. Returns an empty map (callers fall back to NaN) when the
+    geometry is unavailable, so a missing shapefile never breaks the load.
+    """
+    try:
+        gdf = ds.geodataframe().to_crs(4326)
+    except Exception as exc:  # geopandas/pyproj missing, or shapefile download failed
+        print(f"[breizhcrops] parcel geometry unavailable ({exc}); latlon stays NaN", flush=True)
+        return {}
+    pts = gdf.geometry.representative_point()
+    ids = gdf["id"].to_numpy()
+    return {
+        int(i): (float(lat), float(lon))
+        for i, lon, lat in zip(ids, pts.x.to_numpy(), pts.y.to_numpy(), strict=True)
+    }
+
+
 def load_benchmark(
     root: Path = Path("data/input/benchmarks"),
     max_samples: int | None = None,
@@ -73,7 +102,8 @@ def load_benchmark(
     parcels, keeps the 10 S2 bands + a computed NDVI, rescales reflectance to DN (x1e4,
     matching the other benchmarks), and linspace-resamples each parcel to 12 timesteps with
     a synthetic monthly DOY. ``groups`` = region (geographic holdout; frh04 is the paper's
-    test region). S2-only (no S1 / climate).
+    test region). S2-only (no S1 / climate). ``latlon`` is joined per parcel id from the
+    parcel shapefile (``_bz_parcel_latlon``); parcels with no geometry stay NaN.
     """
     try:
         import breizhcrops as bzh
@@ -89,10 +119,12 @@ def load_benchmark(
     s2_list: list[np.ndarray] = []
     labels: list[int] = []
     groups: list[str] = []
+    latlons: list[tuple[float, float]] = []
     for region in regions:
         ds = bzh.BreizhCrops(region, root=str(base), level="L1C", load_timeseries=True, verbose=False)
+        latlon_map = _bz_parcel_latlon(ds)
         for i in range(len(ds)):
-            x, y, _ = ds[i]
+            x, y, fid = ds[i]
             x = np.asarray(x, dtype=np.float32)
             if x.ndim != 2 or x.shape[1] < len(BZ_X_BANDS) or x.shape[0] < 1:
                 continue
@@ -104,6 +136,7 @@ def load_benchmark(
             s2_list.append(_resample_fixed(s2, BZ_TIMESTEPS))
             labels.append(int(y))
             groups.append(region)
+            latlons.append(latlon_map.get(int(fid), (np.nan, np.nan)))
 
     if not s2_list:
         raise ValueError(f"No BreizhCrops parcels parsed from {base}")
@@ -116,6 +149,7 @@ def load_benchmark(
     s2 = np.stack([s2_list[i] for i in order]).astype(np.float32)
     labels_arr = np.asarray([labels[i] for i in order], dtype=np.int64)
     groups_arr = np.asarray([groups[i] for i in order], dtype=object)
+    latlon_arr = np.asarray([latlons[i] for i in order], dtype=np.float32)
 
     n = len(s2)
     doy = np.tile(_synthetic_month_doy(BZ_TIMESTEPS), (n, 1))
@@ -133,7 +167,7 @@ def load_benchmark(
         doy=doy,
         labels=labels_arr,
         groups=groups_arr,
-        latlon=np.full((n, 2), np.nan, np.float32),
+        latlon=latlon_arr,
         s2_bands=BZ_S2_BANDS,
         s1_bands=["VV", "VH"],
         climate_bands=[],
