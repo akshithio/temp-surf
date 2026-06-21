@@ -53,3 +53,21 @@ def iter_splits(y, groups, *, seed, holdouts=None, n_folds=None, **_):
     """Yield the single in-distribution :class:`Split` (train/val/test)."""
     train, val, test = make_splits(y, seed)
     yield Split("random_id", train, test, val)
+
+
+def iter_fold_splits(bench_mod):
+    """Dense (segmentation) realization: the dataset's published fold assignment.
+
+    PASTIS is per-pixel, so there is no flat IID sample to draw an 80/10/10 split from.
+    Its published cross-validation folds (train 1-3 / val 4 / test 5) are spatially balanced
+    rather than a held-out block, so they stand in as the *in-distribution* reference the OOD
+    gap is measured against — the dense analogue of the classification ``random_id`` split.
+    Yields ``(label, train_folds, val_folds, test_folds)``.
+    """
+    test_fold = sorted(bench_mod.TEST_FOLDS)[0]
+    yield (
+        f"fold_{test_fold}",
+        set(bench_mod.TRAIN_FOLDS),
+        set(bench_mod.VAL_FOLDS),
+        set(bench_mod.TEST_FOLDS),
+    )

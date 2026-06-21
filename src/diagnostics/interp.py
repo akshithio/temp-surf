@@ -38,7 +38,6 @@ class AttributionBatch:
 OUTPUT_COLUMNS = [
     "model",
     "benchmark",
-    "benchmark",
     "seed",
     "split_regime",
     "holdout",

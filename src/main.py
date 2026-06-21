@@ -37,15 +37,19 @@ from utils import (
 # === Configuration ===========================================================
 BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis_r"]
 ACTIVE_METHODS = []
+RUN_STAGES = ["gen_embeddings", "probing"]
 # Master list of regimes this run wants. The effective set per benchmark is the
-# intersection with that benchmark's own `SPLIT_REGIMES` allowlist (e.g. grouped_ood
-# is only meaningful where there are enough domains, so it is CropHarvest-only).
-SPLIT_REGIMES = ["random_id", "grouped_ood", "geographic_ood", "phenology_ood"]
-# Probe-capacity ablation axis. "logistic" is the primary protocol; add "mlp" / "knn"
-# (each gets the SAME-size val-selected hyperparameter grid, see evals/probes.py) to test
-# whether a geographic gap is caused by the linear probe (gap vanishes under mlp) or the
-# encoder (gap persists). mlp/knn are much slower, so scope the ablation to one benchmark.
-ACTIVE_PROBES = ["logistic"]
+# intersection with that benchmark's own `SPLIT_REGIMES` allowlist (e.g. temporal_ood
+# needs multiple years, climate_ood needs coordinates, phenology_ood is binary-only).
+# geographic_ood = leave-one-region-out; climate_ood = leave-one-Köppen-zone-out;
+# temporal_ood = forward (train past / test latest year).
+SPLIT_REGIMES = ["random_id", "geographic_ood", "climate_ood", "temporal_ood", "phenology_ood"]
+# Probe-capacity ablation axis. "logistic" is the primary protocol; "mlp"/"knn" test
+# whether a geographic gap is caused by the linear probe (vanishes under mlp) or the
+# encoder (persists). Each family gets the SAME-size val-selected grid and class-balanced
+# training (see evals/probes.py), so the comparison is fair. mlp/knn are the slow part of
+# the run; if it's too long, drop them here (this is the one knob to scope it).
+ACTIVE_PROBES = ["logistic", "mlp", "knn"]
 
 MAX_SAMPLES = None  # benchmark samples per benchmark (None = all)
 MAX_DENSE_PIXELS = 50_000  # sampled pixels per PASTIS fold partition
@@ -65,6 +69,7 @@ DISPATCH_TARGET = {
     "binary": (EV.run_probes_target, EV.METRICS_BINARY),
     "multiclass": (EV.run_probes_multiclass_target, EV.METRICS_MULTICLASS),
 }
+_VALID_RUN_STAGES = {"gen_embeddings", "probing"}
 
 
 def load_benchmark(benchmark_name: str):
@@ -79,6 +84,17 @@ def load_regime(regime_name: str):
     ``iter_splits(y, domains, *, seed, holdouts, n_folds)``.
     """
     return importlib.import_module(f"evals.regimes.{regime_name}")
+
+
+def _run_stage_set(run_stages: list[str]) -> set[str]:
+    """Validate the configured run stages."""
+    stages = set(run_stages)
+    unknown = stages - _VALID_RUN_STAGES
+    if unknown:
+        raise ValueError(f"Unknown RUN_STAGES entries: {sorted(unknown)}. Valid entries: {sorted(_VALID_RUN_STAGES)}")
+    if not stages:
+        raise ValueError("RUN_STAGES must include at least one stage.")
+    return stages
 
 
 def _effective_n_jobs(embeddings: dict[str, np.ndarray]) -> int:
@@ -257,75 +273,141 @@ def _probe_cell_target(
 # --------------------------------------------------------------------------- #
 
 
+# A benchmark lists a regime in SPLIT_REGIMES to assert it SHOULD run. If that regime then
+# yields nothing — missing external data (no Köppen grid), a single-domain/degenerate input
+# (one year -> no temporal split), absent coordinates — the result is a silent hole. We refuse
+# to let that pass quietly: every such case is shouted at the call site, collected here, and
+# re-listed at the end of the run. Set STRICT_REGIMES=1 to turn it into a hard failure instead.
+STRICT_REGIMES = os.environ.get("STRICT_REGIMES", "0").lower() not in ("0", "", "false", "no")
+_REGIME_PROBLEMS: list[tuple[str, str, str]] = []
+
+
+def _regime_problem(benchmark: str, regime: str, reason: str) -> None:
+    """Surface a declared regime that did not run — loudly, never silently."""
+    _REGIME_PROBLEMS.append((benchmark, regime, reason))
+    if STRICT_REGIMES:
+        raise RuntimeError(f"[STRICT_REGIMES] declared regime did not run — {benchmark}/{regime}: {reason}")
+    bar = "!" * 78
+    print(
+        f"\n{bar}\n!! REGIME DECLARED BUT DID NOT RUN — {benchmark}/{regime}\n!! {reason}"
+        f"\n!! (it is in this benchmark's SPLIT_REGIMES; set STRICT_REGIMES=1 to make this fatal)\n{bar}\n",
+        flush=True,
+    )
+
+
+def _report_regime_problems() -> None:
+    """Print a consolidated list of regimes that were declared but did not run."""
+    if not _REGIME_PROBLEMS:
+        return
+    bar = "=" * 78
+    print(f"\n{bar}\nREGIMES DECLARED BUT NOT RUN ({len(_REGIME_PROBLEMS)}):", flush=True)
+    for benchmark, regime, reason in _REGIME_PROBLEMS:
+        print(f"  - {benchmark}/{regime}: {reason}", flush=True)
+    print(f"{bar}\n", flush=True)
+
+
 def _iter_splits(split_regime, bench, y, holdouts, seed):
     """Yield split metadata and regime-assigned domain labels.
 
     A regime owns the domain basis (for example geography or phenology) and the
-    train/test splitting rule over those domains.
+    train/test splitting rule over those domains. A declared regime that assigns no
+    domains, or produces no splits, is reported via :func:`_regime_problem` rather than
+    skipped silently.
     """
     regime = load_regime(split_regime)
-    domains = np.asarray(regime.assign_domains(bench), dtype=object)
+    bench_name = getattr(bench, "name", "?")
+    try:
+        # External-data domains (e.g. climate via a Köppen grid) raise when the data or
+        # coordinates are absent. That is a declared regime failing to run -> surface it.
+        domains = np.asarray(regime.assign_domains(bench), dtype=object)
+    except Exception as exc:
+        _regime_problem(bench_name, split_regime, f"domain assignment failed ({type(exc).__name__}: {exc})")
+        return
     if len(domains) != len(y):
         raise ValueError(
             f"{split_regime}.assign_domains returned {len(domains)} domains for {len(y)} labels"
         )
+    n_unknown = int(np.isin(domains.astype(str), ("unknown", "nan")).sum())
+    if n_unknown:
+        print(
+            f"   [{bench_name}/{split_regime}] {n_unknown}/{len(domains)} samples have no domain "
+            f"(unknown/nan coords) and are excluded from this regime's holdouts",
+            flush=True,
+        )
+    n_splits = 0
     for split in regime.iter_splits(y, domains, seed=seed, holdouts=holdouts):
+        n_splits += 1
         yield split.label, split.train, split.val, split.test, domains, regime.HAS_TARGET, regime.GROUP_KIND
+    if n_splits == 0:
+        labels = sorted({str(d) for d in domains})
+        shown = labels[:8] + (["…"] if len(labels) > 8 else [])
+        _regime_problem(
+            bench_name, split_regime, f"produced 0 splits (domain labels seen: {shown})"
+        )
 
 
 def _segmentation_fold_configs(bench_mod, regimes):
-    """Yield (split_regime, holdout_label, train_folds, val_folds, test_folds) for PASTIS.
+    """Yield (split_regime, holdout_label, train_folds, val_folds, test_folds) for the dense path.
 
-    The domain is the spatial fold (a geographic holdout). Two regimes, gated by the
-    benchmark's ``SPLIT_REGIMES`` allowlist:
-      * ``official_folds``  — the published 1-3 / 4 / 5 split (comparability anchor).
-      * ``geographic_ood``  — leave-one-fold-out: each fold is the test region in turn,
-        the next fold (cyclically) is val, the rest train. The deployment-realistic
-        version that exercises every region as a target and supports worst-region.
-    The dense path streams pixels by fold, so this is the segmentation equivalent of the
-    classification ``geographic_ood`` regime, not a separate idea.
+    Each regime owns its own fold logic in ``evals/regimes/<regime>.py`` via
+    ``iter_fold_splits(bench_mod)`` — ``random_id`` yields the published 1-3 / 4 / 5
+    in-distribution assignment, ``geographic_ood`` yields leave-one-fold-out. This just
+    dispatches over the benchmark's ``SPLIT_REGIMES`` allowlist and skips any regime with no
+    dense (fold-based) realization (e.g. climate/temporal/phenology, which PASTIS — a single
+    region and season — cannot express).
     """
-    all_folds = sorted(set(bench_mod.TRAIN_FOLDS) | set(bench_mod.VAL_FOLDS) | set(bench_mod.TEST_FOLDS))
-    if "official_folds" in regimes:
-        test_fold = sorted(bench_mod.TEST_FOLDS)[0]
-        yield ("official_folds", f"fold_{test_fold}",
-               set(bench_mod.TRAIN_FOLDS), set(bench_mod.VAL_FOLDS), set(bench_mod.TEST_FOLDS))
-    if "geographic_ood" in regimes:
-        for i, test_fold in enumerate(all_folds):
-            val_fold = all_folds[(i + 1) % len(all_folds)]
-            train_folds = {f for f in all_folds if f not in (test_fold, val_fold)}
-            yield ("geographic_ood", f"fold_{test_fold}", train_folds, {val_fold}, {test_fold})
+    for regime_name in regimes:
+        fold_iter = getattr(load_regime(regime_name), "iter_fold_splits", None)
+        if fold_iter is None:
+            _regime_problem(
+                getattr(bench_mod, "BENCHMARK", "?"),
+                regime_name,
+                "no dense (segmentation) realization — regime exposes no iter_fold_splits",
+            )
+            continue
+        for label, train_folds, val_folds, test_folds in fold_iter(bench_mod):
+            yield (regime_name, label, train_folds, val_folds, test_folds)
 
 
-def run_segmentation(benchmark_name, model_name, seeds, max_samples, **enc_kwargs) -> None:
+def run_segmentation(benchmark_name, model_name, seeds, max_samples, run_stages, **enc_kwargs) -> None:
     """Run PASTIS-R segmentation over its fold-based geographic regimes.
 
     PASTIS is dense (per-pixel) and too large to hold in memory, so it streams tiles
     by fold from disk rather than indexing a flat array — hence a separate runner from
     the classification ``run``. Its domain is the spatial fold, and it executes the
     regimes in the benchmark's ``SPLIT_REGIMES`` allowlist via
-    :func:`_segmentation_fold_configs`: ``official_folds`` (published 1-3/4/5, for
-    comparability) and ``geographic_ood`` (leave-one-fold-out, the deployment regime).
+    :func:`_segmentation_fold_configs`: ``random_id`` (published 1-3/4/5, the
+    in-distribution baseline) and ``geographic_ood`` (leave-one-fold-out, the deployment regime).
     Rows carry ``domain_basis="geography"`` so the schema matches the classification
     benchmarks. (Phenology and the few-shot/oracle budget sweep are intentionally NOT
     run here — see the experimental-design notes: phenology is label-confounded on a
     single-region/year dataset, and the target-label unit for dense segmentation is a
     design question, not a mechanism.)
     """
+    stages = _run_stage_set(run_stages)
+    gen_embeddings = "gen_embeddings" in stages
+    probing = "probing" in stages
     bench_mod = load_benchmark(benchmark_name)
     bench_kwargs = dict(max_samples=max_samples, shuffle=True, seed=BENCH_SHUFFLE_SEED)
     tag = cacheutils.bench_tag(bench_mod.BENCHMARK, bench_kwargs)
     perf.reset()
     bench = cacheutils.cached_bench(bench_mod.BENCHMARK, tag, **bench_kwargs)
-    emb_dir = cacheutils.extract_dense_and_cache(
-        bench,
-        bench_mod.BENCHMARK,
-        model_name,
-        tag,
-        overwrite=OVERWRITE_MODE,
-        **enc_kwargs,
-    )
+    if gen_embeddings:
+        emb_dir = cacheutils.extract_dense_and_cache(
+            bench,
+            bench_mod.BENCHMARK,
+            model_name,
+            tag,
+            overwrite=OVERWRITE_MODE,
+            **enc_kwargs,
+        )
+    else:
+        emb_dir = cacheutils.require_dense_cache(bench, bench_mod.BENCHMARK, model_name, tag)
     results_dir = cacheutils.OUTPUT_DIR / "results" / model_name / benchmark_name
+    if not probing:
+        n_events = perf.write_log(results_dir / "perf.jsonl")
+        print(f"  embedding stage complete; perf: {n_events} events logged", flush=True)
+        return
     rows_path = results_dir / "probe_results.jsonl"
     if OVERWRITE_MODE == "override":
         for path in (rows_path, results_dir / "probe_results.csv", results_dir / "summary.csv"):
@@ -333,16 +415,19 @@ def run_segmentation(benchmark_name, model_name, seeds, max_samples, **enc_kwarg
                 path.unlink()
     rows = IOU.read_jsonl(rows_path)
     done = {
-        (r.get("seed"), r.get("method"), r.get("split_regime"), r.get("holdout"))
+        (r.get("seed"), r.get("method"), r.get("split_regime"), r.get("holdout"), r.get("probe_family"))
         for r in rows
     }
-    regimes = getattr(bench_mod, "SPLIT_REGIMES", ["official_folds"])
+    regimes = getattr(bench_mod, "SPLIT_REGIMES", ["random_id"])
     fold_configs = list(_segmentation_fold_configs(bench_mod, regimes))
     for seed in seeds:
         for method_name, (cls, kwargs) in build_methods(bench_mod.LABEL_KIND, seed).items():
             for split_regime, holdout, train_folds, val_folds, test_folds in fold_configs:
-                key = (seed, method_name, split_regime, holdout)
-                if key in done:
+                families_to_run = [
+                    f for f in ACTIVE_PROBES
+                    if (seed, method_name, split_regime, holdout, f) not in done
+                ]
+                if not families_to_run:
                     continue
                 x_train, y_train, groups_train, _ = cacheutils.load_dense_samples(
                     emb_dir, train_folds, MAX_DENSE_PIXELS, seed
@@ -358,35 +443,58 @@ def run_segmentation(benchmark_name, model_name, seeds, max_samples, **enc_kwarg
                     transform = cls(**kwargs)
                     paired = x_test if getattr(cls, "USES_TARGET", False) else None
                     transform.fit(x_train, y_train, groups_train, x_paired=paired)
-                cell_rows: list[dict] = []
-                EV.run_probes_segmentation(
-                    cell_rows,
-                    x_train,
-                    x_val,
-                    x_test,
-                    y_train,
-                    y_val,
-                    y_test,
-                    seed,
-                    transform=transform,
-                    meta={
+                for family in families_to_run:
+                    cell_rows: list[dict] = []
+                    seg_meta = {
                         "model": model_name,
                         "benchmark": bench_mod.BENCHMARK,
                         "method": method_name,
                         "split_regime": split_regime,
                         "domain_basis": "geography",
                         "holdout": holdout,
-                    },
-                    tile_ids_test=tile_ids_test,
-                )
-                IOU.append_jsonl(rows_path, cell_rows)
-                rows.extend(cell_rows)
+                        "probe_family": family,
+                    }
+                    # Source-fraction sweep (always).
+                    EV.run_probes_segmentation(
+                        cell_rows,
+                        x_train,
+                        x_val,
+                        x_test,
+                        y_train,
+                        y_val,
+                        y_test,
+                        seed,
+                        transform=transform,
+                        meta=seg_meta,
+                        tile_ids_test=tile_ids_test,
+                        family=family,
+                    )
+                    # Tile-level target-budget sweep (zero-shot / few-shot / oracle) only on
+                    # the deployment regime; random_id stays the source-only in-distribution split.
+                    if split_regime == "geographic_ood":
+                        EV.run_probes_segmentation_target(
+                            cell_rows,
+                            x_train,
+                            y_train,
+                            x_test,
+                            y_test,
+                            tile_ids_test,
+                            x_val,
+                            y_val,
+                            seed,
+                            transform=transform,
+                            meta=seg_meta,
+                            family=family,
+                        )
+                    IOU.append_jsonl(rows_path, cell_rows)
+                    rows.extend(cell_rows)
     IOU.write_csv(results_dir / "probe_results.csv", rows)
     summary = IOU.summarize_rows(
         rows,
         keys=[
             "model",
             "method",
+            "probe_family",
             "split_regime",
             "holdout",
             "evaluation_split",
@@ -400,17 +508,20 @@ def run_segmentation(benchmark_name, model_name, seeds, max_samples, **enc_kwarg
     perf.write_log(results_dir / "perf.jsonl")
 
 
-def run(benchmark_name, model_name, seeds, max_samples, split_regimes, **enc_kwargs) -> None:
+def run(benchmark_name, model_name, seeds, max_samples, split_regimes, run_stages, **enc_kwargs) -> None:
+    stages = _run_stage_set(run_stages)
+    gen_embeddings = "gen_embeddings" in stages
+    probing = "probing" in stages
     bench_mod = load_benchmark(benchmark_name)
     if bench_mod.LABEL_KIND == "segmentation":
-        run_segmentation(benchmark_name, model_name, seeds, max_samples, **enc_kwargs)
+        run_segmentation(benchmark_name, model_name, seeds, max_samples, run_stages, **enc_kwargs)
         return
     probe_fn_src, metrics = DISPATCH[bench_mod.LABEL_KIND]
     probe_fn_tgt, _ = DISPATCH_TARGET[bench_mod.LABEL_KIND]
     holdouts = bench_mod.HOLDOUTS
 
     # Effective regimes = run's master list ∩ this benchmark's supported regimes.
-    # A benchmark that omits a regime (e.g. grouped_ood off the few-domain benchmarks)
+    # A benchmark that omits a regime never runs it.
     # never runs it, even if it is in the master list.
     supported = getattr(bench_mod, "SPLIT_REGIMES", split_regimes)
     split_regimes = [r for r in split_regimes if r in supported]
@@ -420,11 +531,18 @@ def run(benchmark_name, model_name, seeds, max_samples, split_regimes, **enc_kwa
     perf.reset()
     bench = cacheutils.cached_bench(bench_mod.BENCHMARK, tag, **bench_kwargs)
     y, _native_groups = bench_mod.make_targets(bench)
-    emb = cacheutils.extract_and_cache(
-        bench, bench_mod.BENCHMARK, model_name, tag, overwrite=OVERWRITE_MODE, **enc_kwargs
-    )
+    if gen_embeddings:
+        emb = cacheutils.extract_and_cache(
+            bench, bench_mod.BENCHMARK, model_name, tag, overwrite=OVERWRITE_MODE, **enc_kwargs
+        )
+    else:
+        emb = cacheutils.load_cached_embeddings(bench, bench_mod.BENCHMARK, model_name, tag)
 
     results_dir = cacheutils.OUTPUT_DIR / "results" / model_name / benchmark_name
+    if not probing:
+        n_events = perf.write_log(results_dir / "perf.jsonl")
+        print(f"  embedding stage complete; perf: {n_events} events logged", flush=True)
+        return
     rows_path = results_dir / "probe_results.jsonl"
     preds_path = results_dir / "predictions.jsonl"
 
@@ -534,8 +652,8 @@ def run(benchmark_name, model_name, seeds, max_samples, split_regimes, **enc_kwa
     IOU.write_json(results_dir / "metric_roles.json", EV.METRIC_ROLES[bench_mod.LABEL_KIND])
 
     # Delta table: ID (random_id, source=1.0) minus OOD (geographic_ood, target=0),
-    # plus grouped_ood and hybrid_ood secondary anchors, WILDS-style inherent-difficulty
-    # decomposition (when target=-1 rows exist), and worst-region metrics.
+    # inherent-difficulty decomposition (when target=-1 rows exist),
+    # and worst-region metrics.
     deltas = IOU.compute_deltas(rows, metrics, predictions=IOU.read_jsonl(preds_path))
     IOU.write_csv(results_dir / "deltas.csv", deltas)
 
@@ -555,10 +673,13 @@ if __name__ == "__main__":
     for mod, bm in work:
         print(f"\n========== [shard {shard}/{nshards}] {mod} / {bm} ==========", flush=True)
         print(f"  split_regimes={SPLIT_REGIMES}", flush=True)
+        print(f"  run_stages={RUN_STAGES}", flush=True)
         try:
-            run(bm, mod, SEEDS, MAX_SAMPLES, SPLIT_REGIMES, **enc_kwargs)
+            run(bm, mod, SEEDS, MAX_SAMPLES, SPLIT_REGIMES, RUN_STAGES, **enc_kwargs)
         except NotImplementedError as exc:
             print(f"   [shard {shard}] {mod}/{bm} skipped: {exc}", flush=True)
+        except cacheutils.MissingEmbeddingCache:
+            raise
         except Exception as exc:
             import traceback
 
@@ -567,3 +688,5 @@ if __name__ == "__main__":
                 flush=True,
             )
             traceback.print_exc()
+
+    _report_regime_problems()

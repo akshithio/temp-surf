@@ -68,6 +68,7 @@ _CLEAN, _MINOR, _SEVERE = Adaptation.CLEAN, Adaptation.MINOR, Adaptation.SEVERE
 # cacheutils.ENCODERS keys.
 MATRIX: dict[str, dict[str, tuple[Precedent, Adaptation]]] = {
     "cropharvest": {
+        "raw": (_N, _CLEAN),  # reality-check control: always runs, no precedent, native features
         "presto": (_P, _CLEAN),
         "olmoearth": (_P, _CLEAN),
         "galileo": (_P, _CLEAN),
@@ -75,6 +76,7 @@ MATRIX: dict[str, dict[str, tuple[Precedent, Adaptation]]] = {
         "agrifm": (_N, _SEVERE),
     },
     "eurocropsml": {
+        "raw": (_N, _CLEAN),
         "presto": (_E, _CLEAN),
         "olmoearth": (_E, _CLEAN),
         "galileo": (_E, _CLEAN),
@@ -82,6 +84,7 @@ MATRIX: dict[str, dict[str, tuple[Precedent, Adaptation]]] = {
         "agrifm": (_N, _SEVERE),
     },
     "breizhcrops": {
+        "raw": (_N, _CLEAN),
         "presto": (_T, _CLEAN),
         "olmoearth": (_P, _CLEAN),
         "galileo": (_P, _CLEAN),
@@ -89,6 +92,7 @@ MATRIX: dict[str, dict[str, tuple[Precedent, Adaptation]]] = {
         "agrifm": (_N, _SEVERE),
     },
     "pastis_r": {
+        "raw": (_N, _CLEAN),
         "presto": (_N, _MINOR),
         "olmoearth": (_P, _CLEAN),
         "galileo": (_P, _CLEAN),

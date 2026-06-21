@@ -32,7 +32,6 @@ from evals.probes import (  # noqa: F401
 # Split-regime constructors now live with their regimes (evals/regimes/<regime>.py);
 # re-exported here so existing callers (EV.make_splits, ...) keep working.
 from evals.regimes.geographic_ood import make_strict_holdout_splits  # noqa: F401
-from evals.regimes.grouped_ood import make_grouped_holdout_folds  # noqa: F401
 from evals.regimes.random_id import make_splits  # noqa: F401
 from utils import perfutils as perf
 
@@ -158,6 +157,12 @@ METRIC_ROLES: dict[str, dict[str, list[str]]] = {
 # Shared budget sweep + per-benchmark runners
 # --------------------------------------------------------------------------- #
 
+def _budget_seed(seed: int, budget: float) -> int:
+    """Non-negative per-budget seed. ``abs`` guards the target-ID-upper-bound budget
+    (-1), where ``seed + round(budget*1000)`` would go negative and crash RNG/sklearn."""
+    return abs(seed + int(round(budget * 1000)))
+
+
 def _append_prediction_rows(
     predictions: list[dict[str, Any]] | None,
     *,
@@ -258,7 +263,7 @@ def _worst_group_scores(
 ) -> dict[str, Any]:
     """Compute first-class subpopulation worst-group metrics for one evaluated split.
 
-    This is the WILDS-style "average can hide a bad deployment subgroup" view. For
+    This captures the "average can hide a bad deployment subgroup" view. For
     ``random_id`` rows it is a true subpopulation metric: train/test include all
     domains, and the row also reports the worst test domain. For strict OOD rows
     with one target domain, worst-group equals the target-domain score.
@@ -339,7 +344,7 @@ def _sweep_budgets(
     x_test = _apply(transform, x_test)
     x_val = _apply(transform, x_val) if x_val is not None and len(x_val) else None
     for budget in budgets:
-        sub_seed = seed + int(round(budget * 1000))
+        sub_seed = _budget_seed(seed, budget)
         if transform is not None and hasattr(transform, "subset_indices"):
             sub = transform.subset_indices(y_train, groups_train, budget, sub_seed)
         else:
@@ -444,7 +449,7 @@ def _sweep_target_budgets(
             n_tr = len(x_source_t)
             test_idx = np.arange(len(y_target_full))
         elif budget == TARGET_ID_UPPER_BOUND:
-            sub_seed = seed + int(round(budget * 1000))
+            sub_seed = _budget_seed(seed, budget)
             n_target = len(y_target_full)
             train_size = max(1, min(int(n_target * 0.8), n_target - 1))
             idx = np.arange(n_target)
@@ -463,7 +468,7 @@ def _sweep_target_budgets(
             y_te = y_target_full[test_idx]
             n_tr = len(train_idx)
         else:
-            sub_seed = seed + int(round(budget * 1000))
+            sub_seed = _budget_seed(seed, budget)
             n_target = len(y_target_full)
             k = min(n_target - 1, max(1, int(budget)))
             idx = np.arange(n_target)
@@ -731,7 +736,7 @@ def run_probes_segmentation(
     x_test = _apply(transform, x_test)
     eval_classes = np.arange(19, dtype=np.int64)
     for budget in budgets:
-        sub_seed = seed + int(round(budget * 1000))
+        sub_seed = _budget_seed(seed, budget)
         sub = subset_indices(y_train, budget, sub_seed, stratify=True)
         # The official val fold doubles as the hyperparameter-selection set (no test peeking).
         clf, probe_meta = fit_probe_multiclass(
@@ -757,3 +762,73 @@ def run_probes_segmentation(
                     score_segmentation_per_tile(clf, x_eval, y_eval, tile_ids_test, eval_classes=eval_classes)
                 )
             rows.append(row)
+
+
+def run_probes_segmentation_target(
+    rows: list[dict[str, Any]],
+    x_source: np.ndarray,
+    y_source: np.ndarray,
+    x_target: np.ndarray,
+    y_target: np.ndarray,
+    tile_ids_target: np.ndarray,
+    x_val: np.ndarray,
+    y_val: np.ndarray,
+    seed: int,
+    *,
+    transform: FeatureTransform | None = None,
+    budgets: list[int] = ALL_TARGET_BUDGETS,
+    meta: dict[str, Any] | None = None,
+    family: str = "logistic",
+) -> None:
+    """Tile-level target-budget sweep for PASTIS-R (the dense few-shot / oracle curve).
+
+    The target-label unit is a **tile**, not a pixel: few-shot budgets add ``k`` whole
+    target-fold tiles (all their sampled pixels) to the source training pool and test on
+    the remaining tiles; budget ``0`` is zero-shot (source only); ``TARGET_ID_UPPER_BOUND``
+    (-1) is the target-ID oracle (~80% of target tiles train, ~20% test, no source).
+    Splitting by tile (never by pixel) avoids within-tile spatial-autocorrelation leakage
+    and keeps per-tile mIoU well-defined. ``x_val``/``y_val`` (the source val fold) selects
+    the probe hyperparameter without peeking at the target.
+    """
+    meta = dict(meta or {})
+    x_source = _apply(transform, x_source)
+    x_target = _apply(transform, x_target)
+    tile_ids_target = np.asarray(tile_ids_target)
+    uniq_tiles = np.array(sorted(set(tile_ids_target.tolist())))
+    eval_classes = np.arange(19, dtype=np.int64)
+    for budget in budgets:
+        # few-shot and the tile-split oracle both need >=2 target tiles to split by tile.
+        if budget != 0 and len(uniq_tiles) < 2:
+            continue
+        sub_seed = _budget_seed(seed, budget)
+        rng = np.random.default_rng(sub_seed)
+        if budget == 0:
+            x_tr, y_tr, test_mask = x_source, y_source, np.ones(len(y_target), dtype=bool)
+        elif budget == TARGET_ID_UPPER_BOUND:
+            n_train_tiles = min(len(uniq_tiles) - 1, max(1, int(round(0.8 * len(uniq_tiles)))))
+            train_tiles = set(rng.choice(uniq_tiles, size=n_train_tiles, replace=False).tolist())
+            train_mask = np.array([t in train_tiles for t in tile_ids_target])
+            x_tr, y_tr, test_mask = x_target[train_mask], y_target[train_mask], ~train_mask
+        else:
+            k = min(len(uniq_tiles) - 1, max(1, int(budget)))
+            few_tiles = set(rng.choice(uniq_tiles, size=k, replace=False).tolist())
+            few_mask = np.array([t in few_tiles for t in tile_ids_target])
+            x_tr = np.concatenate([x_source, x_target[few_mask]])
+            y_tr = np.concatenate([y_source, y_target[few_mask]])
+            test_mask = ~few_mask
+        x_te, y_te, tiles_te = x_target[test_mask], y_target[test_mask], tile_ids_target[test_mask]
+        clf, probe_meta = fit_probe_multiclass(x_tr, y_tr, sub_seed, x_val=x_val, y_val=y_val, family=family)
+        row = {
+            **meta,
+            "evaluation_split": "test",
+            "budget_type": "target",
+            "label_budget": budget,
+            "seed": seed,
+            "n_train_sub": int(len(y_tr)),
+            "n_test": int(len(y_te)),
+            **probe_meta,
+            **score_segmentation(clf, x_te, y_te, eval_classes=eval_classes),
+        }
+        if tiles_te.size:
+            row.update(score_segmentation_per_tile(clf, x_te, y_te, tiles_te, eval_classes=eval_classes))
+        rows.append(row)

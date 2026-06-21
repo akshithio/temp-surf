@@ -57,3 +57,18 @@ def iter_splits(y, groups, *, seed, holdouts, n_folds=None, **_):
         except ValueError:
             continue  # one-class holdout or empty region -> skip
         yield Split(str(holdout), train, test, val)
+
+
+def iter_fold_splits(bench_mod):
+    """Dense (segmentation) realization: leave-one-spatial-fold-out.
+
+    The segmentation analogue of leave-one-region-out — each spatial fold is the held-out
+    test region in turn (zero target labels), the next fold (cyclically) is val, the rest
+    train. Exercises every region as a target and supports worst-region reporting. Yields
+    ``(label, train_folds, val_folds, test_folds)``.
+    """
+    all_folds = sorted(set(bench_mod.TRAIN_FOLDS) | set(bench_mod.VAL_FOLDS) | set(bench_mod.TEST_FOLDS))
+    for i, test_fold in enumerate(all_folds):
+        val_fold = all_folds[(i + 1) % len(all_folds)]
+        train_folds = {f for f in all_folds if f not in (test_fold, val_fold)}
+        yield (f"fold_{test_fold}", train_folds, {val_fold}, {test_fold})

@@ -3,5 +3,4 @@ __pycache__
 *.egg-info/
 data/input/
 data/cache/
-uv.lock
 .env

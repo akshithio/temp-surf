@@ -84,8 +84,7 @@ conda config --append envs_dirs "$REMOTE_SCRATCH/envs" 2>/dev/null || true  # so
 [ -x "$REMOTE_SCRATCH/envs/robustness/bin/python" ] || conda env create -f environment.yml
 conda activate robustness
 echo "python: $(python --version)  uv: $(uv --version)  ruff: $(ruff --version)"
-uv pip install -e ".[dev,notebooks]"
-uv pip install --no-deps "presto @ git+https://github.com/nasaharvest/presto.git"
+uv sync --frozen
 rm -rf src/*.egg-info *.egg-info 2>/dev/null || true  # editable install works via the .pth; don't leave egg-info behind
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.device_count())"
 echo "ENV READY. Activate with: source $MF/etc/profile.d/conda.sh && conda activate robustness"

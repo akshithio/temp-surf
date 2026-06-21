@@ -288,12 +288,12 @@ def compute_deltas(
       * ``delta_ci_lo/hi`` = bootstrap 95% CI over region×seed estimates ("consistent across regions")
       * ``delta_sample_ci_lo/hi`` = bootstrap 95% CI over individual test samples (pooled),
         recomputed from ``predictions`` when supplied (within-region precision)
-      * ``ood_std/min/max`` = spread across holdout regions; ``grouped_ood`` as a secondary anchor
+      * ``ood_std/min/max`` = spread across holdout regions
       * ``ood_hybrid`` / ``ood_hybrid_std`` / ``ood_hybrid_min`` / ``delta_hybrid`` = hybrid OOD
         anchor (geographic holdout × source grouped folds): how OOD performance varies with
         source-region composition
       * ``target_id`` / ``inherent_difficulty`` / ``adjusted_delta`` / ``adjusted_relative_drop`` /
-        ``adjusted_floor_norm_drop`` = WILDS-style decomposition (see below).
+        ``adjusted_floor_norm_drop`` = inherent-difficulty decomposition (see below).
     """
     if isinstance(metrics, str):
         metrics = [metrics]
@@ -385,24 +385,14 @@ def compute_deltas(
                         "delta_sample_ci_lo": lo_s, "delta_sample_ci_hi": hi_s,
                         "n_id_samples": len(id_samp[0]), "n_ood_samples": len(ood_samp[0]),
                     })
-            grouped = vals("grouped_ood", "target", 0.0, combo, metric)
-            if grouped:
-                row["ood_grouped"] = float(np.mean(grouped))
-                row["delta_grouped"] = idm - float(np.mean(grouped))
             phenology = vals("phenology_ood", "target", 0.0, combo, metric)
             if phenology:
                 row["ood_phenology"] = float(np.mean(phenology))
                 row["ood_phenology_std"] = float(np.std(phenology))
                 row["ood_phenology_min"] = float(np.min(phenology))
                 row["delta_phenology"] = idm - float(np.mean(phenology))
-            # --- Hybrid OOD: geographic holdout × source grouped folds ---
-            hybrid = vals("hybrid_ood", "target", 0.0, combo, metric)
-            if hybrid:
-                row["ood_hybrid"] = float(np.mean(hybrid))
-                row["ood_hybrid_std"] = float(np.std(hybrid))
-                row["ood_hybrid_min"] = float(np.min(hybrid))
-                row["delta_hybrid"] = idm - float(np.mean(hybrid))
-            # --- WILDS-style inherent-difficulty decomposition ---
+
+            # --- inherent-difficulty decomposition ---
             # target-ID upper-bound: train on 80% of target (no source),
             # test on remaining 20%.  Budget sentinel = -1.
             tid_vals = vals("geographic_ood", "target", -1.0, combo, metric)
