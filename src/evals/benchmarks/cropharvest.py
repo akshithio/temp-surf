@@ -7,6 +7,7 @@ strict geographic holdout (one source region held out at a time).
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -89,19 +90,23 @@ def load_benchmark(
 
     s2_list, s1_list, clim_list = [], [], []
     labels, groups, latlons, years = [], [], [], []
+    skipped = 0
     for path in files:
         idx_str, dataset = path.stem.split("_", 1)
         key = (int(idx_str), dataset)
         if key not in label_map:
-            continue
+            continue  # no label for this array (expected for the unlabeled pool); not a corruption
         try:
             with h5py.File(path, "r") as f:
                 if "array" not in f:
+                    skipped += 1
                     continue
                 arr = np.asarray(f["array"], dtype=np.float32)
         except OSError:
+            skipped += 1  # unreadable / corrupt HDF5
             continue
         if arr.ndim != 2 or arr.shape[0] != CH_TIMESTEPS or arr.shape[1] < CH_MIN_CHANNELS:
+            skipped += 1  # malformed shape
             continue
         arr = np.nan_to_num(arr, nan=0.0)
         is_crop, lat, lon, year = label_map[key]
@@ -113,6 +118,12 @@ def load_benchmark(
         latlons.append((lat, lon))
         years.append(year)
 
+    if skipped:
+        # Corrupt/malformed arrays must not silently shrink the dataset.
+        msg = f"CropHarvest: {skipped} labeled arrays were unreadable/malformed in {arrays_dir}"
+        if os.environ.get("STRICT_DATA", "").strip().lower() not in ("", "0", "false", "no"):
+            raise ValueError(msg + " (STRICT_DATA is set)")
+        print(f"   !! {msg} -- those samples are skipped (set STRICT_DATA=1 to fail instead)", flush=True)
     if not s2_list:
         raise ValueError(f"No valid CropHarvest arrays parsed from {arrays_dir}")
 

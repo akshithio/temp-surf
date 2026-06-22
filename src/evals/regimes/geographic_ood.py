@@ -18,6 +18,10 @@ from evals.regimes.base import Split, geography_domains
 NAME = "geographic_ood"
 GROUP_KIND = "geography"
 HAS_TARGET = True
+# This regime is expected to yield exactly one split per curated holdout in bench.HOLDOUTS.
+# The runner (main._iter_splits) checks for any holdout that dropped out and routes it through
+# _regime_problem, so a partial matrix (e.g. 4 of 5 holdouts) is caught by STRICT_REGIMES.
+USES_CURATED_HOLDOUTS = True
 assign_domains = geography_domains
 
 
@@ -26,20 +30,31 @@ def make_strict_holdout_splits(
     groups: np.ndarray,
     heldout_group: str,
     seed: int,
+    val_group: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Strict geographic holdout: the entire heldout group is the test set.
 
-    Returns ``(train, val, test, train_val)``. The probe never sees the target
-    region. Strict *SSL* exclusion (the model also never pretrained on this region)
-    is enforced upstream at extraction time, not here.
+    Returns ``(train, val, test, train_val)``. The probe never sees the target region. When
+    ``val_group`` is given (a benchmark's published validation region, e.g. BreizhCrops frh03),
+    that whole region is the validation set and is excluded from train -- so the published
+    train/val/test fold assignment is honoured instead of a random val carve. Strict *SSL*
+    exclusion (the model also never pretrained on this region) is enforced upstream.
     """
     idx = np.arange(len(y))
     test = idx[groups == heldout_group]
-    train_val = idx[groups != heldout_group]
     if len(test) == 0:
         raise ValueError(f"No samples found for strict holdout group: {heldout_group}")
     if len(np.unique(y[test])) < 2:
         raise ValueError(f"Strict holdout group is one-class: {heldout_group}")
+    if val_group is not None and np.any(groups == val_group) and val_group != heldout_group:
+        # Published fold: a specific region is the validation set (not a random carve).
+        val = idx[groups == val_group]
+        train = idx[(groups != heldout_group) & (groups != val_group)]
+        train_val = idx[groups != heldout_group]
+        if len(np.unique(y[train])) < 2:
+            raise ValueError(f"Strict holdout training pool is one-class after excluding {heldout_group}/{val_group}")
+        return np.sort(train), np.sort(val), np.sort(test), np.sort(train_val)
+    train_val = idx[groups != heldout_group]
     if len(np.unique(y[train_val])) < 2:
         raise ValueError(f"Strict holdout training pool is one-class after excluding: {heldout_group}")
     try:
@@ -49,13 +64,23 @@ def make_strict_holdout_splits(
     return np.sort(train), np.sort(val), np.sort(test), np.sort(train_val)
 
 
-def iter_splits(y, groups, *, seed, holdouts, n_folds=None, **_):
-    """Yield one :class:`Split` (train/val/test) per curated holdout region."""
+def iter_splits(y, groups, *, seed, holdouts, n_folds=None, val_group=None, **_):
+    """Yield one :class:`Split` (train/val/test) per curated holdout region.
+
+    ``val_group`` (a benchmark's published validation region, e.g. BreizhCrops frh03) makes that
+    whole region the validation set instead of a random carve, honouring the published fold.
+
+    A curated holdout that cannot form a valid split (region absent, one-class test set, or a
+    one-class training pool after excluding it) is dropped here with a reason printed; the
+    runner separately detects the missing holdout and routes it through ``_regime_problem`` (so
+    ``STRICT_REGIMES`` turns the resulting incomplete matrix into a hard failure).
+    """
     for holdout in holdouts:
         try:
-            train, val, test, _train_val = make_strict_holdout_splits(y, groups, holdout, seed)
-        except ValueError:
-            continue  # one-class holdout or empty region -> skip
+            train, val, test, _train_val = make_strict_holdout_splits(y, groups, holdout, seed, val_group=val_group)
+        except ValueError as exc:
+            print(f"   !! geographic_ood: curated holdout {holdout!r} dropped ({exc})", flush=True)
+            continue
         yield Split(str(holdout), train, test, val)
 
 

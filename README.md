@@ -162,16 +162,11 @@ the row reports the worst test domain rather than only the average.
 
 ## Post-Hoc Methods
 
-Methods are fitted feature transforms on frozen embeddings. `None` is the ERM baseline.
-
-| Method | File | Status |
-|---|---|---|
-| GRIT | `src/methods/grit.py` | implemented |
-| DFR | `src/methods/dfr.py` | implemented |
-| TENT | `src/methods/tent.py` | implemented |
-
-The method set should be expanded after the baseline failures are characterized, so
-new methods target observed failure modes rather than adding decorative comparisons.
+Out of scope for now: the pipeline runs the plain **ERM** probe on the frozen embeddings
+(no post-hoc adaptation). The generic `transform` hook in `evals` is retained (always
+`None`), so a fitted-feature-transform method axis (e.g. GRIT/DFR/TENT) can be reintroduced
+once the baseline failures are characterized — targeting observed failure modes rather than
+adding decorative comparisons.
 
 ---
 
@@ -180,7 +175,7 @@ new methods target observed failure modes rather than adding decorative comparis
 ```text
 .
 ├── src/
-│   ├── main.py              # orchestrator: benchmark -> encode/cache -> methods -> tables
+│   ├── main.py              # orchestrator: benchmark -> encode/cache -> probe (ERM) -> tables
 │   ├── dataio/get_input.py  # Benchmark loader + shared degradation protocol
 │   ├── models/              # active frozen model wrappers
 │   ├── evals/
@@ -188,7 +183,6 @@ new methods target observed failure modes rather than adding decorative comparis
 │   │   ├── compat.py        # model × benchmark matrix -> which models run per benchmark
 │   │   ├── regimes/         # one file per regime; each owns domain assignment + splitting
 │   │   └── benchmarks/      # per-benchmark label + metric specs
-│   ├── methods/             # post-hoc feature transforms
 │   └── utils/
 │       ├── cacheutils.py    # content-keyed benchmark and embedding cache
 │       ├── gputils.py       # split work across GPUs
@@ -277,7 +271,7 @@ To build it by hand (locally, or on the box), use the same conda environment nam
 conda env create -f environment.yml
 conda activate robustness
 uv pip install -e ".[dev,notebooks]"
-uv pip install --no-deps git+https://github.com/nasaharvest/presto.git
+uv pip install --no-deps "git+https://github.com/nasaharvest/presto.git@11e207a668a34336ced1d8e492a1bd5849b96c4a"
 ```
 
 If the environment already exists, refresh the conda-managed base tools and then
@@ -287,7 +281,7 @@ sync the project dependencies through uv:
 conda env update -n robustness -f environment.yml --prune
 conda activate robustness
 uv pip install -e ".[dev,notebooks]"
-uv pip install --no-deps git+https://github.com/nasaharvest/presto.git
+uv pip install --no-deps "git+https://github.com/nasaharvest/presto.git@11e207a668a34336ced1d8e492a1bd5849b96c4a"
 ```
 
 Run checks from the activated environment:
@@ -316,7 +310,6 @@ compatibility matrix decides which models run on each):
 
 ```python
 BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis_r"]
-ACTIVE_METHODS = []
 RUN_STAGES = ["gen_embeddings", "probing"]
 SPLIT_REGIMES = ["random_id", "geographic_ood", "phenology_ood"]
 SEEDS = [0, 1]
@@ -326,7 +319,6 @@ Configuration reference:
 
 ```python
 BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis_r"]
-ACTIVE_METHODS = []           # [] = ERM baseline only
 RUN_STAGES = ["gen_embeddings", "probing"]
 SPLIT_REGIMES = ["random_id", "geographic_ood", "phenology_ood"]
 MAX_SAMPLES = None            # None = all samples

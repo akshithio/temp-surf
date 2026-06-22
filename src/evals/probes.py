@@ -37,7 +37,9 @@ PROBE_TOL = 1e-5
 # Probe families (the probe-capacity ablation axis)
 # --------------------------------------------------------------------------- #
 # The primary protocol is `logistic` (the canonical frozen-feature linear probe).
-# `mlp` (higher-capacity head) and `knn` (probe-free, OlmoEarth-style) exist to test
+# `mlp` (higher-capacity head) and `knn` (probe-free; a generic standardized inverse-distance
+# kNN -- a capacity ablation, NOT a replication of OlmoEarth's normalized/temperature-weighted
+# kNN eval) exist to test
 # whether an observed geographic gap is caused by the *linear probe* or by the
 # *encoder*: if the gap persists under mlp/knn it is an encoder property; if it
 # vanishes under mlp it is a "linearly inaccessible from source-only" finding.
@@ -124,10 +126,10 @@ def _fit_probe(x: np.ndarray, y: np.ndarray, *, family: str, hp: float, solver: 
 class FeatureTransform(Protocol):
     """A fitted robustness method: a pure map on the frozen embedding space.
 
-    Methods (src/methods/*) implement their own fitting (using invariant pairs,
-    unlabeled target features, group labels, ...). By the time a transform reaches
-    ``run_probes`` it is already fitted; the probe just applies ``transform`` to
-    train and test features identically. ``None`` means the ERM baseline.
+    This is the (currently dormant) post-hoc-adaptation hook. A future method would fit itself
+    (using invariant pairs, unlabeled target features, group labels, ...) and, by the time it
+    reaches ``run_probes``, already be fitted; the probe just applies ``transform`` to train and
+    test features identically. ``None`` means the ERM baseline — the only mode used right now.
     """
 
     def transform(self, x: np.ndarray) -> np.ndarray: ...
@@ -166,6 +168,7 @@ def fit_probe_with_calibration(
     x_cal: np.ndarray | None = None,
     y_cal: np.ndarray | None = None,
     family: str = "logistic",
+    tune_internal: bool = False,
 ) -> tuple[Any, float, int, int, dict[str, Any]]:
     """Fit a binary probe of ``family`` and an F1 threshold on a validation set.
 
@@ -173,6 +176,10 @@ def fit_probe_with_calibration(
     is swept over ``PROBE_GRIDS[family]`` and selected by val AUC; the probe is fit on
     all of ``x_train`` and the threshold calibrated on ``x_cal``. With no usable val it
     falls back to the legacy 80/20 internal split at the family's default hyperparameter.
+
+    ``tune_internal`` (used by the target-ID oracle): with no external val, select the
+    hyperparameter on a held-out internal split of ``x_train`` and then REFIT on ALL of
+    ``x_train`` -- so the final model trains on the full pool, source-free, while still tuning.
     """
     grid = PROBE_GRIDS[family]
     use_external = (
@@ -182,7 +189,35 @@ def fit_probe_with_calibration(
         f"probe.fit/binary/{family}",
         n_samples=len(y_train), n_features=x_train.shape[1], n_classes=len(np.unique(y_train)),
     ):
-        if use_external:
+        cal_prob = None  # set by tune_internal to OUT-OF-FOLD probabilities for the threshold
+        if not use_external and tune_internal and len(y_train) >= 20 and len(np.unique(y_train)) == 2 \
+                and min(np.bincount(y_train)) >= 4:
+            # select HP on an internal val (disjoint from its selection-fit), then REFIT on ALL train.
+            idx = np.arange(len(y_train))
+            fit_idx, cal_idx = train_test_split(idx, test_size=0.20, random_state=seed, stratify=y_train)
+            best = None
+            for hp in grid:
+                clf_i, _, _ = _fit_probe(
+                    x_train[fit_idx], y_train[fit_idx], family=family, hp=hp, solver=PROBE_SOLVER, seed=seed
+                )
+                try:
+                    score = float(roc_auc_score(y_train[cal_idx], clf_i.predict_proba(x_train[cal_idx])[:, 1]))
+                except ValueError:
+                    score = 0.0
+                if best is None or score > best[0]:
+                    best = (score, hp, clf_i)
+            chosen_hp, clf_oof = best[1], best[2]  # clf_oof was trained WITHOUT cal_idx
+            clf, n_iter, convergence_warnings = _fit_probe(
+                x_train, y_train, family=family, hp=chosen_hp, solver=PROBE_SOLVER, seed=seed
+            )
+            cal_x, cal_y = x_train[cal_idx], y_train[cal_idx]
+            # OUT-OF-FOLD threshold: calibrate on the selection model's probs for cal_idx (which it
+            # never trained on), not the full-pool refit's in-sample probs (that was optimistic).
+            cal_prob = clf_oof.predict_proba(cal_x)[:, 1]
+            n_fit, n_cal = len(y_train), len(cal_idx)
+            calibration_source = "target_internal_tuned_oof"
+            grid_size = len(grid)
+        elif use_external:
             # Fit on ALL of train at each grid point, pick by val AUC (threshold-free),
             # then calibrate the threshold on the same val.
             best = None
@@ -224,7 +259,8 @@ def fit_probe_with_calibration(
         "probe_C": chosen_hp if family == "logistic" else float("nan"),
         "probe_grid_size": grid_size,
     }
-    cal_prob = clf.predict_proba(cal_x)[:, 1]
+    if cal_prob is None:  # tune_internal supplies out-of-fold probs; otherwise use this clf's
+        cal_prob = clf.predict_proba(cal_x)[:, 1]
     threshold = best_f1_threshold(cal_y, cal_prob)
     return clf, threshold, int(n_fit), int(n_cal), probe_meta
 
@@ -300,12 +336,17 @@ def fit_probe_multiclass(
     x_val: np.ndarray | None = None,
     y_val: np.ndarray | None = None,
     family: str = "logistic",
+    tune_internal: bool = False,
 ) -> tuple[Any, dict[str, Any]]:
     """Fit a multiclass probe of ``family`` (no threshold calibration).
 
     When a validation set ``(x_val, y_val)`` is supplied, the family's hyperparameter is
     swept over ``PROBE_GRIDS[family]`` and selected by val balanced accuracy (the same
     equal-budget grid used by the binary probe). Otherwise the default is used.
+
+    ``tune_internal`` (target-ID oracle): with no external val, select the hyperparameter on a
+    held-out internal split of ``x_train`` and REFIT on ALL of ``x_train`` -- full-pool fit,
+    source-free, still tuned.
     """
     grid = PROBE_GRIDS[family]
     use_val = x_val is not None and len(x_val) > 0 and y_val is not None and len(y_val) > 0
@@ -313,7 +354,26 @@ def fit_probe_multiclass(
         f"probe.fit/multiclass/{family}",
         n_samples=len(y_train), n_features=x_train.shape[1], n_classes=len(np.unique(y_train)),
     ):
-        if use_val:
+        if not use_val and tune_internal and len(y_train) >= 20 and len(np.unique(y_train)) >= 2:
+            idx = np.arange(len(y_train))
+            try:
+                fit_idx, cal_idx = train_test_split(idx, test_size=0.20, random_state=seed, stratify=y_train)
+            except ValueError:
+                fit_idx, cal_idx = train_test_split(idx, test_size=0.20, random_state=seed, stratify=None)
+            best = None
+            for hp in grid:
+                clf_i, _, _ = _fit_probe(
+                    x_train[fit_idx], y_train[fit_idx], family=family, hp=hp, solver=PROBE_MULTICLASS_SOLVER, seed=seed
+                )
+                score = float(balanced_accuracy_score(y_train[cal_idx], clf_i.predict(x_train[cal_idx])))
+                if best is None or score > best[0]:
+                    best = (score, hp)
+            chosen_hp = best[1]
+            clf, n_iter, convergence_warnings = _fit_probe(
+                x_train, y_train, family=family, hp=chosen_hp, solver=PROBE_MULTICLASS_SOLVER, seed=seed
+            )
+            grid_size = len(grid)
+        elif use_val:
             best = None
             for hp in grid:
                 clf, n_iter, cw = _fit_probe(

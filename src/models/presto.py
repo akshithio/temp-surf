@@ -73,6 +73,7 @@ PRESTO_WEIGHTS_PATH = None
 PRESTO_NORMALIZER = None  # None = use built-in PRESTO_ADD / PRESTO_DIVIDE
 PRESTO_HF_REPO = "torchgeo/presto"
 PRESTO_HF_FILENAME = "model-f317d103.pth"
+PRESTO_HF_REVISION = "44835fba5116ed5f000d5eea3973655985bf765b"  # immutable commit (reproducible weights)
 
 _REPO = Path(__file__).resolve().parents[2]
 _INPUT = Path(os.environ.get("ROBUSTNESS_INPUT", _REPO / "data" / "input"))
@@ -127,11 +128,14 @@ def _default_load_model(weights_path: str | None) -> Any:
         )
     path = Path(weights_path).expanduser() if weights_path is not None else DEFAULT_PRESTO_WEIGHTS
     if not path.exists() and weights_path is None:
-        path = hf_download_to(PRESTO_HF_REPO, PRESTO_HF_FILENAME, DEFAULT_PRESTO_WEIGHTS)
+        path = hf_download_to(PRESTO_HF_REPO, PRESTO_HF_FILENAME, DEFAULT_PRESTO_WEIGHTS, revision=PRESTO_HF_REVISION)
     elif not path.exists():
         raise FileNotFoundError(f"Presto weights not found at {path}.")
     model = Presto.construct()
-    model.load_state_dict(torch.load(path, map_location="cpu", weights_only=False))
+    # weights_only=True refuses arbitrary pickle execution during load (the checkpoint is a plain
+    # state_dict). If a future checkpoint legitimately needs full unpickling, gate it behind a
+    # verified checksum rather than flipping this back.
+    model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
     model.eval()
     return model.model
 

@@ -69,6 +69,7 @@ def iter_splits(y, groups, *, seed, holdouts=None, n_folds=None, **_):
     for holdout in sorted(set(np.asarray(groups, dtype=object).astype(str).tolist())):
         try:
             train, val, test, _train_val = make_strict_holdout_splits(y, groups, holdout, seed)
-        except ValueError:
+        except ValueError as exc:
+            print(f"   !! phenology_ood: domain {holdout!r} dropped ({exc})", flush=True)
             continue
         yield Split(holdout, train, test, val)

@@ -1,7 +1,6 @@
 """Orchestrator for the frozen-embedding robustness pipeline.
 
-    benchmark spec -> get_input -> encode (frozen) -> cache
-                  -> {ERM, ACTIVE_METHODS} -> probe -> tables
+    benchmark spec -> get_input -> encode (frozen) -> probe (ERM) -> tables
 
 Edit the config block below, then::
 
@@ -18,7 +17,7 @@ from __future__ import annotations
 
 import importlib
 import os
-from typing import Any
+import sys
 
 import numpy as np
 from joblib import Parallel, delayed
@@ -36,7 +35,6 @@ from utils import (
 
 # === Configuration ===========================================================
 BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis_r"]
-ACTIVE_METHODS = []
 RUN_STAGES = ["gen_embeddings", "probing"]
 # Master list of regimes this run wants. The effective set per benchmark is the
 # intersection with that benchmark's own `SPLIT_REGIMES` allowlist (e.g. temporal_ood
@@ -47,8 +45,7 @@ SPLIT_REGIMES = ["random_id", "geographic_ood", "climate_ood", "temporal_ood", "
 # Probe-capacity ablation axis. "logistic" is the primary protocol; "mlp"/"knn" test
 # whether a geographic gap is caused by the linear probe (vanishes under mlp) or the
 # encoder (persists). Each family gets the SAME-size val-selected grid and class-balanced
-# training (see evals/probes.py), so the comparison is fair. mlp/knn are the slow part of
-# the run; if it's too long, drop them here (this is the one knob to scope it).
+# training (see evals/probes.py), so the comparison is fair. mlp/knn are the slow part
 ACTIVE_PROBES = ["logistic", "mlp", "knn"]
 
 MAX_SAMPLES = None  # benchmark samples per benchmark (None = all)
@@ -56,6 +53,11 @@ MAX_DENSE_PIXELS = 50_000  # sampled pixels per PASTIS fold partition
 N_JOBS = -1  # cores for the (single-threaded sklearn) probe sweep; -1 = all
 OVERWRITE_MODE = "skip"  # choose between skip, override
 SEEDS = [0, 1, 2]  # random seeds for probe reproducibility (3 = credibility floor for the gap CIs)
+# Strictness: a regime that is DECLARED (in a benchmark's SPLIT_REGIMES) but does not fully run
+# -- assigns no domains, yields 0 splits, or drops a curated holdout -- is a HARD FAILURE by
+# default, so an incomplete results matrix never exits 0. Set the STRICT_REGIMES env var to a
+# falsey value (0/false/no) to downgrade to warn-and-continue for local iteration.
+STRICT_REGIMES = True
 # =============================================================================
 
 BENCH_SHUFFLE_SEED = 0  # fixed so cached embeddings stay aligned to the bench row order
@@ -106,32 +108,85 @@ def _effective_n_jobs(embeddings: dict[str, np.ndarray]) -> int:
     elif requested == 0:
         requested = 1
 
-    # The probe sweep runs with prefer="threads" (see Parallel(...) below), so the embedding
-    # matrix is SHARED across jobs, not copied per job. Only each cell's working set (the
-    # subset view + scaler + fitted probe) grows with thread count, so the old per-process
-    # caps (1 job >2GB, 2 jobs >200MB) were far too conservative -- e.g. they throttled
-    # EuroCropsML's ~360MB embeddings to 2 cores. Only throttle the genuinely huge matrices.
-    max_bytes = max(np.asarray(arr).nbytes for arr in embeddings.values())
-    if max_bytes >= 4_000_000_000:
-        return min(requested, 4)
-    if max_bytes >= 1_000_000_000:
-        return min(requested, 8)
+    # prefer="threads" shares the base embedding matrix, BUT each cell indexes its train/val/test
+    # subsets with ADVANCED indexing (``emb[train]``), which COPIES -- so peak RAM grows roughly as
+    # n_jobs × (per-cell working copy). A cell's disjoint subsets sum to ~the whole matrix, so cap
+    # concurrency by a memory budget for those copies (override with $PROBE_COPY_BUDGET_BYTES).
+    max_bytes = max((np.asarray(arr).nbytes for arr in embeddings.values()), default=0)
+    budget = int(os.environ.get("PROBE_COPY_BUDGET_BYTES", str(8_000_000_000)))  # ~8 GB of copies
+    if max_bytes > 0:
+        requested = max(1, min(requested, budget // max_bytes))
     return requested
 
 
+def _run_signature(model_name: str, tag: str, split_regimes) -> str:
+    """Fingerprint of everything that defines this experiment's results: the assembled-benchmark
+    tag (params + loader code + staged data), the model checkpoint, the probe + ORCHESTRATION +
+    REGIME source code, the seeds, the effective regimes, MAX_SAMPLES, and MAX_DENSE_PIXELS."""
+    src = cacheutils.REPO / "src"
+    code = cacheutils._hash_files(
+        src / "evals" / "probes.py",
+        src / "evals" / "evals.py",
+        src / "main.py",
+        src / "utils" / "ioutils.py",
+        *sorted((src / "evals" / "regimes").glob("*.py")),
+    )
+    parts = [
+        f"tag={tag}",
+        f"ckpt={cacheutils._checkpoint_fingerprint(model_name)}",
+        f"probes={ACTIVE_PROBES}",
+        f"seeds={SEEDS}",
+        f"regimes={sorted(split_regimes)}",
+        f"max_samples={MAX_SAMPLES}",
+        f"max_dense_pixels={MAX_DENSE_PIXELS}",
+        f"code={code}",
+    ]
+    return cacheutils._hash_str("|".join(map(str, parts)))
+
+
+def _check_run_signature(results_dir, signature: str) -> None:
+    """In skip/resume mode, refuse a results dir that doesn't belong to THIS experiment: a
+    mismatched signature, or pre-existing results with NO signature (a foreign / pre-guard run).
+    Does not write -- the signature is published only after any override deletion (see below)."""
+    if OVERWRITE_MODE == "override":
+        return
+    sig_path = results_dir / "run_signature.txt"
+    rows_path = results_dir / "probe_results.jsonl"
+    if sig_path.exists():
+        existing = sig_path.read_text().strip()
+        if existing and existing != signature:
+            raise RuntimeError(
+                f"Refusing to resume {results_dir}: produced by a DIFFERENT experiment configuration "
+                f"(signature {existing[:10]} != {signature[:10]}). Use OVERWRITE_MODE='override' or remove it."
+            )
+    elif rows_path.exists() and rows_path.stat().st_size > 0:
+        raise RuntimeError(
+            f"Refusing to resume {results_dir}: it has results but NO run_signature.txt (a pre-guard "
+            "or foreign run). Verify they match this config and write the signature, or use "
+            "OVERWRITE_MODE='override'."
+        )
+
+
+def _publish_run_signature(results_dir, signature: str) -> None:
+    """Write the signature AFTER any override deletion, so a crash mid-override can't leave a
+    matching signature next to stale rows."""
+    results_dir.mkdir(parents=True, exist_ok=True)
+    (results_dir / "run_signature.txt").write_text(signature)
+
+
 # --------------------------------------------------------------------------- #
-# Methods
+# Probe pass
 # --------------------------------------------------------------------------- #
 
 
 def build_methods(label_kind: str, seed: int):
-    """name -> (cls_or_none, kwargs).  ERM (no transform) is always included."""
-    methods: dict[str, tuple[Any, dict]] = {"erm": (None, {})}
-    for name in ACTIVE_METHODS:
-        mod = importlib.import_module(f"methods.{name}")
-        for vname, base_kwargs in mod.variants(label_kind).items():
-            methods[vname] = (getattr(mod, name.title()), {**base_kwargs, "seed": seed})
-    return methods
+    """name -> (cls_or_none, kwargs). Only plain ERM (no post-hoc adaptation transform).
+
+    Post-hoc adaptation methods (GRIT/DFR/TENT) are out of scope for now; the probe runs
+    on the frozen embeddings directly. The generic ``transform`` hook in ``evals`` stays
+    in place (always ``None`` here) so a method axis can be reintroduced later.
+    """
+    return {"erm": (None, {})}
 
 
 # --------------------------------------------------------------------------- #
@@ -153,12 +208,15 @@ def _probe_cell(
     meta,
     seed,
     family="logistic",
+    budgets=None,
 ) -> tuple[list[dict], list[dict]]:
     """Fit the (optional) method transform and run the source-budget-swept probe.
 
     Self-contained and picklable so joblib can run many cells across cores. Returns
     ``(rows, per_sample_predictions)``. ``val`` is the regime's held-out validation
-    set, forwarded to the binary probe for threshold calibration.
+    set, forwarded to the binary probe for threshold calibration. ``budgets`` (when given)
+    restricts the sweep to the not-yet-completed budgets so a resumed partial cell finishes
+    only its missing rows.
     """
     x_tr, x_cond_te = emb[train], emb[test]
     y_tr, y_te, g_tr = y[train], y[test], groups[train]
@@ -197,6 +255,7 @@ def _probe_cell(
             x_val=x_val,
             y_val=y_val,
             family=family,
+            **({} if budgets is None else {"budgets": budgets}),
         )
     perf.set_identity(None)
     return rows, preds
@@ -216,12 +275,14 @@ def _probe_cell_target(
     meta,
     seed,
     family="logistic",
+    budgets=None,
 ) -> tuple[list[dict], list[dict]]:
     """Target-budget variant: passes the *full* target pool so the probe runner
     can sample N target labels for few-shot training and use the rest for testing.
 
     ``val`` is the regime's source-side held-out validation set, forwarded to the
-    binary probe for threshold calibration (no peeking at the target region).
+    binary probe for threshold calibration (no peeking at the target region). ``budgets``
+    (when given) restricts the sweep to the not-yet-completed budgets on resume.
     """
     x_source_tr, x_target_full = emb[train], emb[test]
     y_source_tr, y_target_full = y[train], y[test]
@@ -263,6 +324,7 @@ def _probe_cell_target(
             x_val=x_val,
             y_val=y_val,
             family=family,
+            **({} if budgets is None else {"budgets": budgets}),
         )
     perf.set_identity(None)
     return rows, preds
@@ -275,10 +337,12 @@ def _probe_cell_target(
 
 # A benchmark lists a regime in SPLIT_REGIMES to assert it SHOULD run. If that regime then
 # yields nothing — missing external data (no Köppen grid), a single-domain/degenerate input
-# (one year -> no temporal split), absent coordinates — the result is a silent hole. We refuse
-# to let that pass quietly: every such case is shouted at the call site, collected here, and
-# re-listed at the end of the run. Set STRICT_REGIMES=1 to turn it into a hard failure instead.
-STRICT_REGIMES = os.environ.get("STRICT_REGIMES", "0").lower() not in ("0", "", "false", "no")
+# (one year -> no temporal split), absent coordinates, or a dropped curated holdout — the result
+# is a silent hole. Default policy is STRICT (hard failure); the STRICT_REGIMES env var overrides
+# the in-file default for local iteration (set it to 0/false/no to warn-and-continue instead).
+_strict_env = os.environ.get("STRICT_REGIMES")
+if _strict_env is not None:
+    STRICT_REGIMES = _strict_env.strip().lower() not in ("0", "", "false", "no")
 _REGIME_PROBLEMS: list[tuple[str, str, str]] = []
 
 
@@ -290,7 +354,7 @@ def _regime_problem(benchmark: str, regime: str, reason: str) -> None:
     bar = "!" * 78
     print(
         f"\n{bar}\n!! REGIME DECLARED BUT DID NOT RUN — {benchmark}/{regime}\n!! {reason}"
-        f"\n!! (it is in this benchmark's SPLIT_REGIMES; set STRICT_REGIMES=1 to make this fatal)\n{bar}\n",
+        f"\n!! (STRICT_REGIMES is disabled for this run; it would be a hard failure by default)\n{bar}\n",
         flush=True,
     )
 
@@ -306,7 +370,7 @@ def _report_regime_problems() -> None:
     print(f"{bar}\n", flush=True)
 
 
-def _iter_splits(split_regime, bench, y, holdouts, seed):
+def _iter_splits(split_regime, bench, y, holdouts, seed, val_group=None):
     """Yield split metadata and regime-assigned domain labels.
 
     A regime owns the domain basis (for example geography or phenology) and the
@@ -335,8 +399,10 @@ def _iter_splits(split_regime, bench, y, holdouts, seed):
             flush=True,
         )
     n_splits = 0
-    for split in regime.iter_splits(y, domains, seed=seed, holdouts=holdouts):
+    yielded_labels: set[str] = set()
+    for split in regime.iter_splits(y, domains, seed=seed, holdouts=holdouts, val_group=val_group):
         n_splits += 1
+        yielded_labels.add(str(split.label))
         yield split.label, split.train, split.val, split.test, domains, regime.HAS_TARGET, regime.GROUP_KIND
     if n_splits == 0:
         labels = sorted({str(d) for d in domains})
@@ -344,6 +410,15 @@ def _iter_splits(split_regime, bench, y, holdouts, seed):
         _regime_problem(
             bench_name, split_regime, f"produced 0 splits (domain labels seen: {shown})"
         )
+    elif getattr(regime, "USES_CURATED_HOLDOUTS", False):
+        # A curated-holdout regime (geographic_ood) must yield one split per requested holdout.
+        # Any holdout that dropped out (region absent / one-class) leaves an INCOMPLETE matrix
+        # even though >=1 split ran -> surface it so STRICT_REGIMES catches the partial case.
+        missing = [str(h) for h in (holdouts or []) if str(h) not in yielded_labels]
+        if missing:
+            _regime_problem(
+                bench_name, split_regime, f"curated holdout(s) dropped (no valid split): {missing}"
+            )
 
 
 def _segmentation_fold_configs(bench_mod, regimes):
@@ -369,7 +444,7 @@ def _segmentation_fold_configs(bench_mod, regimes):
             yield (regime_name, label, train_folds, val_folds, test_folds)
 
 
-def run_segmentation(benchmark_name, model_name, seeds, max_samples, run_stages, **enc_kwargs) -> None:
+def run_segmentation(benchmark_name, model_name, seeds, max_samples, split_regimes, run_stages, **enc_kwargs) -> None:
     """Run PASTIS-R segmentation over its fold-based geographic regimes.
 
     PASTIS is dense (per-pixel) and too large to hold in memory, so it streams tiles
@@ -379,10 +454,9 @@ def run_segmentation(benchmark_name, model_name, seeds, max_samples, run_stages,
     :func:`_segmentation_fold_configs`: ``random_id`` (published 1-3/4/5, the
     in-distribution baseline) and ``geographic_ood`` (leave-one-fold-out, the deployment regime).
     Rows carry ``domain_basis="geography"`` so the schema matches the classification
-    benchmarks. (Phenology and the few-shot/oracle budget sweep are intentionally NOT
-    run here — see the experimental-design notes: phenology is label-confounded on a
-    single-region/year dataset, and the target-label unit for dense segmentation is a
-    design question, not a mechanism.)
+    benchmarks. The tile-level few-shot/oracle target-budget sweep DOES run here (for
+    geographic_ood) via :func:`EV.run_probes_segmentation_target`. Phenology is intentionally
+    not run (label-confounded on a single-region/year dense crop map).
     """
     stages = _run_stage_set(run_stages)
     gen_embeddings = "gen_embeddings" in stages
@@ -408,24 +482,65 @@ def run_segmentation(benchmark_name, model_name, seeds, max_samples, run_stages,
         n_events = perf.write_log(results_dir / "perf.jsonl")
         print(f"  embedding stage complete; perf: {n_events} events logged", flush=True)
         return
+    signature = _run_signature(model_name, tag, split_regimes)
+    _check_run_signature(results_dir, signature)
     rows_path = results_dir / "probe_results.jsonl"
     if OVERWRITE_MODE == "override":
-        for path in (rows_path, results_dir / "probe_results.csv", results_dir / "summary.csv"):
+        for path in (rows_path, results_dir / "probe_results.csv", results_dir / "summary.csv",
+                     results_dir / "run_signature.txt"):
             if path.exists():
                 path.unlink()
+    _publish_run_signature(results_dir, signature)
     rows = IOU.read_jsonl(rows_path)
-    done = {
-        (r.get("seed"), r.get("method"), r.get("split_regime"), r.get("holdout"), r.get("probe_family"))
-        for r in rows
+    # A family (seed, method, regime, holdout, probe_family) is the atomic unit here: it runs
+    # the full source sweep + (geographic_ood) target sweep in one append. A family is COMPLETE
+    # only once all of its deterministic source rows (SOURCE_BUDGETS x {validation, test}) are
+    # present; an incomplete family (e.g. a partial write before a crash) is pruned and fully
+    # re-run rather than skipped off a single row.
+    fam_fields = ("seed", "method", "split_regime", "holdout", "probe_family")
+
+    def _fam_key(r):
+        return tuple(r.get(k) for k in fam_fields)
+
+    present_by_family: dict[tuple, set] = {}
+    for r in rows:
+        present_by_family.setdefault(_fam_key(r), set()).add(
+            (r.get("budget_type"), r.get("label_budget"), r.get("evaluation_split"))
+        )
+    # A complete family has ALL its deterministic rows: the source sweep
+    # (SOURCE_BUDGETS x {validation, test}) for every regime, PLUS the target sweep
+    # (ALL_TARGET_BUDGETS, "test") for geographic_ood. Checking only the source rows would
+    # treat "source done, target missing" as finished (the crash-resume gap).
+    expected_source = {("source", b, s) for b in EV.SOURCE_BUDGETS for s in ("validation", "test")}
+    expected_target = {("target", b, "test") for b in EV.ALL_TARGET_BUDGETS}
+
+    def _expected(regime):
+        exp = set(expected_source)
+        if regime == "geographic_ood":
+            exp |= expected_target
+        return exp
+
+    regime_idx = fam_fields.index("split_regime")
+    done_families = {
+        k for k, seen in present_by_family.items() if _expected(k[regime_idx]).issubset(seen)
     }
-    regimes = getattr(bench_mod, "SPLIT_REGIMES", ["random_id"])
+    incomplete = set(present_by_family) - done_families
+    if incomplete:  # drop partial families' rows so re-runs don't duplicate them
+        rows = [r for r in rows if _fam_key(r) not in incomplete]
+        rows_path.unlink(missing_ok=True)
+        IOU.append_jsonl(rows_path, rows)
+
+    # Effective regimes = this benchmark's allowlist ∩ the run's master split_regimes (same
+    # rule as the classification path), so the master list actually scopes PASTIS too.
+    supported = getattr(bench_mod, "SPLIT_REGIMES", ["random_id"])
+    regimes = [r for r in supported if r in split_regimes]
     fold_configs = list(_segmentation_fold_configs(bench_mod, regimes))
     for seed in seeds:
         for method_name, (cls, kwargs) in build_methods(bench_mod.LABEL_KIND, seed).items():
             for split_regime, holdout, train_folds, val_folds, test_folds in fold_configs:
                 families_to_run = [
                     f for f in ACTIVE_PROBES
-                    if (seed, method_name, split_regime, holdout, f) not in done
+                    if (seed, method_name, split_regime, holdout, f) not in done_families
                 ]
                 if not families_to_run:
                     continue
@@ -514,7 +629,7 @@ def run(benchmark_name, model_name, seeds, max_samples, split_regimes, run_stage
     probing = "probing" in stages
     bench_mod = load_benchmark(benchmark_name)
     if bench_mod.LABEL_KIND == "segmentation":
-        run_segmentation(benchmark_name, model_name, seeds, max_samples, run_stages, **enc_kwargs)
+        run_segmentation(benchmark_name, model_name, seeds, max_samples, split_regimes, run_stages, **enc_kwargs)
         return
     probe_fn_src, metrics = DISPATCH[bench_mod.LABEL_KIND]
     probe_fn_tgt, _ = DISPATCH_TARGET[bench_mod.LABEL_KIND]
@@ -543,6 +658,8 @@ def run(benchmark_name, model_name, seeds, max_samples, split_regimes, run_stage
         n_events = perf.write_log(results_dir / "perf.jsonl")
         print(f"  embedding stage complete; perf: {n_events} events logged", flush=True)
         return
+    signature = _run_signature(model_name, tag, split_regimes)
+    _check_run_signature(results_dir, signature)  # reject mismatched / unsigned-non-empty dirs
     rows_path = results_dir / "probe_results.jsonl"
     preds_path = results_dir / "predictions.jsonl"
 
@@ -553,11 +670,16 @@ def run(benchmark_name, model_name, seeds, max_samples, split_regimes, run_stage
             results_dir / "probe_results.csv",
             results_dir / "summary.csv",
             results_dir / "deltas.csv",
+            results_dir / "run_signature.txt",
         ]:
             if p.exists():
                 p.unlink()
+    _publish_run_signature(results_dir, signature)  # publish only after stale artifacts are gone
 
     rows = IOU.read_jsonl(rows_path)
+    # Completion is tracked per ROW (down to label_budget), so a crash mid-sweep that wrote
+    # only some budgets resumes the *missing* budgets instead of treating the whole sweep as
+    # finished off a single row.
     done = {
         (
             r.get("seed"),
@@ -566,6 +688,7 @@ def run(benchmark_name, model_name, seeds, max_samples, split_regimes, run_stage
             r.get("method"),
             r.get("probe_family"),
             r.get("budget_type"),
+            r.get("label_budget"),
         )
         for r in rows
     }
@@ -575,11 +698,15 @@ def run(benchmark_name, model_name, seeds, max_samples, split_regimes, run_stage
     def uses_target_flag(cls):
         return getattr(cls, "USES_TARGET", False)
 
+    def _missing(base, budget_type, expected):
+        """Budgets in ``expected`` with no completed row yet for this cell."""
+        return [b for b in expected if (*base, budget_type, b) not in done]
+
     for seed in seeds:
         for mname, (cls, kwargs) in build_methods(bench_mod.LABEL_KIND, seed).items():
             for split_regime in split_regimes:
                 for split_label, train, val, test, groups, has_target, domain_basis in _iter_splits(
-                    split_regime, bench, y, holdouts, seed
+                    split_regime, bench, y, holdouts, seed, val_group=getattr(bench_mod, "VAL_HOLDOUT", None)
                 ):
                     for family in ACTIVE_PROBES:
                         meta = {
@@ -591,30 +718,32 @@ def run(benchmark_name, model_name, seeds, max_samples, split_regimes, run_stage
                             "holdout": split_label,
                             "probe_family": family,
                         }
+                        base = (seed, split_regime, split_label, mname, family)
                         # ---- Target-budget sweep ----
-                        if (
-                            has_target
-                            and (seed, split_regime, split_label, mname, family, "target") not in done
-                        ):
-                            jobs.append(
-                                delayed(_probe_cell_target)(
-                                    probe_fn_tgt,
-                                    emb,
-                                    train,
-                                    val,
-                                    test,
-                                    y,
-                                    groups,
-                                    cls,
-                                    kwargs,
-                                    uses_target_flag(cls),
-                                    {**meta, "budget_type": "target"},
-                                    seed,
-                                    family,
+                        if has_target:
+                            todo = _missing(base, "target", EV.ALL_TARGET_BUDGETS)
+                            if todo:
+                                jobs.append(
+                                    delayed(_probe_cell_target)(
+                                        probe_fn_tgt,
+                                        emb,
+                                        train,
+                                        val,
+                                        test,
+                                        y,
+                                        groups,
+                                        cls,
+                                        kwargs,
+                                        uses_target_flag(cls),
+                                        {**meta, "budget_type": "target"},
+                                        seed,
+                                        family,
+                                        todo,
+                                    )
                                 )
-                            )
                         # ---- Source-fraction sweep ----
-                        if (seed, split_regime, split_label, mname, family, "source") not in done:
+                        todo_src = _missing(base, "source", EV.SOURCE_BUDGETS)
+                        if todo_src:
                             jobs.append(
                                 delayed(_probe_cell)(
                                     probe_fn_src,
@@ -630,6 +759,7 @@ def run(benchmark_name, model_name, seeds, max_samples, split_regimes, run_stage
                                     {**meta, "budget_type": "source"},
                                     seed,
                                     family,
+                                    todo_src,
                                 )
                             )
 
@@ -637,10 +767,14 @@ def run(benchmark_name, model_name, seeds, max_samples, split_regimes, run_stage
         n_jobs = _effective_n_jobs(emb)
         print(f"  probe jobs={len(jobs)} n_jobs={n_jobs}", flush=True)
         for cell_rows, cell_preds in Parallel(n_jobs=n_jobs, return_as="generator", prefer="threads")(jobs):
-            IOU.append_jsonl(rows_path, cell_rows)
-            rows.extend(cell_rows)
+            # Predictions are written BEFORE the result rows: the result rows are what mark a
+            # cell done (the resume key), so writing them last guarantees "row present => preds
+            # present". A crash between the two only loses rows (recomputed on resume; the
+            # re-appended preds are harmless duplicates the per-observation collapse folds away).
             if cell_preds:
                 IOU.append_jsonl(preds_path, cell_preds)
+            IOU.append_jsonl(rows_path, cell_rows)
+            rows.extend(cell_rows)
 
     IOU.write_csv(results_dir / "probe_results.csv", rows)
     summary = IOU.summarize_rows(
@@ -670,6 +804,7 @@ if __name__ == "__main__":
     all_pairs = [(mod, bm) for bm in BENCHMARKS for mod in compat.eligible_models(bm)]
     work = gputils.take_shard(all_pairs)
     shard, nshards = gputils.shard_indices()
+    failures: list[tuple[str, str, str]] = []
     for mod, bm in work:
         print(f"\n========== [shard {shard}/{nshards}] {mod} / {bm} ==========", flush=True)
         print(f"  split_regimes={SPLIT_REGIMES}", flush=True)
@@ -677,16 +812,27 @@ if __name__ == "__main__":
         try:
             run(bm, mod, SEEDS, MAX_SAMPLES, SPLIT_REGIMES, RUN_STAGES, **enc_kwargs)
         except NotImplementedError as exc:
-            print(f"   [shard {shard}] {mod}/{bm} skipped: {exc}", flush=True)
+            print(f"   [shard {shard}] {mod}/{bm} skipped (not implemented): {exc}", flush=True)
         except cacheutils.MissingEmbeddingCache:
             raise
         except Exception as exc:
             import traceback
 
+            # Keep going so the other pairs still run, but record the failure so the process
+            # exits NONZERO -- a partial run must not look like success to a scheduler/operator.
+            failures.append((mod, bm, f"{type(exc).__name__}: {exc}"))
             print(
-                f"!! [shard {shard}] {mod}/{bm} FAILED: {type(exc).__name__}: {exc} (skipping; re-run to resume)",
+                f"!! [shard {shard}] {mod}/{bm} FAILED: {type(exc).__name__}: {exc} (continuing; re-run to resume)",
                 flush=True,
             )
             traceback.print_exc()
 
     _report_regime_problems()
+
+    if failures:
+        bar = "!" * 78
+        print(f"\n{bar}\n[shard {shard}/{nshards}] {len(failures)} (model, benchmark) pair(s) FAILED:", flush=True)
+        for mod, bm, reason in failures:
+            print(f"  - {mod}/{bm}: {reason}", flush=True)
+        print(f"{bar}", flush=True)
+        sys.exit(1)

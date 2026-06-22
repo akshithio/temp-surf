@@ -97,6 +97,7 @@ GALILEO_NORM_13_STD = np.array(
 _REPO = Path(__file__).resolve().parents[2]
 _INPUT = Path(os.environ.get("ROBUSTNESS_INPUT", _REPO / "data" / "input"))
 GALILEO_HF_REPO = "nasaharvest/galileo"
+GALILEO_HF_REVISION = "f039dd5dde966a931baeda47eb680fa89b253e4e"  # immutable commit (reproducible weights)
 
 # band indexing helpers
 _GALILEO_S2_NAMES = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12"]
@@ -141,8 +142,10 @@ def _default_load_model(weights_path: str | Path | None, model_size: str) -> Any
         from utils.ioutils import hf_download_to
 
         p.mkdir(parents=True, exist_ok=True)
-        hf_download_to(GALILEO_HF_REPO, f"{subdir}/config.json", p / "config.json")
-        hf_download_to(GALILEO_HF_REPO, f"{subdir}/model.pt", p / "model.pt")
+        hf_download_to(GALILEO_HF_REPO, f"{subdir}/config.json", p / "config.json", revision=GALILEO_HF_REVISION)
+        # The repo ships the encoder as encoder.pt (there is no model.pt); save it to the
+        # local model.pt destination the loader (galileoutil) expects.
+        hf_download_to(GALILEO_HF_REPO, f"{subdir}/encoder.pt", p / "model.pt", revision=GALILEO_HF_REVISION)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = GalileoNativeModel.load_from_folder(p, device=torch.device(device))
@@ -191,11 +194,11 @@ class GalileoModel:
         sp_x  : (N, 1, 1, 16)     float32 — zeros
         t_x   : (N, T, 6)         float32 — zeros
         st_x  : (N, 18)           float32 — zeros
-        s_t_m : (N, 1, 1, T, 7)   float32 — 0=available group, 1=masked
+        s_t_m : (N, 1, 1, T, 7)   float32 — 0=available group, 1=masked (per-timestep s2/s1 mask)
         sp_m  : (N, 1, 1, 3)      float32 — all 1 (masked)
         t_m   : (N, T, 3)         float32 — all 1 (masked)
         st_m  : (N, 4)            float32 — all 1 (masked)
-        months: (N, T)            int64   — July for each year
+        months: (N, T)            int64   — calendar month (0-indexed) per timestep from doy
         """
         n, t = bench.s2.shape[0], bench.s2.shape[1]
 
@@ -215,14 +218,21 @@ class GalileoModel:
         x_st = (x_st - GALILEO_NORM_13_MEAN) / GALILEO_NORM_13_STD
 
         # -- masks -----------------------------------------------------------
-        # s_t_m: (N, 1, 1, T, 7) — 1 = masked, 0 = available
+        # s_t_m: (N, 1, 1, T, 7) — 1 = masked, 0 = available. A group is available at a
+        # timestep ONLY where that modality is actually observed there (per-timestep
+        # s2_mask / s1_mask), exactly like the dense path. Marking every timestep available
+        # because an array exists fed zero-filled missing months / padded steps to the model
+        # as if they were real observations (and unmasked the all-zero placeholder S1 on the
+        # S2-only benchmarks).
         s_t_m = np.ones((n, 1, 1, t, len(SPACE_TIME_BANDS_GROUPS_IDX)), dtype=np.float32)
-        # Unmask S2 groups (including NDVI) if we have S2 data
         if bench.s2 is not None:
-            s_t_m[:, :, :, :, _GALILEO_S2_GROUP_IDS] = 0.0
-        # Unmask S1 group if we have S1 data
+            s2_obs = np.asarray(bench.s2_mask) if getattr(bench, "s2_mask", None) is not None else np.ones((n, t))
+            s2_masked = (s2_obs <= 0).astype(np.float32)  # (n, t): 1 where NOT observed
+            for gid in _GALILEO_S2_GROUP_IDS:
+                s_t_m[:, 0, 0, :, gid] = s2_masked
         if bench.s1 is not None:
-            s_t_m[:, :, :, :, 0] = 0.0  # S1 is the first group
+            s1_obs = np.asarray(bench.s1_mask) if getattr(bench, "s1_mask", None) is not None else np.ones((n, t))
+            s_t_m[:, 0, 0, :, 0] = (s1_obs <= 0).astype(np.float32)  # S1 is the first group
 
         # -- empty modalities (all masked) -----------------------------------
         sp_x = np.zeros((n, 1, 1, len(SPACE_BANDS)), dtype=np.float32)
@@ -233,7 +243,19 @@ class GalileoModel:
         st_m = np.ones((n, len(STATIC_BAND_GROUPS_IDX)), dtype=np.float32)
 
         # -- months ----------------------------------------------------------
-        months = np.full((n, t), 6, dtype=np.int64)  # July
+        # Real calendar month (0-indexed) per timestep from day-of-year — Galileo's temporal
+        # encoding is month-aware, so a constant "July" misrepresents the season for every
+        # sample. Falls back to July only if the benchmark carries no doy at all.
+        if getattr(bench, "doy", None) is not None:
+            doy = np.clip(np.asarray(bench.doy, dtype=np.int64), 1, 365)
+            months = (
+                (np.datetime64("2001-01-01") + (doy - 1).astype("timedelta64[D]"))
+                .astype("datetime64[M]")
+                .astype(np.int64)
+                % 12
+            ).astype(np.int64)
+        else:
+            months = np.full((n, t), 6, dtype=np.int64)
 
         return x_st, sp_x, t_x, st_x, s_t_m, sp_m, t_m, st_m, months
 

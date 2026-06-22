@@ -7,6 +7,7 @@ tests. Class 19 is void and is removed; background class 0 remains evaluated.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -234,6 +235,7 @@ def load_benchmark(
         order = order[:max_samples]
 
     patches: list[PastisPatch] = []
+    missing = 0
     for i in order:
         r = rows[int(i)]
         pid = int(r["ID_PATCH"])
@@ -241,6 +243,7 @@ def load_benchmark(
         s1_path = base / "DATA_S1A" / f"S1A_{pid}.npy"
         target_path = base / "ANNOTATIONS" / f"TARGET_{pid}.npy"
         if not (s2_path.exists() and s1_path.exists() and target_path.exists()):
+            missing += 1
             continue
         patches.append(
             PastisPatch(
@@ -254,6 +257,13 @@ def load_benchmark(
             )
         )
 
+    if missing:
+        # A partial release must be visible: don't silently evaluate over the patches that happen
+        # to be present. Loud warning; raise under STRICT_DATA so a partial release fails outright.
+        msg = f"PASTIS: {missing}/{len(order)} metadata patches have missing .npy files in {base}"
+        if os.environ.get("STRICT_DATA", "").strip().lower() not in ("", "0", "false", "no"):
+            raise ValueError(msg + " (STRICT_DATA is set)")
+        print(f"   !! {msg} -- those patches are skipped (set STRICT_DATA=1 to fail instead)", flush=True)
     if not patches:
         raise ValueError(f"No PASTIS patches parsed from {base}")
     return PastisBenchmark(
