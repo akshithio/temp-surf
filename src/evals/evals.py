@@ -53,8 +53,8 @@ def subset_indices(y: np.ndarray, budget: float, seed: int, stratify: bool = Tru
     drops are part of the EuroCropsML transfer story).
     """
     idx = np.arange(len(y))
-    if budget >= 1.0:
-        return idx
+    if budget >= 1.0 or len(idx) < 2:
+        return idx  # nothing to subsample (and a <2 pool would make k=0 crash train_test_split)
     k = min(len(idx) - 1, max(2, int(round(budget * len(idx)))))
     strat = y if stratify else None
     try:
@@ -174,6 +174,7 @@ def _append_prediction_rows(
     sample_ids: np.ndarray,
     groups_test: np.ndarray | None,
     per_sample: dict[str, np.ndarray] | None,
+    evaluation_split: str = "held_out",
 ) -> None:
     """Append one prediction row per test sample for a completed probe budget cell."""
     if predictions is None or per_sample is None:
@@ -185,6 +186,7 @@ def _append_prediction_rows(
         **meta,
         "budget_type": budget_type,
         "label_budget": label_budget,
+        "evaluation_split": evaluation_split,
         "seed": seed,
         "n_train_sub": int(n_train_sub),
     }
@@ -423,16 +425,20 @@ def _sweep_target_budgets(
     y_val: np.ndarray | None = None,
     family: str = "logistic",
 ) -> None:
-    """Sweep target-region label budgets (absolute counts).
+    """Sweep target-region label budgets (absolute counts) on a SHARED fixed target test set.
 
-    Budget = 0 → strict geographic holdout (train only on source).
-    Budget = TARGET_ID_UPPER_BOUND → target-ID upper bound (train only on
-    80 % of target, test on remaining 20 %; no source used).
-    Budget > 0 → sample that many *target* labels for training, keep the
-    remaining target samples for testing.
+    A single 80/20 target split is drawn once (budget-independent): the 20% is the fixed test
+    set every budget is scored on, the 80% is the train pool with a fixed nested ordering.
 
-    ``x_val``/``y_val`` is the regime's source-side held-out validation set, used by
-    the binary probe to calibrate its threshold without peeking at the target.
+    Budget = 0 → strict geographic holdout (train on source only).
+    Budget > 0 → add the first ``budget`` target labels from the nested ordering to the source
+                 training pool (so the few-shot label sets are nested).
+    Budget = TARGET_ID_UPPER_BOUND → target-ID upper bound: train on the FULL 80% pool (no
+                 source), HP tuned + refit internally on the pool (source-free).
+
+    ``x_val``/``y_val`` is the source-side regime val, used to calibrate/select for the
+    zero-shot and few-shot budgets without peeking at the target; the oracle tunes on an
+    internal target val instead, so it uses no source labels.
     """
     meta = dict(meta or {})
     x_source_t = _apply(transform, x_source)
@@ -440,53 +446,53 @@ def _sweep_target_budgets(
     x_val_t = _apply(transform, x_val) if x_val is not None and len(x_val) else None
     sample_ids_full = np.asarray(sample_ids_target if sample_ids_target is not None else np.arange(len(y_target_full)))
     groups_full = np.asarray(groups_target) if groups_target is not None else None
+    n_target = len(y_target_full)
+
+    # ONE fixed target test split + ONE fixed nested ordering of the train pool, shared by EVERY
+    # budget. Consequences: (a) zero-shot, few-shot and the oracle are all scored on the SAME
+    # target test set, so the inherent-difficulty decomposition compares like-with-like; (b) the
+    # few-shot label sets are NESTED (budget 10's labels ⊇ budget 5's), so the curve isolates
+    # "more target labels" instead of confounding it with a fresh random draw + a fresh test set.
+    # The split seed is budget-independent.
+    split_seed = _budget_seed(seed, 0.5)
+    idx = np.arange(n_target)
+    degenerate = n_target < 5
+    if degenerate:
+        pool_idx = test_idx = idx
+    else:
+        test_size = max(1, min(int(round(0.2 * n_target)), n_target - 1))
+        strat = y_target_full if stratify else None
+        try:
+            pool_idx, test_idx = train_test_split(idx, test_size=test_size, random_state=split_seed, stratify=strat)
+        except ValueError:
+            pool_idx, test_idx = train_test_split(idx, test_size=test_size, random_state=split_seed, stratify=None)
+    order = np.random.default_rng(split_seed).permutation(pool_idx)  # nested few-shot ordering
+    x_te, y_te = x_target_t[test_idx], y_target_full[test_idx]
 
     for budget in budgets:
+        if budget != 0 and degenerate:
+            continue  # too few target samples for a held-out train/test split
+        cal_x, cal_y = x_val_t, y_val  # source val for zero-shot / few-shot (no target peeking)
+        tune_internal = False
         if budget == 0:
             sub_seed = seed
             x_tr, y_tr = x_source_t, y_source
-            x_te, y_te = x_target_t, y_target_full
             n_tr = len(x_source_t)
-            test_idx = np.arange(len(y_target_full))
         elif budget == TARGET_ID_UPPER_BOUND:
             sub_seed = _budget_seed(seed, budget)
-            n_target = len(y_target_full)
-            train_size = max(1, min(int(n_target * 0.8), n_target - 1))
-            idx = np.arange(n_target)
-            strat = y_target_full if stratify else None
-            try:
-                train_idx, test_idx = train_test_split(
-                    idx, train_size=train_size, random_state=sub_seed, stratify=strat
-                )
-            except ValueError:
-                train_idx, test_idx = train_test_split(
-                    idx, train_size=train_size, random_state=sub_seed, stratify=None
-                )
-            x_tr = x_target_t[train_idx]
-            y_tr = y_target_full[train_idx]
-            x_te = x_target_t[test_idx]
-            y_te = y_target_full[test_idx]
-            n_tr = len(train_idx)
+            # oracle: train on the WHOLE 80% pool (not 64%). HP is tuned and the model REFIT on
+            # the full pool via an internal target val, so it stays source-free.
+            x_tr, y_tr = x_target_t[order], y_target_full[order]
+            cal_x, cal_y = None, None
+            tune_internal = True
+            n_tr = len(order)
         else:
             sub_seed = _budget_seed(seed, budget)
-            n_target = len(y_target_full)
-            k = min(n_target - 1, max(1, int(budget)))
-            idx = np.arange(n_target)
-            strat = y_target_full if stratify else None
-            try:
-                few, _ = train_test_split(idx, train_size=k, random_state=sub_seed, stratify=strat)
-            except ValueError:
-                few, _ = train_test_split(idx, train_size=k, random_state=sub_seed, stratify=None)
-            remaining = np.setdiff1d(idx, few)
-            if len(remaining) == 0:
-                few = few[:-1]
-                remaining = np.array([few[-1]])
+            k = min(len(order), max(1, int(budget)))
+            few = order[:k]  # nested prefix of the fixed ordering
             x_tr = np.concatenate([x_source_t, x_target_t[few]])
             y_tr = np.concatenate([y_source, y_target_full[few]])
-            x_te = x_target_t[remaining]
-            y_te = y_target_full[remaining]
             n_tr = len(x_tr)
-            test_idx = remaining
 
         identity = {
             "seed": seed,
@@ -498,7 +504,7 @@ def _sweep_target_budgets(
         perf.set_identity(identity)
         with perf.measure(f"probe.sweep.target/{meta.get('benchmark', '?')}/{meta.get('method', '?')}",
                           n_train=n_tr, n_test=len(y_te)):
-            result = fit_score(x_tr, y_tr, x_te, y_te, sub_seed, x_val_t, y_val)
+            result = fit_score(x_tr, y_tr, x_te, y_te, sub_seed, cal_x, cal_y, tune_internal)
             if len(result) == 3:
                 scores, extra, per_sample = result
             else:
@@ -508,27 +514,41 @@ def _sweep_target_budgets(
         current_groups = groups_full[test_idx] if groups_full is not None else None
         scores = {**scores, **_worst_group_scores(per_sample, current_groups)}
 
+        # Every budget is scored on the fixed held-out 20% (the matched set for the few-shot curve
+        # and the inherent-difficulty decomposition).
         rows.append({
-            **meta,
-            "budget_type": "target",
-            "label_budget": budget,
-            "seed": seed,
-            "n_train_sub": n_tr,
-            "n_test": len(y_te),
-            **extra,
-            **scores,
+            **meta, "budget_type": "target", "label_budget": budget, "evaluation_split": "held_out",
+            "seed": seed, "n_train_sub": n_tr, "n_test": len(y_te), **extra, **scores,
         })
         _append_prediction_rows(
-            predictions,
-            meta=meta,
-            seed=seed,
-            budget_type="target",
-            label_budget=budget,
-            n_train_sub=n_tr,
-            sample_ids=sample_ids_full[test_idx],
-            groups_test=current_groups,
-            per_sample=per_sample,
+            predictions, meta=meta, seed=seed, budget_type="target", label_budget=budget,
+            n_train_sub=n_tr, sample_ids=sample_ids_full[test_idx], groups_test=current_groups,
+            per_sample=per_sample, evaluation_split="held_out",
         )
+
+        # Budget 0 ALSO emits a FULL-target zero-shot anchor (train source only, evaluate on the
+        # WHOLE target domain): this is the PRIMARY deployment OOD estimand (compute_deltas reads
+        # it), restoring the full-domain estimate the fixed-20% split would otherwise shrink.
+        if budget == 0:
+            full_idx = np.arange(len(y_target_full))
+            res_full = fit_score(x_source_t, y_source, x_target_t, y_target_full, sub_seed, cal_x, cal_y)
+            if len(res_full) == 3:
+                scores_f, extra_f, per_sample_f = res_full
+            else:
+                scores_f, extra_f = res_full
+                per_sample_f = None
+            groups_all = groups_full if groups_full is not None else None
+            scores_f = {**scores_f, **_worst_group_scores(per_sample_f, groups_all)}
+            rows.append({
+                **meta, "budget_type": "target", "label_budget": budget, "evaluation_split": "full",
+                "seed": seed, "n_train_sub": len(x_source_t), "n_test": len(y_target_full),
+                **extra_f, **scores_f,
+            })
+            _append_prediction_rows(
+                predictions, meta=meta, seed=seed, budget_type="target", label_budget=budget,
+                n_train_sub=len(x_source_t), sample_ids=sample_ids_full[full_idx], groups_test=groups_all,
+                per_sample=per_sample_f, evaluation_split="full",
+            )
 
 
 def run_probes(
@@ -552,9 +572,9 @@ def run_probes(
 ) -> None:
     """Binary calibrated-probe budget sweep (source-fraction budgets)."""
 
-    def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None):
+    def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False):
         clf, threshold, n_fit, n_cal, probe_meta = fit_probe_with_calibration(
-            x_tr, y_tr, probe_seed, x_cal=x_cal, y_cal=y_cal, family=family
+            x_tr, y_tr, probe_seed, x_cal=x_cal, y_cal=y_cal, family=family, tune_internal=tune_internal
         )
         extra = {
             "n_probe_fit": n_fit,
@@ -602,9 +622,9 @@ def run_probes_target(
     (target-ID upper bound, train on 80 % of target only).
     """
 
-    def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None):
+    def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False):
         clf, threshold, n_fit, n_cal, probe_meta = fit_probe_with_calibration(
-            x_tr, y_tr, probe_seed, x_cal=x_cal, y_cal=y_cal, family=family
+            x_tr, y_tr, probe_seed, x_cal=x_cal, y_cal=y_cal, family=family, tune_internal=tune_internal
         )
         extra = {
             "n_probe_fit": n_fit,
@@ -651,8 +671,10 @@ def run_probes_multiclass(
     regime's held-out val) are used to select the L2 strength on a fixed grid.
     """
 
-    def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None):
-        clf, probe_meta = fit_probe_multiclass(x_tr, y_tr, probe_seed, x_val=x_cal, y_val=y_cal, family=family)
+    def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False):
+        clf, probe_meta = fit_probe_multiclass(
+            x_tr, y_tr, probe_seed, x_val=x_cal, y_val=y_cal, family=family, tune_internal=tune_internal
+        )
         if transform is not None and hasattr(transform, "adapt_test_features"):
             x_te = transform.adapt_test_features(clf, x_te)
         scores, per_sample = score_multiclass(clf, x_te, y_te, return_per_sample=True)
@@ -693,8 +715,10 @@ def run_probes_multiclass_target(
     regime's source-side val) select the L2 strength on a fixed grid.
     """
 
-    def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None):
-        clf, probe_meta = fit_probe_multiclass(x_tr, y_tr, probe_seed, x_val=x_cal, y_val=y_cal, family=family)
+    def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False):
+        clf, probe_meta = fit_probe_multiclass(
+            x_tr, y_tr, probe_seed, x_val=x_cal, y_val=y_cal, family=family, tune_internal=tune_internal
+        )
         if transform is not None and hasattr(transform, "adapt_test_features"):
             x_te = transform.adapt_test_features(clf, x_te)
         scores, per_sample = score_multiclass(clf, x_te, y_te, return_per_sample=True)
@@ -782,13 +806,14 @@ def run_probes_segmentation_target(
 ) -> None:
     """Tile-level target-budget sweep for PASTIS-R (the dense few-shot / oracle curve).
 
-    The target-label unit is a **tile**, not a pixel: few-shot budgets add ``k`` whole
-    target-fold tiles (all their sampled pixels) to the source training pool and test on
-    the remaining tiles; budget ``0`` is zero-shot (source only); ``TARGET_ID_UPPER_BOUND``
-    (-1) is the target-ID oracle (~80% of target tiles train, ~20% test, no source).
-    Splitting by tile (never by pixel) avoids within-tile spatial-autocorrelation leakage
-    and keeps per-tile mIoU well-defined. ``x_val``/``y_val`` (the source val fold) selects
-    the probe hyperparameter without peeking at the target.
+    The target-label unit is a **tile**, not a pixel. ONE fixed 80/20 tile split is drawn (a
+    fixed nested ordering of the 80% pool, a fixed 20% test): every budget is scored on the SAME
+    held-out test tiles, and few-shot tile sets are nested. Budget ``0`` is zero-shot (source
+    only); few-shot adds the first ``k`` pool tiles to the source training pool; ``TARGET_ID_UPPER_BOUND``
+    (-1) is the target-ID oracle (trains on the FULL 80% pool, HP tuned + refit internally, no
+    source). Splitting by tile (never by pixel) avoids within-tile spatial-autocorrelation leakage
+    and keeps per-tile mIoU well-defined. ``x_val``/``y_val`` (the source val fold) selects the
+    probe hyperparameter for zero-shot / few-shot; the oracle tunes on an internal target split.
     """
     meta = dict(meta or {})
     x_source = _apply(transform, x_source)
@@ -796,28 +821,41 @@ def run_probes_segmentation_target(
     tile_ids_target = np.asarray(tile_ids_target)
     uniq_tiles = np.array(sorted(set(tile_ids_target.tolist())))
     eval_classes = np.arange(19, dtype=np.int64)
+
+    # ONE fixed test-tile split + ONE fixed nested ordering of the train tiles, shared by every
+    # budget (same rationale as the classification sweep): zero-shot, few-shot and the oracle are
+    # all scored on the SAME held-out target tiles, and the few-shot tile sets are nested.
+    degenerate = len(uniq_tiles) < 2
+    split_rng = np.random.default_rng(_budget_seed(seed, 0.5))
+    perm = split_rng.permutation(uniq_tiles)
+    n_test_tiles = max(1, int(round(0.2 * len(uniq_tiles)))) if not degenerate else 0
+    test_tiles = set(perm[:n_test_tiles].tolist())
+    pool_order = [t for t in perm if t not in test_tiles]  # fixed nested ordering of the 80% pool
+    pool_set = set(pool_order)
+    test_mask = np.array([t in test_tiles for t in tile_ids_target])
+    x_te, y_te, tiles_te = x_target[test_mask], y_target[test_mask], tile_ids_target[test_mask]
+
     for budget in budgets:
-        # few-shot and the tile-split oracle both need >=2 target tiles to split by tile.
-        if budget != 0 and len(uniq_tiles) < 2:
+        if budget != 0 and degenerate:
             continue
         sub_seed = _budget_seed(seed, budget)
-        rng = np.random.default_rng(sub_seed)
+        cal_x, cal_y, tune_internal = x_val, y_val, False  # source val for zero-shot / few-shot
         if budget == 0:
-            x_tr, y_tr, test_mask = x_source, y_source, np.ones(len(y_target), dtype=bool)
+            x_tr, y_tr = x_source, y_source
         elif budget == TARGET_ID_UPPER_BOUND:
-            n_train_tiles = min(len(uniq_tiles) - 1, max(1, int(round(0.8 * len(uniq_tiles)))))
-            train_tiles = set(rng.choice(uniq_tiles, size=n_train_tiles, replace=False).tolist())
-            train_mask = np.array([t in train_tiles for t in tile_ids_target])
-            x_tr, y_tr, test_mask = x_target[train_mask], y_target[train_mask], ~train_mask
+            # oracle: train on the WHOLE 80% pool of tiles; HP tuned + refit internally (source-free).
+            pool_mask = np.array([t in pool_set for t in tile_ids_target])
+            x_tr, y_tr = x_target[pool_mask], y_target[pool_mask]
+            cal_x, cal_y, tune_internal = None, None, True
         else:
-            k = min(len(uniq_tiles) - 1, max(1, int(budget)))
-            few_tiles = set(rng.choice(uniq_tiles, size=k, replace=False).tolist())
+            k = min(len(pool_order), max(1, int(budget)))
+            few_tiles = set(pool_order[:k])  # nested prefix of the fixed ordering
             few_mask = np.array([t in few_tiles for t in tile_ids_target])
             x_tr = np.concatenate([x_source, x_target[few_mask]])
             y_tr = np.concatenate([y_source, y_target[few_mask]])
-            test_mask = ~few_mask
-        x_te, y_te, tiles_te = x_target[test_mask], y_target[test_mask], tile_ids_target[test_mask]
-        clf, probe_meta = fit_probe_multiclass(x_tr, y_tr, sub_seed, x_val=x_val, y_val=y_val, family=family)
+        clf, probe_meta = fit_probe_multiclass(
+            x_tr, y_tr, sub_seed, x_val=cal_x, y_val=cal_y, family=family, tune_internal=tune_internal
+        )
         row = {
             **meta,
             "evaluation_split": "test",

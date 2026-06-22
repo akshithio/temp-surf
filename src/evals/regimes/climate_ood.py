@@ -44,6 +44,7 @@ def iter_splits(y, groups, *, seed, holdouts=None, n_folds=None, **_):
             continue  # off-grid / coordinate-less samples are not a deployment domain
         try:
             train, val, test, _train_val = make_strict_holdout_splits(y, groups, target, seed)
-        except ValueError:
+        except ValueError as exc:
+            print(f"   !! climate_ood: Köppen zone {target!r} dropped ({exc})", flush=True)
             continue
         yield Split(f"koppen_{target}", train, test, val)

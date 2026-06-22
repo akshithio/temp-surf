@@ -1,9 +1,9 @@
 """Benchmark: BreizhCrops crop-type classification (Brittany, Sentinel-2 L1C, 9 classes).
 
 Multiclass crop-type classification over NUTS-3 regions of Brittany, France. Geographic
-holdout reproduces the BreizhCrops paper's split direction: the held-out region is the
-test set (``frh04`` in the paper) and the remaining regions train. ``groups`` is the
-region, so holding out ``frh04`` matches the published evaluation.
+holdout reproduces the BreizhCrops paper's published fold: ``frh04`` is the test region,
+``frh03`` (``VAL_HOLDOUT``) is the validation region, and the remaining regions train.
+``groups`` is the region.
 
 Parcel coordinates are recovered from BreizhCrops' own parcel shapefile (see
 ``_bz_parcel_latlon``) so location-aware encoders receive a real lat/lon rather than a
@@ -26,7 +26,11 @@ from dataio.get_input import (
 
 BENCHMARK = "breizhcrops"
 LABEL_KIND = "multiclass"
-HOLDOUTS = ["frh04"]  # paper's test region (train on frh01/frh02/frh03/belle-ile)
+HOLDOUTS = ["frh04"]  # paper's TEST region
+# Paper fold: frh01+frh02 train, frh03 validation, frh04 test. VAL_HOLDOUT makes frh03 the
+# validation region (not a random carve), so geographic_ood reproduces the published split
+# instead of scattering frh03/belle-ile into training.
+VAL_HOLDOUT = "frh03"
 # Region holdout is the only OOD axis here: crop-type task (phenology is label-confounded),
 # a single year 2017 (no forward-time split), and although parcels now carry real coordinates,
 # all of Brittany sits in one Köppen zone (no climate contrast to hold out).
@@ -37,7 +41,10 @@ SPLIT_REGIMES = ["random_id", "geographic_ood"]
 BZ_X_BANDS = ["B1", "B10", "B11", "B12", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9"]
 BZ_S2_KEEP = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12"]
 BZ_S2_BANDS = BZ_S2_KEEP + ["NDVI"]
-BZ_REGIONS = ["frh01", "frh02", "frh03", "frh04", "belle-ile"]
+# Only the four FRH NUTS-3 regions, matching the published BreizhCrops fold (frh01+frh02 train,
+# frh03 val, frh04 test). belle-ile is deliberately EXCLUDED: including it would put it in the
+# training pool and break the published-anchor comparison.
+BZ_REGIONS = ["frh01", "frh02", "frh03", "frh04"]
 BZ_TIMESTEPS = 12
 
 

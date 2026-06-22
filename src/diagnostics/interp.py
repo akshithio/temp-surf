@@ -118,8 +118,17 @@ def subset_benchmark(bench: Any, indices: Iterable[int]) -> Any:
         "labels",
         "groups",
         "latlon",
+        "years",  # per-sample too -> must be subset/reordered with the rest, not left full-length
     }
-    updates = {name: np.asarray(getattr(bench, name))[idx].copy() for name in sample_fields if hasattr(bench, name)}
+    updates = {}
+    for name in sample_fields:
+        val = getattr(bench, name, None)
+        if val is None:
+            continue
+        arr = np.asarray(val)
+        if arr.ndim == 0:  # scalar / unset placeholder -> nothing to subset
+            continue
+        updates[name] = arr[idx].copy()
     if is_dataclass(bench):
         valid = {f.name for f in fields(bench)}
         return replace(bench, **{k: v for k, v in updates.items() if k in valid})
@@ -330,13 +339,12 @@ def write_importance(
     path = Path(output_path) if output_path is not None else DEFAULT_IMPORTANCE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     mode = "a" if append and path.exists() else "w"
+    # Fixed schema so the header never drifts: a later append with extra keys would otherwise
+    # misalign against the header written on the first (mode="w") call. Unexpected keys are
+    # dropped (add them to OUTPUT_COLUMNS deliberately if a new column is wanted).
     columns = list(OUTPUT_COLUMNS)
-    for row in rows:
-        for key in row:
-            if key not in columns:
-                columns.append(key)
     with path.open(mode, newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=columns)
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
         if mode == "w":
             writer.writeheader()
         writer.writerows(rows)

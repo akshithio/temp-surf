@@ -196,7 +196,9 @@ class TesseraModel:
                 "tessera_v1_1_mpc_model.pt and set TESSERA_WEIGHTS or weights_path."
             )
         model = TesseraV11Model()
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        # weights_only=True blocks arbitrary code execution during unpickling (the checkpoint is a
+        # plain dict of tensors). Gate any future full-pickle checkpoint behind a verified checksum.
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         state = checkpoint.get("model_state", checkpoint.get("model_state_dict", checkpoint))
         cleaned = {}
         for key, value in state.items():

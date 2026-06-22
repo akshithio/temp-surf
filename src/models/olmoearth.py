@@ -77,6 +77,7 @@ _BENCH_TO_OLMOEARTH_IDX: dict[str, int] = {
 _REPO = Path(__file__).resolve().parents[2]
 _INPUT = Path(os.environ.get("ROBUSTNESS_INPUT", _REPO / "data" / "input"))
 OLMOEARTH_HF_REPO = "allenai/OlmoEarth-v1_1-Base"
+OLMOEARTH_HF_REVISION = "4ef31d45f80c1d4fcce18f9cde40c1b5e4d96cf4"  # immutable commit (reproducible weights)
 DEFAULT_OLMOEARTH_WEIGHTS = _INPUT / "models" / "olmoearth-v1_1-base"
 
 
@@ -94,6 +95,7 @@ def _default_load_model(weights_path: str | Path | None = None) -> Any:
     if not (model_dir / "config.json").exists() or not (model_dir / "weights.pth").exists():
         snapshot_download(
             repo_id=OLMOEARTH_HF_REPO,
+            revision=OLMOEARTH_HF_REVISION,
             local_dir=model_dir,
             allow_patterns=["config.json", "weights.pth"],
         )

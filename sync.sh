@@ -85,6 +85,9 @@ conda config --append envs_dirs "$REMOTE_SCRATCH/envs" 2>/dev/null || true  # so
 conda activate robustness
 echo "python: $(python --version)  uv: $(uv --version)  ruff: $(ruff --version)"
 uv sync --frozen
+# presto is installed --no-deps (upstream pins torch==2.0/numpy==1.23.5/einops==0.6.0/... and would
+# wreck the resolved env); the project already provides the deps presto needs at runtime.
+uv pip install --no-deps "git+https://github.com/nasaharvest/presto.git@11e207a668a34336ced1d8e492a1bd5849b96c4a"
 rm -rf src/*.egg-info *.egg-info 2>/dev/null || true  # editable install works via the .pth; don't leave egg-info behind
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.device_count())"
 echo "ENV READY. Activate with: source $MF/etc/profile.d/conda.sh && conda activate robustness"

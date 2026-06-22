@@ -7,11 +7,13 @@ so any code change self-invalidates the cache.  The caller never has to clear
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import importlib
 import inspect
 import os
 import pickle
+import re
 from pathlib import Path
 from typing import Any
 
@@ -68,14 +70,33 @@ def _hash_str(s: str) -> str:
 
 
 def _input_fingerprint(bench_dir: Path) -> str:
-    """Cheap (non-recursive) fingerprint of a dataset dir -- folds DATA re-staging
-    into the key. Catches added/removed/renamed top-level entries and mtime bumps
-    (what rsync/unzip do); a surgical in-place edit of one deep file may not bump it."""
+    """Fingerprint a dataset dir -- folds DATA changes into the cache key.
+
+    Default (``DATA_FINGERPRINT`` unset or ``deep``): a full RECURSIVE walk hashing every
+    file's ``relpath:size:mtime``. This is automatic correctness -- it catches added/removed/
+    renamed files AND surgical in-place edits of deep files. On a local FS (cranberry scratch,
+    where the real runs happen) walking even EuroCropsML's ~700k files is a few seconds, paid
+    once per process. Over a high-latency mount (e.g. sshfs on the Mac) it is slow, so set
+    ``DATA_FINGERPRINT=top`` to fall back to the cheap top-level-only stat there. ``$DATA_VERSION``
+    (folded into ``bench_tag``) remains an explicit override on top of either mode.
+    """
     h = hashlib.sha256()
+    mode = os.environ.get("DATA_FINGERPRINT", "deep").strip().lower()
     try:
-        for e in sorted(bench_dir.iterdir(), key=lambda x: x.name):
-            st = e.stat()
-            h.update(f"{e.name}:{st.st_size}:{int(st.st_mtime)}".encode())
+        if mode == "top":
+            for e in sorted(bench_dir.iterdir(), key=lambda x: x.name):
+                st = e.stat()
+                h.update(f"{e.name}:{st.st_size}:{int(st.st_mtime)}".encode())
+        else:
+            for root, dirs, files in os.walk(bench_dir):
+                dirs.sort()
+                rel = os.path.relpath(root, bench_dir)
+                for name in sorted(files):
+                    try:
+                        st = os.stat(os.path.join(root, name))
+                        h.update(f"{rel}/{name}:{st.st_size}:{int(st.st_mtime)}".encode())
+                    except OSError:
+                        h.update(f"{rel}/{name}:<missing>".encode())
     except OSError:
         h.update(b"<missing>")
     return h.hexdigest()[:10]
@@ -86,13 +107,21 @@ def bench_tag(benchmark: str, kwargs: dict) -> str:
 
     Any change to the params, to get_input.py, to the benchmark's spec file, or to the
     staged input files yields a new tag -- so the bench pickle AND the embeddings derived
-    from it self-invalidate.
+    from it self-invalidate. The data hash is recursive by default (see ``_input_fingerprint``);
+    ``$DATA_VERSION`` is an additional explicit override folded into the tag.
     """
     params = "_".join(f"{k}-{kwargs[k]}" for k in sorted(kwargs)) or "default"
     spec_path = REPO / "src" / (BENCHMARK_MODULES[benchmark].replace(".", "/") + ".py")
     code = _hash_files(BENCH_SRC, spec_path)
     data = _input_fingerprint(INPUT_ROOT / benchmark)
-    return f"{params}__code-{code}__data-{data}"
+    data_version = os.environ.get("DATA_VERSION", "").strip()
+    suffix = f"__dv-{data_version}" if data_version else ""
+    # STRICT_DATA changes which samples survive loading (corrupt/missing are excluded vs raise),
+    # so it is part of the assembled-benchmark identity -- otherwise a permissive cache would be
+    # silently reused by a strict run, skipping the strict check entirely.
+    if os.environ.get("STRICT_DATA", "").strip().lower() not in ("", "0", "false", "no"):
+        suffix += "__strict"
+    return f"{params}__code-{code}__data-{data}{suffix}"
 
 
 def cached_bench(benchmark: str, tag: str, **kwargs):
@@ -129,20 +158,112 @@ def build_model(name: str, **kwargs) -> Any:
 
 
 def _model_source_files(model_name: str) -> list[Path]:
+    """Wrapper source + the model-specific util modules it imports (e.g. galileoutil,
+    agrifmutils), so a change to transitive model code also invalidates the embedding cache."""
     mod_src = REPO / "src" / (MODELS[model_name][0].replace(".", "/") + ".py")
-    return [mod_src]
+    files = [mod_src]
+    try:
+        text = mod_src.read_text()
+    except OSError:
+        return files
+    for name in re.findall(r"utils\.([A-Za-z_]\w*?util[s]?)\b", text):
+        util_path = REPO / "src" / "utils" / f"{name}.py"
+        if util_path.exists() and util_path not in files:
+            files.append(util_path)
+    return files
+
+
+# Per-model checkpoint identity, folded into the embedding key so a weights change invalidates
+# stale embeddings. It MUST be download-independent (identical before and after an HF lazy
+# download), or a gen run (weights absent) and a later probe run (weights present) would key
+# differently and never hit the cache -- which is why there is no legacy fallback.
+#   * HF models  -> the pinned repo/filename/variant string. Changing the intended weights means
+#                   editing the wrapper, already captured by the wrapper-source hash.
+#   * local models -> size+mtime of the resolved file, so replacing the weights in place (the
+#                   exact stale-reuse scenario) yields a new key.
+# The HF pin includes the IMMUTABLE commit revision (must match the wrapper's *_HF_REVISION),
+# so a moved branch / re-uploaded weights file changes the key. value: (kind, env_var, default_rel, hf_pin)
+# The HF pin includes the weights revision AND (for pip-installed external model code: presto,
+# olmoearth) the pinned package revision, so changing either the weights or the model CODE
+# invalidates the embedding key. presto code commit must match sync.sh; olmoearth must match the
+# [tool.uv.sources] olmoearth-pretrain rev in pyproject.toml. (galileo runs on local galileoutil,
+# already covered by the model-source hash.)
+_CHECKPOINT_SPECS: dict[str, tuple[str, str | None, str | None, str | None]] = {
+    "presto": ("hf", None, None,
+               "torchgeo/presto@44835fba5116ed5f000d5eea3973655985bf765b:model-f317d103.pth"
+               "+code@11e207a668a34336ced1d8e492a1bd5849b96c4a"),
+    "olmoearth": ("hf", None, None,
+                  "allenai/OlmoEarth-v1_1-Base@4ef31d45f80c1d4fcce18f9cde40c1b5e4d96cf4"
+                  "+code@0e11e448946f8ca259593435194e9faa14a58c77"),
+    "galileo": ("hf", None, None, "nasaharvest/galileo@f039dd5dde966a931baeda47eb680fa89b253e4e:base"),
+    "agrifm": ("local", "AGRIFM_WEIGHTS", "models/agrifm/AgriFM.pth", None),
+    "tessera": ("local", "TESSERA_WEIGHTS", "models/tessera/tessera_v1_1_mpc_model.pt", None),
+    "raw": ("raw", None, None, None),  # no checkpoint; identity is the RAW_MODE featurization
+}
+
+
+@functools.lru_cache(maxsize=128)
+def _hash_file_content(path_str: str, size: int, mtime_ns: int) -> str:
+    """Whole-file sha (size + bytes), memoised by (path, size, mtime) so a multi-GB checkpoint is
+    read at most once per process even though the fingerprint is requested many times (per
+    benchmark, and again for the run signature)."""
+    h = hashlib.sha256()
+    h.update(str(size).encode())
+    with open(path_str, "rb") as f:
+        for block in iter(lambda: f.read(8 << 20), b""):  # 8 MiB blocks
+            h.update(block)
+    return h.hexdigest()[:16]
+
+
+def _local_weight_id(path: Path) -> str:
+    """Full-content id of a local checkpoint: fully immutable (any byte change -> new id)."""
+    if path.is_dir():
+        files = sorted(p for p in path.rglob("*") if p.is_file())
+        return _hash_str("|".join(f"{f.relative_to(path)}:{_local_weight_id(f)}" for f in files))
+    st = path.stat()
+    return _hash_file_content(str(path), st.st_size, st.st_mtime_ns)
+
+
+# Checkpoints live under the INPUT base (data/input/models/...), NOT under INPUT_ROOT, which
+# points at data/input/benchmarks. Resolve them against the base so the default agrifm/tessera
+# paths match the wrappers' own resolution (otherwise the fingerprint stats a nonexistent path
+# and weight replacement never invalidates).
+_INPUT_BASE = INPUT_ROOT.parent
+
+
+def _checkpoint_fingerprint(model_name: str) -> str:
+    """Download-independent identity of a model's checkpoint, or '' if it has none."""
+    spec = _CHECKPOINT_SPECS.get(model_name)
+    if not spec:
+        return ""
+    kind, env_name, default_rel, hf_pin = spec
+    if kind == "hf":
+        return _hash_str(f"hf:{hf_pin}")[:10]
+    if kind == "raw":  # raw baseline has no weights; its output depends on the featurization mode
+        return _hash_str(f"raw:{os.environ.get('RAW_MODE', 'flatten')}")[:10]
+    if kind == "local":
+        env_val = os.environ.get(env_name) if env_name else None
+        path = Path(env_val).expanduser() if env_val else _INPUT_BASE / default_rel
+        if not path.exists():
+            return _hash_str(f"local-missing:{path}")[:10]  # stable even before the file is staged
+        return _hash_str(f"local:{path.name}:{_local_weight_id(path)}")[:10]
+    return ""
+
+
+def _emb_sig(bench: Any, model_name: str, tag: str) -> str:
+    base = f"n{bench.n_samples}_b{_hash_str(tag)}_e{_hash_files(*_model_source_files(model_name))}"
+    fp = _checkpoint_fingerprint(model_name)
+    return f"{base}_w{fp}" if fp else base
 
 
 def embedding_cache_path(bench: Any, benchmark: str, model_name: str, tag: str) -> Path:
-    """Path for one benchmark-level frozen embedding matrix."""
-    sig = f"n{bench.n_samples}_b{_hash_str(tag)}_e{_hash_files(*_model_source_files(model_name))}"
-    return EMBEDDINGS_DIR / benchmark / model_name / sig / "baseline.npy"
+    """Checkpoint-aware path for one benchmark-level frozen embedding matrix."""
+    return EMBEDDINGS_DIR / benchmark / model_name / _emb_sig(bench, model_name, tag) / "baseline.npy"
 
 
 def dense_embedding_cache_dir(bench: PastisBenchmark, benchmark: str, model_name: str, tag: str) -> Path:
-    """Root directory for one dense frozen-feature tile cache."""
-    sig = f"n{bench.n_samples}_b{_hash_str(tag)}_e{_hash_files(*_model_source_files(model_name))}"
-    return EMBEDDINGS_DIR / benchmark / model_name / sig / "baseline"
+    """Checkpoint-aware root directory for one dense frozen-feature tile cache."""
+    return EMBEDDINGS_DIR / benchmark / model_name / _emb_sig(bench, model_name, tag) / "baseline"
 
 
 def load_cached_embeddings(bench: Any, benchmark: str, model_name: str, tag: str) -> np.ndarray:
@@ -157,12 +278,32 @@ def load_cached_embeddings(bench: Any, benchmark: str, model_name: str, tag: str
 
 
 def require_dense_cache(bench: PastisBenchmark, benchmark: str, model_name: str, tag: str) -> Path:
-    """Return an existing dense tile cache root, failing if it has not been built."""
+    """Return an existing dense tile cache root, failing if it is absent OR INCOMPLETE.
+
+    Validates the EXACT expected set of tile IDs (every patch × every subtile) -- both the
+    feature and the label file must exist for each. A bare count would let a missing expected
+    tile be masked by an extra stale one; matching identities catches that.
+    """
     root = dense_embedding_cache_dir(bench, benchmark, model_name, tag)
-    if not root.exists() or not any(root.glob("fold_*/*.labels.npy")):
+    if not root.exists():
         raise MissingEmbeddingCache(
             f"Dense embedding cache not found for {model_name}/{benchmark}: {root}. "
             "Run with RUN_STAGES including 'gen_embeddings' first."
+        )
+    tiles_per_axis = 128 // bench.tile_size
+    missing: list[str] = []
+    for patch in bench.patches:
+        fold_dir = root / f"fold_{patch.fold}"
+        for r in range(tiles_per_axis):
+            for c in range(tiles_per_axis):
+                tile_id = f"{patch.patch_id}_{r}_{c}"
+                if not ((fold_dir / f"{tile_id}.npy").exists() and (fold_dir / f"{tile_id}.labels.npy").exists()):
+                    missing.append(tile_id)
+    if missing:
+        raise MissingEmbeddingCache(
+            f"Dense cache INCOMPLETE for {model_name}/{benchmark}: {len(missing)} expected tiles "
+            f"are missing a feature/label file in {root} (e.g. {missing[:3]}). Extraction was "
+            "interrupted -- re-run RUN_STAGES with 'gen_embeddings'."
         )
     return root
 
@@ -191,11 +332,12 @@ def extract_and_cache(
         n_samples=bench.n_samples,
         n_features=model.embedding_dim,
     )
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "wb") as f:
-        np.save(f, arr.astype(EMB_DTYPE, copy=False))
+    arr = arr.astype(EMB_DTYPE, copy=False)  # cache dtype; round BEFORE returning so a single-process
+    tmp = path.with_name(path.name + ".tmp")  # run probes on the exact same values a two-stage (load
+    with open(tmp, "wb") as f:                 # from cache) run would -- no fp16-vs-fp32 drift.
+        np.save(f, arr)
     os.replace(tmp, path)
-    return arr
+    return arr.astype(np.float32, copy=False)
 
 
 def extract_dense_and_cache(
