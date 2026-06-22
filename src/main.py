@@ -119,26 +119,35 @@ def _effective_n_jobs(embeddings: dict[str, np.ndarray]) -> int:
     return requested
 
 
-def _run_signature(model_name: str, tag: str, split_regimes) -> str:
+def _run_signature(model_name: str, tag: str, split_regimes, seeds, enc_kwargs) -> str:
     """Fingerprint of everything that defines this experiment's results: the assembled-benchmark
-    tag (params + loader code + staged data), the model checkpoint, the probe + ORCHESTRATION +
-    REGIME source code, the seeds, the effective regimes, MAX_SAMPLES, and MAX_DENSE_PIXELS."""
+    tag (params + loader code + staged data), the model checkpoint AND wrapper/util source, the
+    probe + ORCHESTRATION + REGIME source code, the ACTUAL seeds, the effective regimes,
+    MAX_SAMPLES, MAX_DENSE_PIXELS, and result-defining encoder kwargs (e.g. a custom weights path;
+    ``device`` excluded -- it doesn't change the numbers)."""
     src = cacheutils.REPO / "src"
     code = cacheutils._hash_files(
         src / "evals" / "probes.py",
         src / "evals" / "evals.py",
         src / "main.py",
         src / "utils" / "ioutils.py",
+        src / "utils" / "cacheutils.py",  # model construction, embedding dtype, extraction, cache behavior
+        *cacheutils._model_source_files(model_name),  # model wrapper + its util modules
         *sorted((src / "evals" / "regimes").glob("*.py")),
     )
+    enc = {k: v for k, v in sorted(enc_kwargs.items()) if k != "device"}
     parts = [
         f"tag={tag}",
-        f"ckpt={cacheutils._checkpoint_fingerprint(model_name)}",
+        # Fingerprint the EFFECTIVE checkpoint (honoring a weights_path override) so a same-path
+        # content change invalidates results, and so a valid override doesn't read the (possibly
+        # inaccessible) default checkpoint.
+        f"ckpt={cacheutils._checkpoint_fingerprint(model_name, enc_kwargs.get('weights_path'))}",
         f"probes={ACTIVE_PROBES}",
-        f"seeds={SEEDS}",
+        f"seeds={list(seeds)}",
         f"regimes={sorted(split_regimes)}",
         f"max_samples={MAX_SAMPLES}",
         f"max_dense_pixels={MAX_DENSE_PIXELS}",
+        f"enc={enc}",
         f"code={code}",
     ]
     return cacheutils._hash_str("|".join(map(str, parts)))
@@ -154,10 +163,11 @@ def _check_run_signature(results_dir, signature: str) -> None:
     rows_path = results_dir / "probe_results.jsonl"
     if sig_path.exists():
         existing = sig_path.read_text().strip()
-        if existing and existing != signature:
+        if existing != signature:  # ANY difference incl. empty (a crashed/corrupt publish) is refused
             raise RuntimeError(
-                f"Refusing to resume {results_dir}: produced by a DIFFERENT experiment configuration "
-                f"(signature {existing[:10]} != {signature[:10]}). Use OVERWRITE_MODE='override' or remove it."
+                f"Refusing to resume {results_dir}: signature {existing[:10]!r} != {signature[:10]!r} "
+                "(different experiment config, or a corrupt/partial signature). Use OVERWRITE_MODE='override' "
+                "or remove the directory."
             )
     elif rows_path.exists() and rows_path.stat().st_size > 0:
         raise RuntimeError(
@@ -167,11 +177,38 @@ def _check_run_signature(results_dir, signature: str) -> None:
         )
 
 
+def _budget_row_key(r):
+    """Budget-level identity (scope-agnostic) of a result/prediction row."""
+    return (r.get("seed"), r.get("split_regime"), r.get("holdout"), r.get("method"),
+            r.get("probe_family"), r.get("budget_type"), r.get("label_budget"))
+
+
+def _prune_partial_budgets(rows, rows_path, preds_path, rerun_keys):
+    """Remove all rows/predictions for budgets being regenerated, rewriting the jsonl logs, so a
+    surviving partial scope (e.g. a budget-0 ``held_out`` row whose ``full`` row was lost to a
+    crash) isn't double-counted when the budget reruns. Returns the pruned in-memory rows."""
+    if not rerun_keys:
+        return rows
+    kept = [r for r in rows if _budget_row_key(r) not in rerun_keys]
+    if len(kept) != len(rows):
+        rows_path.unlink(missing_ok=True)
+        IOU.append_jsonl(rows_path, kept)
+    preds = IOU.read_jsonl(preds_path)
+    kept_preds = [p for p in preds if _budget_row_key(p) not in rerun_keys]
+    if len(kept_preds) != len(preds):
+        preds_path.unlink(missing_ok=True)
+        IOU.append_jsonl(preds_path, kept_preds)
+    return kept
+
+
 def _publish_run_signature(results_dir, signature: str) -> None:
-    """Write the signature AFTER any override deletion, so a crash mid-override can't leave a
-    matching signature next to stale rows."""
+    """Write the signature ATOMICALLY (tmp + os.replace), AFTER any override deletion -- so a crash
+    mid-publish can't leave a half-written signature that would later be adopted."""
     results_dir.mkdir(parents=True, exist_ok=True)
-    (results_dir / "run_signature.txt").write_text(signature)
+    sig_path = results_dir / "run_signature.txt"
+    tmp = sig_path.with_name(sig_path.name + ".tmp")
+    tmp.write_text(signature)
+    os.replace(tmp, sig_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -400,9 +437,11 @@ def _iter_splits(split_regime, bench, y, holdouts, seed, val_group=None):
         )
     n_splits = 0
     yielded_labels: set[str] = set()
+    yielded_domains: set[str] = set()
     for split in regime.iter_splits(y, domains, seed=seed, holdouts=holdouts, val_group=val_group):
         n_splits += 1
         yielded_labels.add(str(split.label))
+        yielded_domains.add(str(getattr(split, "domain", None) or split.label))
         yield split.label, split.train, split.val, split.test, domains, regime.HAS_TARGET, regime.GROUP_KIND
     if n_splits == 0:
         labels = sorted({str(d) for d in domains})
@@ -418,6 +457,16 @@ def _iter_splits(split_regime, bench, y, holdouts, seed, val_group=None):
         if missing:
             _regime_problem(
                 bench_name, split_regime, f"curated holdout(s) dropped (no valid split): {missing}"
+            )
+    elif getattr(regime, "LEAVE_ONE_DOMAIN_OUT", False):
+        # A leave-one-domain-out regime (climate/phenology) must yield a split for EVERY discovered
+        # (non-unknown) domain. A domain dropped because it is degenerate/one-class still leaves a
+        # hole in the matrix -> surface it so STRICT_REGIMES catches the partial case.
+        attempted = {str(d) for d in domains if str(d) not in ("unknown", "nan")}
+        missing = sorted(attempted - yielded_domains)
+        if missing:
+            _regime_problem(
+                bench_name, split_regime, f"domain(s) dropped (no valid split): {missing}"
             )
 
 
@@ -467,7 +516,7 @@ def run_segmentation(benchmark_name, model_name, seeds, max_samples, split_regim
     perf.reset()
     bench = cacheutils.cached_bench(bench_mod.BENCHMARK, tag, **bench_kwargs)
     if gen_embeddings:
-        emb_dir = cacheutils.extract_dense_and_cache(
+        cacheutils.extract_dense_and_cache(
             bench,
             bench_mod.BENCHMARK,
             model_name,
@@ -475,14 +524,20 @@ def run_segmentation(benchmark_name, model_name, seeds, max_samples, split_regim
             overwrite=OVERWRITE_MODE,
             **enc_kwargs,
         )
-    else:
-        emb_dir = cacheutils.require_dense_cache(bench, bench_mod.BENCHMARK, model_name, tag)
+    # Validate the dense cache before probing REGARDLESS of how it was produced: the gen path can
+    # leave stale extra tiles from a previous descriptor, and require_dense_cache rejects both
+    # missing and unexpected tiles (the bare extract path skipped this check).
+    emb_dir = (
+        cacheutils.require_dense_cache(bench, bench_mod.BENCHMARK, model_name, tag, enc_kwargs.get("weights_path"))
+        if probing
+        else cacheutils.dense_embedding_cache_dir(bench, bench_mod.BENCHMARK, model_name, tag, enc_kwargs.get("weights_path"))
+    )
     results_dir = cacheutils.OUTPUT_DIR / "results" / model_name / benchmark_name
     if not probing:
         n_events = perf.write_log(results_dir / "perf.jsonl")
         print(f"  embedding stage complete; perf: {n_events} events logged", flush=True)
         return
-    signature = _run_signature(model_name, tag, split_regimes)
+    signature = _run_signature(model_name, tag, split_regimes, seeds, enc_kwargs)
     _check_run_signature(results_dir, signature)
     rows_path = results_dir / "probe_results.jsonl"
     if OVERWRITE_MODE == "override":
@@ -651,14 +706,14 @@ def run(benchmark_name, model_name, seeds, max_samples, split_regimes, run_stage
             bench, bench_mod.BENCHMARK, model_name, tag, overwrite=OVERWRITE_MODE, **enc_kwargs
         )
     else:
-        emb = cacheutils.load_cached_embeddings(bench, bench_mod.BENCHMARK, model_name, tag)
+        emb = cacheutils.load_cached_embeddings(bench, bench_mod.BENCHMARK, model_name, tag, enc_kwargs.get("weights_path"))
 
     results_dir = cacheutils.OUTPUT_DIR / "results" / model_name / benchmark_name
     if not probing:
         n_events = perf.write_log(results_dir / "perf.jsonl")
         print(f"  embedding stage complete; perf: {n_events} events logged", flush=True)
         return
-    signature = _run_signature(model_name, tag, split_regimes)
+    signature = _run_signature(model_name, tag, split_regimes, seeds, enc_kwargs)
     _check_run_signature(results_dir, signature)  # reject mismatched / unsigned-non-empty dirs
     rows_path = results_dir / "probe_results.jsonl"
     preds_path = results_dir / "predictions.jsonl"
@@ -677,9 +732,10 @@ def run(benchmark_name, model_name, seeds, max_samples, split_regimes, run_stage
     _publish_run_signature(results_dir, signature)  # publish only after stale artifacts are gone
 
     rows = IOU.read_jsonl(rows_path)
-    # Completion is tracked per ROW (down to label_budget), so a crash mid-sweep that wrote
-    # only some budgets resumes the *missing* budgets instead of treating the whole sweep as
-    # finished off a single row.
+    # Completion is tracked per ROW (down to label_budget AND evaluation_split), so a crash that
+    # wrote only some budgets/scopes resumes the *missing* ones rather than treating the whole
+    # sweep as finished off a single row. Target budget 0 emits TWO scopes (full + held_out); both
+    # must be present for it to count as done.
     done = {
         (
             r.get("seed"),
@@ -689,6 +745,7 @@ def run(benchmark_name, model_name, seeds, max_samples, split_regimes, run_stage
             r.get("probe_family"),
             r.get("budget_type"),
             r.get("label_budget"),
+            r.get("evaluation_split"),
         )
         for r in rows
     }
@@ -698,9 +755,22 @@ def run(benchmark_name, model_name, seeds, max_samples, split_regimes, run_stage
     def uses_target_flag(cls):
         return getattr(cls, "USES_TARGET", False)
 
+    def _scopes(budget_type, b):
+        if budget_type == "target":
+            return ("full", "held_out") if b == 0 else ("held_out",)
+        return (None,)  # source rows carry no evaluation_split
+
     def _missing(base, budget_type, expected):
-        """Budgets in ``expected`` with no completed row yet for this cell."""
-        return [b for b in expected if (*base, budget_type, b) not in done]
+        """Budgets in ``expected`` not yet COMPLETE for this cell (all their scopes present)."""
+        return [
+            b for b in expected
+            if not all((*base, budget_type, b, sc) in done for sc in _scopes(budget_type, b))
+        ]
+
+    # Budgets being (re)generated, keyed WITHOUT evaluation_split. A budget rerun re-emits ALL its
+    # scopes (target budget 0 -> full+held_out), so any surviving partial-scope rows for it must be
+    # pruned first or they'd be double-counted.
+    rerun_keys: set = set()
 
     for seed in seeds:
         for mname, (cls, kwargs) in build_methods(bench_mod.LABEL_KIND, seed).items():
@@ -723,6 +793,7 @@ def run(benchmark_name, model_name, seeds, max_samples, split_regimes, run_stage
                         if has_target:
                             todo = _missing(base, "target", EV.ALL_TARGET_BUDGETS)
                             if todo:
+                                rerun_keys.update((*base, "target", b) for b in todo)
                                 jobs.append(
                                     delayed(_probe_cell_target)(
                                         probe_fn_tgt,
@@ -744,6 +815,7 @@ def run(benchmark_name, model_name, seeds, max_samples, split_regimes, run_stage
                         # ---- Source-fraction sweep ----
                         todo_src = _missing(base, "source", EV.SOURCE_BUDGETS)
                         if todo_src:
+                            rerun_keys.update((*base, "source", b) for b in todo_src)
                             jobs.append(
                                 delayed(_probe_cell)(
                                     probe_fn_src,
@@ -763,6 +835,10 @@ def run(benchmark_name, model_name, seeds, max_samples, split_regimes, run_stage
                                 )
                             )
 
+    # Prune any pre-existing (partial) rows/predictions for budgets we're about to regenerate, so a
+    # surviving scope from an interrupted write isn't duplicated by the rerun.
+    rows = _prune_partial_budgets(rows, rows_path, preds_path, rerun_keys)
+
     if jobs:
         n_jobs = _effective_n_jobs(emb)
         print(f"  probe jobs={len(jobs)} n_jobs={n_jobs}", flush=True)
@@ -779,7 +855,8 @@ def run(benchmark_name, model_name, seeds, max_samples, split_regimes, run_stage
     IOU.write_csv(results_dir / "probe_results.csv", rows)
     summary = IOU.summarize_rows(
         rows,
-        keys=["model", "method", "probe_family", "split_regime", "domain_basis", "budget_type", "label_budget"],
+        keys=["model", "method", "probe_family", "split_regime", "domain_basis", "budget_type",
+              "label_budget", "evaluation_split"],
         metrics=metrics,
     )
     IOU.write_csv(results_dir / "summary.csv", summary)

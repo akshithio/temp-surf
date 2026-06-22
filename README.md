@@ -123,11 +123,25 @@ leave-one-spatial-fold-out. Both log `domain_basis=geography`.
 
 | Type | Levels | Meaning |
 |---|---|---|
-| Target budgets | `[5, 10, 25, 50]` | Absolute count of target-region labels added to OOD training. |
+| Target budgets | `[0, 5, 10, 25, 50, -1]` | `0` = zero-shot OOD; `5..50` = absolute count of target labels added (nested); `-1` = target-ID oracle (trains on the 80% target pool). |
 | Source budgets | `[0.05, 0.10, 0.25, 1.00]` | Fraction of source training data used. |
 
-Each budget level fits a calibrated logistic-regression probe and scores the
-metrics on the test set.
+Each budget level fits a calibrated probe and scores the metrics on the test set.
+
+**Target evaluation scope (`evaluation_split`).** The target sweep draws ONE fixed 80/20
+target split (a nested ordering of the 80% pool, a fixed 20% test). Every target-budget row
+is tagged with an `evaluation_split`:
+
+- `held_out` — scored on the fixed 20% test. Used by all budgets so the few-shot curve and the
+  inherent-difficulty decomposition (zero-shot vs the `-1` oracle) compare like-for-like on the
+  same samples.
+- `full` — emitted only for budget `0`: zero-shot scored on the **whole** target domain. This is
+  the **primary deployment OOD** estimand: `compute_deltas` reads the `full` rows for `ood` /
+  `delta` / `ood_worst_region` / the secondary `ood_<axis>`, and the `held_out` rows for
+  `ood_matched` / `target_id` / `adjusted_delta`.
+
+Downstream tables (`summary.csv`, the resume completion key) key on `evaluation_split`, so the
+two scopes are never averaged together.
 
 **Metric roles**
 

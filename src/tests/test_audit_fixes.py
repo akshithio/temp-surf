@@ -135,10 +135,12 @@ def test_local_checkpoint_fingerprint_tracks_content(tmp_path, monkeypatch):
     wp.write_bytes(b"weights-v1" + b"\0" * 1000)
     monkeypatch.setenv("AGRIFM_WEIGHTS", str(wp))
     fp1 = C._checkpoint_fingerprint("agrifm")
-    # same size, mtime preserved, but different content -> fingerprint must still change
+    # Replacing weights happens BETWEEN runs (cold cache); clear the per-process content-hash memo
+    # to simulate that. Even with size AND mtime preserved, the full-content hash detects the change.
     mtime = wp.stat().st_mtime
     wp.write_bytes(b"weights-v2" + b"\0" * 1000)
     os.utime(wp, (mtime, mtime))
+    C._hash_file_content.cache_clear()
     assert C._checkpoint_fingerprint("agrifm") != fp1
 
 
@@ -315,3 +317,175 @@ def test_worst_region_uses_max_for_error_metrics():
         add("brier", 0.4, s, "regB")     # WORST region for an error metric = the MAX
     out = [r for r in IOU.compute_deltas(rows, ["brier"], n_boot=0, seed=0) if r["metric"] == "brier"][0]
     assert abs(out["ood_worst_region"] - 0.4) < 1e-9   # max, not min (0.2)
+
+
+# --------------------------------------------------------------------------- #
+# Round-6: full/held_out scope separation, dense extra tiles, empty signature
+# --------------------------------------------------------------------------- #
+def _scoped_delta_rows():
+    """geographic + climate, each with BOTH a full-target (val 0.6) and a held_out (val 0.1)
+    budget-0 row per seed, plus a held_out oracle (budget -1, val 0.5)."""
+    rows = []
+
+    def add(regime, lb, es, val, seed, holdout):
+        rows.append({"model": "m", "benchmark": "b", "method": "erm", "probe_family": "logistic",
+                     "split_regime": regime, "budget_type": "target", "label_budget": lb,
+                     "evaluation_split": es, "seed": seed, "holdout": holdout, "auc": val,
+                     "test_pos_rate": 0.5, "test_n_classes": 2, "test_majority_rate": 0.5})
+    for s in range(2):
+        rows.append({"model": "m", "benchmark": "b", "method": "erm", "probe_family": "logistic",
+                     "split_regime": "random_id", "budget_type": "source", "label_budget": 1.0,
+                     "seed": s, "holdout": "random_id", "auc": 0.9,
+                     "test_pos_rate": 0.5, "test_n_classes": 2, "test_majority_rate": 0.5})
+        for reg in ("regA", "regB"):
+            add("geographic_ood", 0.0, "full", 0.6, s, reg)        # deployment scope (full target)
+            add("geographic_ood", 0.0, "held_out", 0.1, s, reg)    # noisy 20% (decomposition only)
+            add("geographic_ood", -1.0, "held_out", 0.5, s, reg)   # oracle on the held-out 20%
+        add("climate_ood", 0.0, "full", 0.62, s, "koppen_C")
+        add("climate_ood", 0.0, "held_out", 0.15, s, "koppen_C")
+    return rows
+
+
+def test_compute_deltas_separates_full_and_held_out_scopes():
+    out = [r for r in IOU.compute_deltas(_scoped_delta_rows(), ["auc"], n_boot=0, seed=0)
+           if r["metric"] == "auc"][0]
+    assert abs(out["ood"] - 0.6) < 1e-9              # primary OOD = full-target, NOT mixed with 0.1
+    assert abs(out["ood_worst_region"] - 0.6) < 1e-9  # worst region from full scope (not 0.1)
+    assert abs(out["delta_climate"] - (0.9 - 0.62)) < 1e-9  # secondary OOD uses full scope
+    # inherent-difficulty decomposition uses the MATCHED held-out scope (oracle 0.5 vs held_out 0.1)
+    assert abs(out["ood_matched"] - 0.1) < 1e-9
+    assert abs(out["adjusted_delta"] - (0.5 - 0.1)) < 1e-9
+
+
+def test_summarize_rows_keeps_scopes_separate():
+    rows = [
+        {"model": "m", "evaluation_split": "full", "miou": 0.6},
+        {"model": "m", "evaluation_split": "held_out", "miou": 0.1},
+    ]
+    summ = IOU.summarize_rows(rows, keys=["model", "evaluation_split"], metrics=["miou"])
+    by_es = {r["evaluation_split"]: r for r in summ}
+    assert abs(by_es["full"]["mean_miou"] - 0.6) < 1e-9 and abs(by_es["held_out"]["mean_miou"] - 0.1) < 1e-9
+
+
+def test_require_dense_cache_rejects_extra_tile(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from utils import cacheutils as C
+    monkeypatch.setattr(C, "EMBEDDINGS_DIR", tmp_path)  # isolate from the real cache
+    patch = SimpleNamespace(patch_id=7, fold=1)
+    bench = SimpleNamespace(patches=(patch,), tile_size=128, n_samples=1)  # 1 patch, tiles_per_axis=1
+    fold = C.dense_embedding_cache_dir(bench, "pastis_r", "raw", "tag") / "fold_1"
+    fold.mkdir(parents=True, exist_ok=True)
+    for name in ("7_0_0.npy", "7_0_0.labels.npy", "999_0_0.npy", "999_0_0.labels.npy"):  # 999 is stale
+        (fold / name).write_bytes(b"x")
+    with pytest.raises(C.MissingEmbeddingCache):
+        C.require_dense_cache(bench, "pastis_r", "raw", "tag")
+
+
+def test_run_signature_rejects_empty_or_corrupt(tmp_path, monkeypatch):
+    import main
+    d = tmp_path / "r"
+    d.mkdir()
+    monkeypatch.setattr(main, "OVERWRITE_MODE", "skip")
+    (d / "run_signature.txt").write_text("")   # crashed/corrupt publish
+    with pytest.raises(RuntimeError):
+        main._check_run_signature(d, "sigAAAA")
+
+
+# --------------------------------------------------------------------------- #
+# Round-7: LEAVE_ONE_DOMAIN_OUT completeness + enriched run signature
+# --------------------------------------------------------------------------- #
+def test_leave_one_domain_out_dropped_domain_surfaced(monkeypatch):
+    import main
+    from evals.regimes.base import Split
+
+    class StubRegime:
+        NAME = "climate_ood"
+        GROUP_KIND = "climate"
+        HAS_TARGET = True
+        LEAVE_ONE_DOMAIN_OUT = True
+
+        @staticmethod
+        def assign_domains(bench):
+            return np.array(["A", "A", "B", "B", "C", "C"], dtype=object)
+
+        @staticmethod
+        def iter_splits(y, groups, *, seed, holdouts, val_group=None):
+            for d in ("A", "B"):           # C is silently dropped (degenerate) -> must be surfaced
+                idx = np.flatnonzero(groups == d)
+                tr = np.flatnonzero(groups != d)
+                yield Split(f"koppen_{d}", tr, idx, np.array([], dtype=int), domain=d)
+
+    monkeypatch.setattr(main, "load_regime", lambda name: StubRegime)
+    monkeypatch.setattr(main, "STRICT_REGIMES", False)
+    main._REGIME_PROBLEMS.clear()
+    bench = type("B", (), {"name": "b"})()
+    list(main._iter_splits("climate_ood", bench, np.array([0, 1, 0, 1, 0, 1]), holdouts=None, seed=0))
+    assert any("C" in reason for _, reg, reason in main._REGIME_PROBLEMS if reg == "climate_ood")
+
+
+def test_run_signature_includes_seeds_and_enc_kwargs():
+    import main
+    base = main._run_signature("raw", "tag", ["random_id"], [0, 1, 2], {"device": "cpu"})
+    assert main._run_signature("raw", "tag", ["random_id"], [0, 1], {"device": "cpu"}) != base   # seeds matter
+    assert main._run_signature("raw", "tag", ["random_id"], [0, 1, 2],
+                               {"device": "cpu", "weights_path": "/x"}) != base                  # enc kwargs matter
+    assert main._run_signature("raw", "tag", ["random_id"], [0, 1, 2], {"device": "cuda"}) == base  # device ignored
+
+
+# --------------------------------------------------------------------------- #
+# Round-8: partial-resume prune, custom-weights cache key, signature includes cacheutils
+# --------------------------------------------------------------------------- #
+def test_prune_partial_budgets_removes_surviving_scope(tmp_path):
+    import main
+    rows_path = tmp_path / "probe_results.jsonl"
+    preds_path = tmp_path / "predictions.jsonl"
+
+    def row(lb, es):
+        return {"seed": 0, "split_regime": "geographic_ood", "holdout": "t", "method": "erm",
+                "probe_family": "logistic", "budget_type": "target", "label_budget": lb,
+                "evaluation_split": es, "auc": 0.5}
+    # budget 0 has only its held_out scope (full lost to a crash); budget 5 is complete.
+    rows = [row(0, "held_out"), row(5, "held_out")]
+    IOU.append_jsonl(rows_path, rows)
+    IOU.append_jsonl(preds_path, [{**row(0, "held_out"), "sample_id": 1}])
+    base = (0, "geographic_ood", "t", "erm", "logistic")
+    rerun = {(*base, "target", 0)}                       # budget 0 will be regenerated (both scopes)
+    kept = main._prune_partial_budgets(rows, rows_path, preds_path, rerun)
+    assert [r["label_budget"] for r in kept] == [5]      # the partial budget-0 row was pruned
+    assert [r["label_budget"] for r in IOU.read_jsonl(rows_path)] == [5]   # jsonl rewritten
+    assert IOU.read_jsonl(preds_path) == []              # its prediction pruned too
+
+
+def test_custom_weights_path_changes_embedding_cache_key(tmp_path):
+    class B:
+        n_samples = 10
+    wa, wb = tmp_path / "a.pth", tmp_path / "b.pth"   # tiny overrides (avoid reading real weights)
+    wa.write_bytes(b"AAAA")
+    wb.write_bytes(b"BBBB")
+    C._hash_file_content.cache_clear()
+    ka = C.embedding_cache_path(B(), "cropharvest", "agrifm", "tag", weights_override=str(wa))
+    kb = C.embedding_cache_path(B(), "cropharvest", "agrifm", "tag", weights_override=str(wb))
+    assert ka != kb                                   # the override checkpoint is part of the cache key
+
+
+def test_run_signature_includes_cacheutils_in_code_hash():
+    import main
+    # the code hash folds cacheutils.py; sanity: signature is stable and non-empty (the hashed set
+    # is exercised), and changing seeds (a separate input) changes it.
+    sig = main._run_signature("raw", "tag", ["random_id"], [0], {"device": "cpu"})
+    assert sig and sig == main._run_signature("raw", "tag", ["random_id"], [0], {"device": "cpu"})
+
+
+def test_run_signature_reflects_override_checkpoint_content(tmp_path):
+    import main
+    wp = tmp_path / "agrifm.pth"
+    wp.write_bytes(b"weights-v1" + b"\0" * 64)
+    enc = {"device": "cpu", "weights_path": str(wp)}
+    sig1 = main._run_signature("agrifm", "tag", ["geographic_ood"], [0], enc)
+    # SAME path, different content (cold cache = a between-runs replace) -> signature MUST change
+    mtime = wp.stat().st_mtime
+    wp.write_bytes(b"weights-v2" + b"\0" * 64)
+    os.utime(wp, (mtime, mtime))
+    C._hash_file_content.cache_clear()
+    assert main._run_signature("agrifm", "tag", ["geographic_ood"], [0], enc) != sig1

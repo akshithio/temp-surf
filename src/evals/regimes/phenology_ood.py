@@ -61,6 +61,9 @@ def phenology_domains(bench) -> np.ndarray:
 NAME = "phenology_ood"
 GROUP_KIND = "phenology"
 HAS_TARGET = True
+# Leave-one-domain-out: the runner enforces that every phenology domain yielded a split (a dropped
+# degenerate domain is routed through _regime_problem so STRICT catches a partial matrix).
+LEAVE_ONE_DOMAIN_OUT = True
 assign_domains = phenology_domains
 
 
@@ -72,4 +75,4 @@ def iter_splits(y, groups, *, seed, holdouts=None, n_folds=None, **_):
         except ValueError as exc:
             print(f"   !! phenology_ood: domain {holdout!r} dropped ({exc})", flush=True)
             continue
-        yield Split(holdout, train, test, val)
+        yield Split(holdout, train, test, val, domain=str(holdout))

@@ -24,6 +24,10 @@ from evals.regimes.geographic_ood import make_strict_holdout_splits
 NAME = "climate_ood"
 GROUP_KIND = "climate"
 HAS_TARGET = True
+# Leave-one-domain-out over discovered domains: the runner checks that every non-unknown domain
+# yielded a split and routes any dropped (degenerate) domain through _regime_problem so STRICT
+# catches a partial climate matrix.
+LEAVE_ONE_DOMAIN_OUT = True
 
 
 def climate_domains(bench) -> np.ndarray:
@@ -47,4 +51,4 @@ def iter_splits(y, groups, *, seed, holdouts=None, n_folds=None, **_):
         except ValueError as exc:
             print(f"   !! climate_ood: Köppen zone {target!r} dropped ({exc})", flush=True)
             continue
-        yield Split(f"koppen_{target}", train, test, val)
+        yield Split(f"koppen_{target}", train, test, val, domain=str(target))

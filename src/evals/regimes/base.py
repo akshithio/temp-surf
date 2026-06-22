@@ -23,13 +23,16 @@ class Split:
 
     ``label`` identifies the held-out domain (or fold). ``val`` may be empty when a
     regime trains on the full non-target pool and leaves threshold calibration to
-    the probe's own internal split.
+    the probe's own internal split. ``domain`` is the raw domain value held out (e.g. the
+    Köppen zone ``"C"`` behind label ``"koppen_C"``); the runner uses it to detect a
+    leave-one-domain-out regime that silently dropped a domain. Defaults to ``label``.
     """
 
     label: str
     train: np.ndarray
     test: np.ndarray
     val: np.ndarray = field(default_factory=_empty)
+    domain: str | None = None
 
 
 def geography_domains(bench) -> np.ndarray:
