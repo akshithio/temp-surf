@@ -495,16 +495,22 @@ def compute_deltas(
                 "n_id": len(id_vals), "n_ood": len(ood_vals),
                 "ood_std": float(np.std(ood_arr)), "ood_min": float(ood_arr.min()), "ood_max": float(ood_arr.max()),
             })
-            # worst-region metric: for each seed, find min across holdouts,
-            # then average over seeds.
+            # worst-region metric: for each seed, find min across holdouts, then average over seeds.
+            # Use the FULL-target zero-shot rows (the deployment scope), falling back to held_out
+            # for older results -- NEVER mix the two scopes (the held-out 20% is noisier and would
+            # masquerade as the worst region).
             _seed_holdout: dict[int, list[float]] = {}
-            for r in rows:
-                if (r.get("split_regime") == "geographic_ood" and r.get("budget_type") == "target"
-                        and _close(r.get("label_budget"), 0.0) and metric in r and r[metric] is not None
-                        and all(r.get(k) == combo[i] for i, k in enumerate(keys))):
-                    s = r.get("seed")
-                    if s is not None:
-                        _seed_holdout.setdefault(int(s), []).append(float(r[metric]))
+            for want in ("full", "held_out"):
+                for r in rows:
+                    if (r.get("split_regime") == "geographic_ood" and r.get("budget_type") == "target"
+                            and _close(r.get("label_budget"), 0.0) and metric in r and r[metric] is not None
+                            and (r.get("evaluation_split") or "held_out") == want
+                            and all(r.get(k) == combo[i] for i, k in enumerate(keys))):
+                        s = r.get("seed")
+                        if s is not None:
+                            _seed_holdout.setdefault(int(s), []).append(float(r[metric]))
+                if _seed_holdout:
+                    break
             if _seed_holdout:
                 # worst region = MIN for higher-better metrics, MAX for error metrics (brier/nll/ece)
                 pick_worst = max if metric in _LOWER_BETTER else min
@@ -535,7 +541,10 @@ def compute_deltas(
             # (previously only phenology was surfaced, so climate/temporal silently had no columns).
             for ood_regime in secondary_ood_regimes:
                 axis = ood_regime[:-4] if ood_regime.endswith("_ood") else ood_regime
-                ovals = vals(ood_regime, "target", 0.0, combo, metric)
+                # deployment scope = full-target zero-shot (fall back to held_out for old results);
+                # never average the two scopes together.
+                ovals = (vals(ood_regime, "target", 0.0, combo, metric, es="full")
+                         or vals(ood_regime, "target", 0.0, combo, metric, es="held_out"))
                 if ovals:
                     oa = np.asarray(ovals)
                     row[f"ood_{axis}"] = float(oa.mean())

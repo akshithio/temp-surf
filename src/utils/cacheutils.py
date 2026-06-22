@@ -231,8 +231,18 @@ def _local_weight_id(path: Path) -> str:
 _INPUT_BASE = INPUT_ROOT.parent
 
 
-def _checkpoint_fingerprint(model_name: str) -> str:
-    """Download-independent identity of a model's checkpoint, or '' if it has none."""
+def _checkpoint_fingerprint(model_name: str, weights_override: str | Path | None = None) -> str:
+    """Download-independent identity of a model's checkpoint, or '' if it has none.
+
+    ``weights_override`` is the EFFECTIVE weights path passed to the wrapper (e.g. via
+    ``enc_kwargs['weights_path']``); when given it takes precedence over the spec's default/env
+    resolution, so a custom checkpoint gets its own cache key instead of sharing another's.
+    """
+    if weights_override:
+        p = Path(weights_override).expanduser()
+        if p.exists():
+            return _hash_str(f"override:{p.name}:{_local_weight_id(p)}")[:10]
+        return _hash_str(f"override-missing:{p}")[:10]
     spec = _CHECKPOINT_SPECS.get(model_name)
     if not spec:
         return ""
@@ -250,25 +260,27 @@ def _checkpoint_fingerprint(model_name: str) -> str:
     return ""
 
 
-def _emb_sig(bench: Any, model_name: str, tag: str) -> str:
+def _emb_sig(bench: Any, model_name: str, tag: str, weights_override=None) -> str:
     base = f"n{bench.n_samples}_b{_hash_str(tag)}_e{_hash_files(*_model_source_files(model_name))}"
-    fp = _checkpoint_fingerprint(model_name)
+    fp = _checkpoint_fingerprint(model_name, weights_override)
     return f"{base}_w{fp}" if fp else base
 
 
-def embedding_cache_path(bench: Any, benchmark: str, model_name: str, tag: str) -> Path:
+def embedding_cache_path(bench: Any, benchmark: str, model_name: str, tag: str, weights_override=None) -> Path:
     """Checkpoint-aware path for one benchmark-level frozen embedding matrix."""
-    return EMBEDDINGS_DIR / benchmark / model_name / _emb_sig(bench, model_name, tag) / "baseline.npy"
+    return EMBEDDINGS_DIR / benchmark / model_name / _emb_sig(bench, model_name, tag, weights_override) / "baseline.npy"
 
 
-def dense_embedding_cache_dir(bench: PastisBenchmark, benchmark: str, model_name: str, tag: str) -> Path:
+def dense_embedding_cache_dir(
+    bench: PastisBenchmark, benchmark: str, model_name: str, tag: str, weights_override=None
+) -> Path:
     """Checkpoint-aware root directory for one dense frozen-feature tile cache."""
-    return EMBEDDINGS_DIR / benchmark / model_name / _emb_sig(bench, model_name, tag) / "baseline"
+    return EMBEDDINGS_DIR / benchmark / model_name / _emb_sig(bench, model_name, tag, weights_override) / "baseline"
 
 
-def load_cached_embeddings(bench: Any, benchmark: str, model_name: str, tag: str) -> np.ndarray:
+def load_cached_embeddings(bench: Any, benchmark: str, model_name: str, tag: str, weights_override=None) -> np.ndarray:
     """Load an existing frozen embedding matrix, failing if it has not been built."""
-    path = embedding_cache_path(bench, benchmark, model_name, tag)
+    path = embedding_cache_path(bench, benchmark, model_name, tag, weights_override)
     if not path.exists():
         raise MissingEmbeddingCache(
             f"Embedding cache not found for {model_name}/{benchmark}: {path}. "
@@ -277,33 +289,45 @@ def load_cached_embeddings(bench: Any, benchmark: str, model_name: str, tag: str
     return np.load(path).astype(np.float32, copy=False)
 
 
-def require_dense_cache(bench: PastisBenchmark, benchmark: str, model_name: str, tag: str) -> Path:
+def require_dense_cache(bench: PastisBenchmark, benchmark: str, model_name: str, tag: str, weights_override=None) -> Path:
     """Return an existing dense tile cache root, failing if it is absent OR INCOMPLETE.
 
     Validates the EXACT expected set of tile IDs (every patch × every subtile) -- both the
     feature and the label file must exist for each. A bare count would let a missing expected
     tile be masked by an extra stale one; matching identities catches that.
     """
-    root = dense_embedding_cache_dir(bench, benchmark, model_name, tag)
+    root = dense_embedding_cache_dir(bench, benchmark, model_name, tag, weights_override)
     if not root.exists():
         raise MissingEmbeddingCache(
             f"Dense embedding cache not found for {model_name}/{benchmark}: {root}. "
             "Run with RUN_STAGES including 'gen_embeddings' first."
         )
     tiles_per_axis = 128 // bench.tile_size
+    expected: set[Path] = set()
     missing: list[str] = []
     for patch in bench.patches:
         fold_dir = root / f"fold_{patch.fold}"
         for r in range(tiles_per_axis):
             for c in range(tiles_per_axis):
                 tile_id = f"{patch.patch_id}_{r}_{c}"
-                if not ((fold_dir / f"{tile_id}.npy").exists() and (fold_dir / f"{tile_id}.labels.npy").exists()):
+                label_path = fold_dir / f"{tile_id}.labels.npy"
+                expected.add(label_path)
+                if not ((fold_dir / f"{tile_id}.npy").exists() and label_path.exists()):
                     missing.append(tile_id)
     if missing:
         raise MissingEmbeddingCache(
             f"Dense cache INCOMPLETE for {model_name}/{benchmark}: {len(missing)} expected tiles "
             f"are missing a feature/label file in {root} (e.g. {missing[:3]}). Extraction was "
             "interrupted -- re-run RUN_STAGES with 'gen_embeddings'."
+        )
+    # Reject EXTRA tiles too: load_dense_samples globs every *.labels.npy, so a stale tile left from
+    # a different descriptor (e.g. a changed max_samples) would silently be evaluated.
+    extra = sorted(str(p.relative_to(root)) for p in root.glob("fold_*/*.labels.npy") if p not in expected)
+    if extra:
+        raise MissingEmbeddingCache(
+            f"Dense cache for {model_name}/{benchmark} has {len(extra)} UNEXPECTED tile(s) not in the "
+            f"descriptor in {root} (e.g. {extra[:3]}). These would contaminate evaluation -- clear the "
+            "cache dir and re-run 'gen_embeddings'."
         )
     return root
 
@@ -312,7 +336,7 @@ def extract_and_cache(
     bench: Any, benchmark, model_name, tag, overwrite="skip", **enc_kwargs
 ) -> np.ndarray:
     """Cache and return the frozen-model embedding matrix for a benchmark."""
-    path = embedding_cache_path(bench, benchmark, model_name, tag)
+    path = embedding_cache_path(bench, benchmark, model_name, tag, enc_kwargs.get("weights_path"))
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and overwrite != "override":
         return np.load(path).astype(np.float32, copy=False)
@@ -354,7 +378,7 @@ def extract_dense_and_cache(
     the release or its complete feature tensor in memory and resumes at tile
     granularity after interruption.
     """
-    root = dense_embedding_cache_dir(bench, benchmark, model_name, tag)
+    root = dense_embedding_cache_dir(bench, benchmark, model_name, tag, enc_kwargs.get("weights_path"))
     root.mkdir(parents=True, exist_ok=True)
     model = None
     for tile_id, fold, tile, labels in bench.iter_tiles():
