@@ -69,11 +69,9 @@ def _delta_rows(extra_regimes=()):
 
 
 def test_compute_deltas_surfaces_secondary_ood_regimes():
-    rows = _delta_rows(extra_regimes=("climate_ood", "temporal_ood"))
+    rows = _delta_rows(extra_regimes=("geographic_ood",))
     out = [r for r in IOU.compute_deltas(rows, ["auc"], n_boot=100, seed=0) if r["metric"] == "auc"]
     r = out[0]
-    for axis in ("climate", "temporal"):
-        assert f"ood_{axis}" in r and f"delta_{axis}" in r
     # primary geographic CI is present and brackets the point estimate (non-degenerate)
     assert r["delta_ci_lo"] <= r["delta"] <= r["delta_ci_hi"]
 
@@ -322,7 +320,7 @@ def test_worst_region_uses_max_for_error_metrics():
 # Round-6: full/held_out scope separation, dense extra tiles, empty signature
 # --------------------------------------------------------------------------- #
 def _scoped_delta_rows():
-    """geographic + climate, each with BOTH a full-target (val 0.6) and a held_out (val 0.1)
+    """geographic, each with BOTH a full-target (val 0.6) and a held_out (val 0.1)
     budget-0 row per seed, plus a held_out oracle (budget -1, val 0.5)."""
     rows = []
 
@@ -340,8 +338,6 @@ def _scoped_delta_rows():
             add("geographic_ood", 0.0, "full", 0.6, s, reg)        # deployment scope (full target)
             add("geographic_ood", 0.0, "held_out", 0.1, s, reg)    # noisy 20% (decomposition only)
             add("geographic_ood", -1.0, "held_out", 0.5, s, reg)   # oracle on the held-out 20%
-        add("climate_ood", 0.0, "full", 0.62, s, "koppen_C")
-        add("climate_ood", 0.0, "held_out", 0.15, s, "koppen_C")
     return rows
 
 
@@ -350,7 +346,6 @@ def test_compute_deltas_separates_full_and_held_out_scopes():
            if r["metric"] == "auc"][0]
     assert abs(out["ood"] - 0.6) < 1e-9              # primary OOD = full-target, NOT mixed with 0.1
     assert abs(out["ood_worst_region"] - 0.6) < 1e-9  # worst region from full scope (not 0.1)
-    assert abs(out["delta_climate"] - (0.9 - 0.62)) < 1e-9  # secondary OOD uses full scope
     # inherent-difficulty decomposition uses the MATCHED held-out scope (oracle 0.5 vs held_out 0.1)
     assert abs(out["ood_matched"] - 0.1) < 1e-9
     assert abs(out["adjusted_delta"] - (0.5 - 0.1)) < 1e-9
@@ -420,8 +415,8 @@ def test_leave_one_domain_out_dropped_domain_surfaced(monkeypatch):
     from evals.regimes.base import Split
 
     class StubRegime:
-        NAME = "climate_ood"
-        GROUP_KIND = "climate"
+        NAME = "geographic_ood"
+        GROUP_KIND = "geography"
         HAS_TARGET = True
         LEAVE_ONE_DOMAIN_OUT = True
 
@@ -434,20 +429,20 @@ def test_leave_one_domain_out_dropped_domain_surfaced(monkeypatch):
             for d in ("A", "B"):           # C is silently dropped (degenerate) -> must be surfaced
                 idx = np.flatnonzero(groups == d)
                 tr = np.flatnonzero(groups != d)
-                yield Split(f"koppen_{d}", tr, idx, np.array([], dtype=int), domain=d)
+                yield Split(f"fold_{d}", tr, idx, np.array([], dtype=int), domain=d)
 
     monkeypatch.setattr(RB, "load_regime", lambda name: StubRegime)
     RB.REGIME_PROBLEMS.clear()
     bench = type("B", (), {"name": "b"})()
     list(RB.iter_splits(
-        "climate_ood",
+        "geographic_ood",
         bench,
         np.array([0, 1, 0, 1, 0, 1]),
         holdouts=None,
         seed=0,
         overwrite_mode=False,
     ))
-    assert any("C" in reason for _, reg, reason in RB.REGIME_PROBLEMS if reg == "climate_ood")
+    assert any("C" in reason for _, reg, reason in RB.REGIME_PROBLEMS if reg == "geographic_ood")
 
 
 def test_run_signature_includes_seeds_and_enc_kwargs():

@@ -11,7 +11,7 @@ from models.olmoearth import OlmoEarthModel
 from models.presto import PrestoModel
 from models.tessera import TESSERA_S2_BANDS, TesseraModel
 from utils import cacheutils
-from utils.galileoutil import GalileoNativeModel
+from utils.models.galileoutil import GalileoNativeModel
 
 
 class FakePrestoModel:

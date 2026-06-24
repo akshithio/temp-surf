@@ -30,10 +30,8 @@ from dataio.get_input import (
 BENCHMARK = "cropharvest"
 LABEL_KIND = "binary"
 HOLDOUTS = ["togo", "ethiopia", "lem-brazil", "rwanda", "togo-eval"]
-# Binary task with global coordinates and multi-year windows, so it supports the
-# committed set: region, climate (Köppen via lat/lon), and forward-time. (Phenology
-# was dropped: NDVI-phenology domains are confounded with the crop/non-crop label.)
-SPLIT_REGIMES = ["random_id", "geographic_ood", "climate_ood", "temporal_ood"]
+# Binary task with global coordinates and multi-year windows.
+SPLIT_REGIMES = ["random_id", "geographic_ood"]
 
 # --- Raw array band layout --------------------------------------------------
 # Raw 18-col array: [S1 VV,VH] + [S2: B2..B8A, B9, B11, B12] + [ERA5 temp,precip]

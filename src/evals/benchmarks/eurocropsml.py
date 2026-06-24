@@ -35,12 +35,8 @@ from dataio.get_input import (
 BENCHMARK = "eurocropsml"
 LABEL_KIND = "multiclass"
 HOLDOUTS = ["Estonia"]  # train Latvia+Portugal -> test Estonia (official transnational split)
-# Crop-type task: phenology is label-confounded here, so it is omitted. Parcel-center coordinates
-# are present for every parcel (climate via Köppen). The EuroCropsML reference release is single-
-# year (2021 for EE/LV/PT), so there is no forward-time axis -> temporal_ood is intentionally not
-# declared. NOTE: the two Köppen zones here are D (Estonia+Latvia) and C (Portugal), so climate_ood
-# is largely confounded with the country holdout.
-SPLIT_REGIMES = ["random_id", "geographic_ood", "climate_ood"]
+# Crop-type task with parcel-center coordinates present for every parcel.
+SPLIT_REGIMES = ["random_id", "geographic_ood"]
 HCAT_PREFIX = 6  # truncate the 10-digit HCAT code to this many leading digits (crop-type level)
 
 # --- Raw npz band layout ----------------------------------------------------

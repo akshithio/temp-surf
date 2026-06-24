@@ -18,9 +18,6 @@ from evals.regimes.base import Split, geography_domains
 NAME = "geographic_ood"
 GROUP_KIND = "geography"
 HAS_TARGET = True
-# This regime is expected to yield exactly one split per curated holdout in bench.HOLDOUTS.
-# The runner checks for any holdout that dropped out and routes it through regime_problem, so a
-# partial matrix (e.g. 4 of 5 holdouts) is caught by OVERWRITE_MODE.
 USES_CURATED_HOLDOUTS = True
 assign_domains = geography_domains
 

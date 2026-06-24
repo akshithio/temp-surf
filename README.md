@@ -15,8 +15,7 @@ method or probe operates on those cached matrices.
 
 ## Current Scope
 
-- **Robustness axis:** deployment-style domain transfer through geographic and
-  geographic, climate, and temporal holdouts.
+- **Robustness axis:** deployment-style domain transfer through geographic holdouts.
 - **Benchmarks:** binary crop/non-crop (CropHarvest), multiclass crop-type
   (EuroCropsML, BreizhCrops), and semantic segmentation (PASTIS-R).
 - **Models:** Presto, OlmoEarth v1.1-Base, Galileo v1 Base, AgriFM, and TESSERA v1.1.

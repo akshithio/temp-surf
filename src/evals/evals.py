@@ -1646,11 +1646,6 @@ def _run_tabular_pair(
     axes = {"geography": np.asarray(bench.groups), "class": np.asarray(y)}
     if getattr(bench, "years", None) is not None:
         axes["year"] = np.asarray(bench.years)
-    try:
-        from dataio.koppen import koppen_main_group
-        axes["climate"] = koppen_main_group(np.asarray(bench.latlon))
-    except Exception:
-        pass
     IOU.write_json(results_dir / "domain_confounds.json", confounds.domain_confound_report(axes))
 
     declared = set(compat.input_modalities(model_name))

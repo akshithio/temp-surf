@@ -166,8 +166,8 @@ def _model_source_files(model_name: str) -> list[Path]:
         text = mod_src.read_text()
     except OSError:
         return files
-    for name in re.findall(r"utils\.([A-Za-z_]\w*?util[s]?)\b", text):
-        util_path = REPO / "src" / "utils" / f"{name}.py"
+    for name in re.findall(r"utils\.\w+\.([A-Za-z_]\w*?util[s]?)\b", text):
+        util_path = REPO / "src" / "utils" / "models" / f"{name}.py"
         if util_path.exists() and util_path not in files:
             files.append(util_path)
     return files

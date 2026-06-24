@@ -1,13 +1,9 @@
 """Domain-confound diagnostics.
 
 A measured OOD gap is only attributable to the axis it is named for if that axis is not entangled
-with another. Two known cases:
-  * EuroCropsML ``climate_ood`` -- Köppen zone is (here) a function of country, so a "climate" gap
-    is largely a geography gap (#8).
-  * CropHarvest ``temporal_ood`` -- if source datasets / regions appear in different years, a "time"
-    gap may be a dataset/geography gap (#9).
+with another.
 
-This module cross-tabulates the per-sample domain bases (geography, year, climate, class) and reports
+This module cross-tabulates the per-sample domain bases (geography, year, class) and reports
 how strongly each pair is entangled, so those gaps are read as *decomposition metadata*, not as
 independent robustness results. It is pure numpy (no model/probe), and the report is written next to
 the probe results as ``domain_confounds.json``.
@@ -72,11 +68,9 @@ def confound_pair(a: np.ndarray, b: np.ndarray, max_cells: int = 30) -> dict:
 def domain_confound_report(axes: dict[str, np.ndarray | None]) -> dict:
     """Pairwise confound stats between the supplied per-sample domain axes.
 
-    ``axes`` maps an axis name (e.g. ``geography``, ``year``, ``climate``, ``class``) to a per-sample
+    ``axes`` maps an axis name (e.g. ``geography``, ``year``, ``class``) to a per-sample
     label array (``None`` / single-valued axes are skipped). Returns the cardinality of each usable
-    axis and, for every pair, the :func:`confound_pair` stats -- so e.g. a near-1 ``climate__vs__
-    geography`` determination flags climate_ood as confounded with the country split, and a high
-    ``year__vs__geography`` entanglement flags a temporal gap that is really a source/region gap.
+    axis and, for every pair, the :func:`confound_pair` stats.
     """
     usable = [
         name
