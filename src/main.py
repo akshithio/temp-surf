@@ -22,7 +22,7 @@ RUN_STAGES = ["gen_embeddings", "probing"]
 SPLIT_REGIMES = ["random_id", "geographic_ood"]
 ACTIVE_PROBES = ["logistic"]
 BUDGET_REGIMES = {
-    "source": [0.05, 0.10, 0.25, 0],
+    "source": [0.05, 0.10, 0.25, 1.0],
     "target": [0, 5, 10, 25, 50, EV.TARGET_ID_UPPER_BOUND],
 }
 MAX_SAMPLES = None

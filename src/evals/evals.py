@@ -945,6 +945,132 @@ def build_methods(label_kind: str, seed: int):
     return {"erm": (None, {})}
 
 
+def _value_counts(values: np.ndarray) -> dict[str, int]:
+    """Stable JSON-friendly counts for class/domain labels."""
+    arr = np.asarray(values)
+    if arr.size == 0:
+        return {}
+    labels, counts = np.unique(arr.astype(str), return_counts=True)
+    return {str(label): int(count) for label, count in zip(labels, counts, strict=True)}
+
+
+def _split_manifest_entry(
+    *,
+    model_name: str,
+    benchmark_name: str,
+    seed: int,
+    split_regime: str,
+    domain_basis: str,
+    holdout: str,
+    train: np.ndarray,
+    val: np.ndarray,
+    test: np.ndarray,
+    domains: np.ndarray,
+    labels: np.ndarray,
+) -> dict[str, Any]:
+    """Describe one tabular split with domain and class composition."""
+
+    def part(prefix: str, idx: np.ndarray) -> dict[str, Any]:
+        idx = np.asarray(idx, dtype=np.int64)
+        return {
+            f"n_{prefix}": int(len(idx)),
+            f"{prefix}_domains": sorted({str(v) for v in np.asarray(domains)[idx].tolist()}),
+            f"{prefix}_domain_counts": _value_counts(np.asarray(domains)[idx]),
+            f"{prefix}_class_counts": _value_counts(np.asarray(labels)[idx]),
+        }
+
+    row: dict[str, Any] = {
+        "model": model_name,
+        "benchmark": benchmark_name,
+        "seed": int(seed),
+        "split_regime": split_regime,
+        "domain_basis": domain_basis,
+        "holdout": str(holdout),
+    }
+    row.update(part("train", train))
+    row.update(part("val", val))
+    row.update(part("test", test))
+    return row
+
+
+def _dense_fold_stats(emb_dir, folds: set[int]) -> dict[str, Any]:
+    """Exact dense label/domain stats for cached PASTIS fold partitions."""
+    class_counts: dict[str, int] = {}
+    domain_counts: dict[str, int] = {}
+    n_tiles = 0
+    patches: set[int] = set()
+    for fold in sorted(folds):
+        fold_dir = emb_dir / f"fold_{int(fold)}"
+        for label_path in sorted(fold_dir.glob("*.labels.npy")):
+            labels = np.asarray(np.load(label_path, mmap_mode="r"), dtype=np.int64)
+            n_tiles += 1
+            patch_id = int(label_path.name.split("_", 1)[0])
+            patches.add(patch_id)
+            domain_counts[str(int(fold))] = domain_counts.get(str(int(fold)), 0) + int(len(labels))
+            for label, count in _value_counts(labels).items():
+                class_counts[label] = class_counts.get(label, 0) + int(count)
+    return {
+        "n": int(sum(domain_counts.values())),
+        "n_tiles": int(n_tiles),
+        "n_patches": int(len(patches)),
+        "domains": [str(int(fold)) for fold in sorted(folds)],
+        "domain_counts": domain_counts,
+        "class_counts": class_counts,
+    }
+
+
+def _segmentation_split_manifest_entry(
+    *,
+    model_name: str,
+    benchmark_name: str,
+    seed: int,
+    split_regime: str,
+    holdout: str,
+    train_folds: set[int],
+    val_folds: set[int],
+    test_folds: set[int],
+    emb_dir,
+) -> dict[str, Any]:
+    """Describe one dense fold split with exact cached-pixel class counts."""
+
+    def add_part(row: dict[str, Any], prefix: str, stats: dict[str, Any]) -> None:
+        row[f"n_{prefix}"] = stats["n"]
+        row[f"n_{prefix}_tiles"] = stats["n_tiles"]
+        row[f"n_{prefix}_patches"] = stats["n_patches"]
+        row[f"{prefix}_domains"] = stats["domains"]
+        row[f"{prefix}_domain_counts"] = stats["domain_counts"]
+        row[f"{prefix}_class_counts"] = stats["class_counts"]
+
+    row: dict[str, Any] = {
+        "model": model_name,
+        "benchmark": benchmark_name,
+        "seed": int(seed),
+        "split_regime": split_regime,
+        "domain_basis": "geography",
+        "holdout": str(holdout),
+    }
+    add_part(row, "train", _dense_fold_stats(emb_dir, train_folds))
+    add_part(row, "val", _dense_fold_stats(emb_dir, val_folds))
+    add_part(row, "test", _dense_fold_stats(emb_dir, test_folds))
+    return row
+
+
+def _write_split_manifest(results_dir, rows: list[dict[str, Any]]) -> None:
+    """Write the split audit artifact beside the probe outputs."""
+    IOU.write_json(results_dir / "split_manifest.json", {"splits": rows})
+
+
+def _id_source_budget(source_budgets: list[float | int]) -> float | int:
+    """Prefer the explicit full-source anchor when choosing the ID row for deltas."""
+    for budget in source_budgets:
+        if abs(float(budget) - 1.0) < 1e-9:
+            return budget
+    for budget in source_budgets:
+        if abs(float(budget)) < 1e-9:
+            return budget
+    return max(source_budgets)
+
+
 def _probe_cell(
     probe_fn,
     emb,
@@ -1124,8 +1250,14 @@ def _run_segmentation_pair(
     runstate.check_run_signature(results_dir, signature, overwrite_mode=overwrite_mode)
     rows_path = results_dir / "probe_results.jsonl"
     if overwrite_mode:
-        for path in (rows_path, results_dir / "probe_results.csv", results_dir / "summary.csv",
-                     results_dir / "run_signature.txt"):
+        for path in (
+            rows_path,
+            results_dir / "probe_results.csv",
+            results_dir / "summary.csv",
+            results_dir / "deltas.csv",
+            results_dir / "split_manifest.json",
+            results_dir / "run_signature.txt",
+        ):
             if path.exists():
                 path.unlink()
     runstate.publish_run_signature(results_dir, signature)
@@ -1162,6 +1294,24 @@ def _run_segmentation_pair(
     supported = getattr(bench_mod, "SPLIT_REGIMES", ["random_id"])
     regimes = [r for r in supported if r in split_regimes]
     fold_configs = list(regime_base.segmentation_fold_configs(bench_mod, regimes, overwrite_mode=overwrite_mode))
+    _write_split_manifest(
+        results_dir,
+        [
+            _segmentation_split_manifest_entry(
+                model_name=model_name,
+                benchmark_name=benchmark_name,
+                seed=seed,
+                split_regime=split_regime,
+                holdout=holdout,
+                train_folds=set(train_folds),
+                val_folds=set(val_folds),
+                test_folds=set(test_folds),
+                emb_dir=emb_dir,
+            )
+            for seed in seeds
+            for split_regime, holdout, train_folds, val_folds, test_folds in fold_configs
+        ],
+    )
     for seed in seeds:
         for method_name, (cls, kwargs) in build_methods(bench_mod.LABEL_KIND, seed).items():
             for split_regime, holdout, train_folds, val_folds, test_folds in fold_configs:
@@ -1247,6 +1397,8 @@ def _run_segmentation_pair(
     )
     IOU.write_csv(results_dir / "summary.csv", summary)
     IOU.write_json(results_dir / "metric_roles.json", METRIC_ROLES["segmentation"])
+    deltas = IOU.compute_deltas(rows, METRICS_SEGMENTATION, id_source_budget=_id_source_budget(source_budgets))
+    IOU.write_csv(results_dir / "deltas.csv", deltas)
     declared = set(compat.input_modalities(model_name))
     available = {"s2", "s1", "time"}
     IOU.write_json(results_dir / "model_inputs.json", {
@@ -1334,6 +1486,7 @@ def _run_tabular_pair(
             results_dir / "probe_results.csv",
             results_dir / "summary.csv",
             results_dir / "deltas.csv",
+            results_dir / "split_manifest.json",
             results_dir / "run_signature.txt",
         ]:
             if p.exists():
@@ -1372,58 +1525,60 @@ def _run_tabular_pair(
         ]
 
     rerun_keys: set = set()
+    split_specs: list[tuple] = []
+    split_manifest: list[dict[str, Any]] = []
 
     for seed in seeds:
+        for split_regime in split_regimes:
+            for split_label, train, val, test, groups, has_target, domain_basis in regime_base.iter_splits(
+                split_regime,
+                bench,
+                y,
+                holdouts,
+                seed,
+                overwrite_mode=overwrite_mode,
+                val_group=getattr(bench_mod, "VAL_HOLDOUT", None),
+            ):
+                split_specs.append((seed, split_regime, split_label, train, val, test, groups, has_target, domain_basis))
+                split_manifest.append(
+                    _split_manifest_entry(
+                        model_name=model_name,
+                        benchmark_name=benchmark_name,
+                        seed=seed,
+                        split_regime=split_regime,
+                        domain_basis=domain_basis,
+                        holdout=split_label,
+                        train=train,
+                        val=val,
+                        test=test,
+                        domains=groups,
+                        labels=y,
+                    )
+                )
+    _write_split_manifest(results_dir, split_manifest)
+
+    for seed in seeds:
+        seed_split_specs = [spec for spec in split_specs if spec[0] == seed]
         for mname, (cls, kwargs) in build_methods(bench_mod.LABEL_KIND, seed).items():
-            for split_regime in split_regimes:
-                for split_label, train, val, test, groups, has_target, domain_basis in regime_base.iter_splits(
-                    split_regime,
-                    bench,
-                    y,
-                    holdouts,
-                    seed,
-                    overwrite_mode=overwrite_mode,
-                    val_group=getattr(bench_mod, "VAL_HOLDOUT", None),
-                ):
-                    for family in active_probes:
-                        meta = {
-                            "model": model_name,
-                            "benchmark": bench_mod.BENCHMARK,
-                            "method": mname,
-                            "split_regime": split_regime,
-                            "domain_basis": domain_basis,
-                            "holdout": split_label,
-                            "probe_family": family,
-                        }
-                        base = (seed, split_regime, split_label, mname, family)
-                        if has_target:
-                            todo = _missing(base, "target", target_budgets)
-                            if todo:
-                                rerun_keys.update((*base, "target", b) for b in todo)
-                                jobs.append(
-                                    delayed(_probe_cell_target)(
-                                        probe_fn_tgt,
-                                        emb,
-                                        train,
-                                        val,
-                                        test,
-                                        y,
-                                        groups,
-                                        cls,
-                                        kwargs,
-                                        uses_target_flag(cls),
-                                        {**meta, "budget_type": "target"},
-                                        seed,
-                                        family,
-                                        todo,
-                                    )
-                                )
-                        todo_src = _missing(base, "source", source_budgets)
-                        if todo_src:
-                            rerun_keys.update((*base, "source", b) for b in todo_src)
+            for _, split_regime, split_label, train, val, test, groups, has_target, domain_basis in seed_split_specs:
+                for family in active_probes:
+                    meta = {
+                        "model": model_name,
+                        "benchmark": bench_mod.BENCHMARK,
+                        "method": mname,
+                        "split_regime": split_regime,
+                        "domain_basis": domain_basis,
+                        "holdout": split_label,
+                        "probe_family": family,
+                    }
+                    base = (seed, split_regime, split_label, mname, family)
+                    if has_target:
+                        todo = _missing(base, "target", target_budgets)
+                        if todo:
+                            rerun_keys.update((*base, "target", b) for b in todo)
                             jobs.append(
-                                delayed(_probe_cell)(
-                                    probe_fn_src,
+                                delayed(_probe_cell_target)(
+                                    probe_fn_tgt,
                                     emb,
                                     train,
                                     val,
@@ -1433,12 +1588,33 @@ def _run_tabular_pair(
                                     cls,
                                     kwargs,
                                     uses_target_flag(cls),
-                                    {**meta, "budget_type": "source"},
+                                    {**meta, "budget_type": "target"},
                                     seed,
                                     family,
-                                    todo_src,
+                                    todo,
                                 )
                             )
+                    todo_src = _missing(base, "source", source_budgets)
+                    if todo_src:
+                        rerun_keys.update((*base, "source", b) for b in todo_src)
+                        jobs.append(
+                            delayed(_probe_cell)(
+                                probe_fn_src,
+                                emb,
+                                train,
+                                val,
+                                test,
+                                y,
+                                groups,
+                                cls,
+                                kwargs,
+                                uses_target_flag(cls),
+                                {**meta, "budget_type": "source"},
+                                seed,
+                                family,
+                                todo_src,
+                            )
+                        )
 
     rows = runstate.prune_partial_budgets(rows, rows_path, preds_path, rerun_keys)
 
@@ -1461,9 +1637,8 @@ def _run_tabular_pair(
     IOU.write_csv(results_dir / "summary.csv", summary)
     IOU.write_json(results_dir / "metric_roles.json", METRIC_ROLES[bench_mod.LABEL_KIND])
 
-    id_source_budget = 0 if 0 in source_budgets else max(source_budgets)
     deltas = IOU.compute_deltas(
-        rows, metrics, predictions=IOU.read_jsonl(preds_path), id_source_budget=id_source_budget
+        rows, metrics, predictions=IOU.read_jsonl(preds_path), id_source_budget=_id_source_budget(source_budgets)
     )
     IOU.write_csv(results_dir / "deltas.csv", deltas)
 

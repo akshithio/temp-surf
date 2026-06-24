@@ -37,13 +37,14 @@ and label budget. Each split produces one probe fit per budget level.
 
 **Models**
 
-| Model | Embedding dim | Input | Status |
-|---|---:|---|---|
-| Presto | 128 | S1+S2+ERA5/SRTM pixel time series | active |
-| OlmoEarth v1.1-Base | 768 | S2 L2A spatial chips (H,W,T,12) | active |
-| Galileo v1 (Base) | 768 | S2 spatial chips (H,W,T,10) + NDVI | active |
-| AgriFM | 1024 | S2 time series adapted to the S2 branch | active |
-| TESSERA v1.1 | 128 | S1+S2 time series | active |
+| Model               | Embedding dim | Input                                   |
+| ------------------- | ------------: | --------------------------------------- |
+| Presto              |           128 | S1+S2+ERA5/SRTM pixel time series       |
+| OlmoEarth v1.1-Base |           768 | S2 L2A spatial chips (H,W,T,12)         |
+| Galileo v1 (Base)   |           768 | S2 spatial chips (H,W,T,10) + NDVI      |
+| AgriFM              |          1024 | S2 time series adapted to the S2 branch |
+| TESSERA v1.1        |           128 | S1+S2 time series                       |
+
 
 **Benchmarks**
 
@@ -308,7 +309,7 @@ RUN_STAGES = ["gen_embeddings", "probing"]
 SPLIT_REGIMES = ["random_id", "geographic_ood"]
 ACTIVE_PROBES = ["logistic"]
 BUDGET_REGIMES = {
-    "source": [0.05, 0.10, 0.25, 0],
+    "source": [0.05, 0.10, 0.25, 1.0],
     "target": [0, 5, 10, 25, 50, EV.TARGET_ID_UPPER_BOUND],
 }
 SEEDS = [0]
@@ -322,7 +323,7 @@ RUN_STAGES = ["gen_embeddings", "probing"]
 SPLIT_REGIMES = ["random_id", "geographic_ood"]
 ACTIVE_PROBES = ["logistic"]  # add "mlp" later if linear-probe gaps are ambiguous
 BUDGET_REGIMES = {
-    "source": [0.05, 0.10, 0.25, 0],  # 0 = full-source ID anchor; other values are source fractions
+    "source": [0.05, 0.10, 0.25, 1.0],
     "target": [0, 5, 10, 25, 50, EV.TARGET_ID_UPPER_BOUND],
 }
 MAX_SAMPLES = None            # None = all samples

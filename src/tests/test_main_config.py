@@ -46,6 +46,10 @@ def test_main_dispatches_config_to_run_pair(monkeypatch) -> None:
     assert call["enc_kwargs"] == {"device": "cpu"}
 
 
+def test_main_source_budgets_include_explicit_full_source_anchor() -> None:
+    assert main.BUDGET_REGIMES["source"][-1] == 1.0
+
+
 def test_compatibility_table_excludes_only_blocked_pairs() -> None:
     from evals import compat
 

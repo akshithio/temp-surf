@@ -356,6 +356,28 @@ def test_compute_deltas_separates_full_and_held_out_scopes():
     assert abs(out["adjusted_delta"] - (0.5 - 0.1)) < 1e-9
 
 
+def test_compute_deltas_accepts_dense_test_evaluation_split():
+    rows = [
+        {"model": "m", "benchmark": "pastis_r", "method": "erm", "probe_family": "logistic",
+         "split_regime": "random_id", "budget_type": "source", "label_budget": 1.0,
+         "evaluation_split": "validation", "seed": 0, "holdout": "fold_5", "miou": 0.1},
+        {"model": "m", "benchmark": "pastis_r", "method": "erm", "probe_family": "logistic",
+         "split_regime": "random_id", "budget_type": "source", "label_budget": 1.0,
+         "evaluation_split": "test", "seed": 0, "holdout": "fold_5", "miou": 0.8},
+        {"model": "m", "benchmark": "pastis_r", "method": "erm", "probe_family": "logistic",
+         "split_regime": "geographic_ood", "budget_type": "target", "label_budget": 0.0,
+         "evaluation_split": "test", "seed": 0, "holdout": "fold_1", "miou": 0.5},
+        {"model": "m", "benchmark": "pastis_r", "method": "erm", "probe_family": "logistic",
+         "split_regime": "geographic_ood", "budget_type": "target", "label_budget": -1.0,
+         "evaluation_split": "test", "seed": 0, "holdout": "fold_1", "miou": 0.7},
+    ]
+    out = [r for r in IOU.compute_deltas(rows, ["miou"], n_boot=0, seed=0) if r["metric"] == "miou"][0]
+    assert abs(out["id"] - 0.8) < 1e-9
+    assert abs(out["ood"] - 0.5) < 1e-9
+    assert abs(out["target_id"] - 0.7) < 1e-9
+    assert abs(out["ood_matched"] - 0.5) < 1e-9
+
+
 def test_summarize_rows_keeps_scopes_separate():
     rows = [
         {"model": "m", "evaluation_split": "full", "miou": 0.6},
