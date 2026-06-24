@@ -393,12 +393,23 @@ def compute_deltas(
 
     def _matches(r, split_regime, budget_type, budget, combo, metric, es=None):
         # es filters target rows by evaluation_split ("full" = full-target zero-shot anchor,
-        # "held_out" = the matched fixed-20% test); rows without the field default to "held_out".
-        if es is not None and (r.get("evaluation_split") or "held_out") != es:
-            return False
+        # "held_out" = the matched fixed-20% test). Source rows without an evaluation_split are
+        # the test anchor; old target rows without one are the held-out anchor.
+        if es is not None:
+            actual = r.get("evaluation_split")
+            if actual is None:
+                actual = "held_out" if budget_type == "target" else "test"
+            if actual != es:
+                return False
         return (r.get("split_regime") == split_regime and r.get("budget_type") == budget_type
                 and _close(r.get("label_budget"), budget) and metric in r and r[metric] is not None
                 and all(r.get(k) == combo[i] for i, k in enumerate(keys)))
+
+    def _eval_matches(row: dict[str, Any], accepted: set[str], *, budget_type: str) -> bool:
+        actual = row.get("evaluation_split")
+        if actual is None:
+            actual = "held_out" if budget_type == "target" else "test"
+        return str(actual) in accepted
 
     def vals(split_regime, budget_type, budget, combo, metric, es=None) -> list[float]:
         out: list[float] = []
@@ -420,6 +431,20 @@ def compute_deltas(
                     out.setdefault(r.get("holdout"), []).append(v)
         return out
 
+    def _first_vals(split_regime, budget_type, budget, combo, metric, eval_splits: tuple[str, ...]) -> list[float]:
+        for eval_split in eval_splits:
+            found = vals(split_regime, budget_type, budget, combo, metric, es=eval_split)
+            if found:
+                return found
+        return []
+
+    def _first_vals_by_region(split_regime, budget_type, budget, combo, metric, eval_splits: tuple[str, ...]):
+        for eval_split in eval_splits:
+            found = vals_by_region(split_regime, budget_type, budget, combo, metric, es=eval_split)
+            if found:
+                return found
+        return {}
+
     # per-sample predictions indexed by combo -> split_regime, for the within-region bootstrap
     pred_by: dict[tuple, dict[str, list]] = {}
     for p in (predictions or []):
@@ -437,6 +462,7 @@ def compute_deltas(
         # ID test-set label stats (from the random_id anchor rows) -> chance/no-skill floor
         id_stat = [r for r in rows if r.get("split_regime") == "random_id" and r.get("budget_type") == "source"
                    and _close(r.get("label_budget"), id_source_budget)
+                   and _eval_matches(r, {"test"}, budget_type="source")
                    and all(r.get(k) == combo[i] for i, k in enumerate(keys))]
 
         def _avg(field: str, id_stat=id_stat):
@@ -451,6 +477,7 @@ def compute_deltas(
         id_preds = [
             p for p in pred_by.get(combo, {}).get("random_id", [])
             if p.get("budget_type") == "source" and _close(p.get("label_budget"), id_source_budget)
+            and _eval_matches(p, {"test"}, budget_type="source")
         ]
         # Primary OOD anchor = the FULL-target zero-shot (evaluation_split "full"); fall back to
         # the held-out rows for older results that predate the full-target anchor.
@@ -458,13 +485,15 @@ def compute_deltas(
             p for p in pred_by.get(combo, {}).get("geographic_ood", [])
             if p.get("budget_type") == "target" and _close(p.get("label_budget"), 0.0)
         ]
-        _ood_full = [p for p in _ood_preds_all if (p.get("evaluation_split") or "held_out") == "full"]
-        ood_preds = _ood_full or _ood_preds_all
+        _ood_full = [p for p in _ood_preds_all if _eval_matches(p, {"full"}, budget_type="target")]
+        _ood_test = [p for p in _ood_preds_all if _eval_matches(p, {"test"}, budget_type="target")]
+        ood_preds = _ood_full or _ood_test or _ood_preds_all
 
         for metric in metrics:
-            id_vals = vals("random_id", "source", id_source_budget, combo, metric)
-            ood_vals = vals("geographic_ood", "target", 0.0, combo, metric, es="full") \
-                or vals("geographic_ood", "target", 0.0, combo, metric, es="held_out")
+            id_vals = vals("random_id", "source", id_source_budget, combo, metric, es="test")
+            ood_vals = _first_vals(
+                "geographic_ood", "target", 0.0, combo, metric, ("full", "test", "held_out")
+            )
             if not id_vals or not ood_vals:
                 continue
             idm, oodm = float(np.mean(id_vals)), float(np.mean(ood_vals))
@@ -473,8 +502,9 @@ def compute_deltas(
             # WITHIN each drawn region (OOD side), and resample seeds for the single-region ID
             # anchor. Flattening region×seed and resampling iid (the old behaviour) treats a
             # region's correlated per-seed replicates as independent and understates the interval.
-            ood_by_region = (vals_by_region("geographic_ood", "target", 0.0, combo, metric, es="full")
-                             or vals_by_region("geographic_ood", "target", 0.0, combo, metric, es="held_out"))
+            ood_by_region = _first_vals_by_region(
+                "geographic_ood", "target", 0.0, combo, metric, ("full", "test", "held_out")
+            )
             if n_boot and ood_by_region:
                 region_vals = [np.asarray(v) for v in ood_by_region.values()]
                 n_reg = len(region_vals)
@@ -502,7 +532,7 @@ def compute_deltas(
             # for older results -- NEVER mix the two scopes (the held-out 20% is noisier and would
             # masquerade as the worst region).
             _seed_holdout: dict[int, list[float]] = {}
-            for want in ("full", "held_out"):
+            for want in ("full", "test", "held_out"):
                 for r in rows:
                     if (r.get("split_regime") == "geographic_ood" and r.get("budget_type") == "target"
                             and _close(r.get("label_budget"), 0.0) and metric in r and r[metric] is not None
@@ -545,8 +575,7 @@ def compute_deltas(
                 axis = ood_regime[:-4] if ood_regime.endswith("_ood") else ood_regime
                 # deployment scope = full-target zero-shot (fall back to held_out for old results);
                 # never average the two scopes together.
-                ovals = (vals(ood_regime, "target", 0.0, combo, metric, es="full")
-                         or vals(ood_regime, "target", 0.0, combo, metric, es="held_out"))
+                ovals = _first_vals(ood_regime, "target", 0.0, combo, metric, ("full", "test", "held_out"))
                 if ovals:
                     oa = np.asarray(ovals)
                     row[f"ood_{axis}"] = float(oa.mean())
@@ -558,10 +587,12 @@ def compute_deltas(
             # target-ID upper-bound (budget -1): train on the 80% target pool, test on the fixed
             # held-out 20%. The decomposition compares it to the zero-shot on that SAME held-out
             # 20% (``ood_matched``) -- like-with-like -- NOT the full-target primary ``ood``.
-            tid_vals = vals("geographic_ood", "target", -1.0, combo, metric, es="held_out")
+            tid_vals = _first_vals("geographic_ood", "target", -1.0, combo, metric, ("held_out", "test"))
             if tid_vals:
                 tidm = float(np.mean(tid_vals))
-                ood_matched_vals = vals("geographic_ood", "target", 0.0, combo, metric, es="held_out")
+                ood_matched_vals = _first_vals(
+                    "geographic_ood", "target", 0.0, combo, metric, ("held_out", "test")
+                )
                 ood_matched = float(np.mean(ood_matched_vals)) if ood_matched_vals else oodm
                 row.update({
                     "target_id": tidm,

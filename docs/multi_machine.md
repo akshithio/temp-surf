@@ -103,8 +103,8 @@ rsync -a machineY:.../data/output/results/  ./data/output/results/   # disjoint 
 ```
 
 `probe_results.jsonl` / `predictions.jsonl` / `perf.jsonl` are append-only per pair; `summary.csv`,
-`deltas.csv`, `metric_roles.json`, `run_signature.txt` are per-pair too. Nothing needs a real merge —
-just gather the per-pair directories into one tree.
+`deltas.csv`, `metric_roles.json`, `split_manifest.json`, `run_signature.txt` are per-pair too. Nothing
+needs a real merge — just gather the per-pair directories into one tree.
 
 ## A note on resume / partial runs
 Within a single `(model, benchmark)` the pipeline resumes per-row (classification) / per-family
