@@ -1,131 +1,64 @@
-"""Model × benchmark compatibility matrix — drives automatic model selection.
-
-This is the executable form of the design doc's `(4) A Compatibility Matrix`
-(and the table in the README). Each ``(benchmark, model)`` cell carries two
-independent grades:
-
-  * **precedent**  — how strongly the literature sanctions the baseline.
-  * **adaptation** — how far our wrapper had to bend the model's native input.
-
-The two collapse to a single runnability ``RANK`` (1 = best). A pair is eligible
-to run iff its adaptation is below ``RUN_CUTOFF`` (i.e. ``CLEAN`` or ``MINOR``):
-a 🔴 ``SEVERE`` adaptation produces a number that misrepresents the model, so it
-is excluded from the cross-model comparison rather than run.
-
-``main.py`` consumes :func:`eligible_models` so that you specify only the
-*benchmarks* — the model set for each benchmark is read off this matrix.
-"""
+"""Model/benchmark eligibility and model input footprints."""
 
 from __future__ import annotations
 
-from enum import IntEnum
+BENCHMARKS: tuple[str, ...] = ("cropharvest", "eurocropsml", "breizhcrops", "pastis_r")
+MODEL_ORDER: tuple[str, ...] = ("presto", "tessera", "agrifm", "olmoearth", "galileo", "raw")
 
-
-class Precedent(IntEnum):
-    """How strongly the literature sanctions a (model, benchmark) baseline."""
-
-    NONE = 0  # 🆕 no published precedent — runs, but the number is exploratory
-    THIRD_PARTY = 1  # ⚠️ only a third-party re-implementation ran it (not the authors)
-    EQUIVALENT = 2  # 🔗 own paper ran a directly-equivalent benchmark, not this one
-    PAPER = 3  # 📄 own paper ran this exact benchmark
-
-
-class Adaptation(IntEnum):
-    """How far our wrapper bends the model's native input form."""
-
-    CLEAN = 0  # native input — no adaptation
-    MINOR = 1  # 🚧 defensible reframing or tolerable missing input
-    SEVERE = 2  # 🔴 off-distribution input, or a data form the model has no pathway for
-
-
-# Curated runnability rank for every (precedent, adaptation) pair (1 = best). This
-# is NOT a closed-form of the two axes: the order is the one fixed in the design
-# doc's "Ranking & run cutoff" table (e.g. 📄🚧 deliberately outranks a clean
-# ⚠️/🔗/🆕). Edit here to match the doc; nothing else depends on the exact integers.
-RANK: dict[tuple[Precedent, Adaptation], int] = {
-    (Precedent.PAPER, Adaptation.CLEAN): 1,
-    (Precedent.PAPER, Adaptation.MINOR): 2,
-    (Precedent.THIRD_PARTY, Adaptation.CLEAN): 3,
-    (Precedent.EQUIVALENT, Adaptation.CLEAN): 4,
-    (Precedent.NONE, Adaptation.CLEAN): 5,
-    (Precedent.EQUIVALENT, Adaptation.MINOR): 6,
-    (Precedent.THIRD_PARTY, Adaptation.MINOR): 7,
-    (Precedent.NONE, Adaptation.MINOR): 8,
-    (Precedent.PAPER, Adaptation.SEVERE): 9,
-    (Precedent.EQUIVALENT, Adaptation.SEVERE): 10,
-    (Precedent.THIRD_PARTY, Adaptation.SEVERE): 11,
-    (Precedent.NONE, Adaptation.SEVERE): 12,
+BLOCKED_MODELS: dict[str, set[str]] = {
+    "cropharvest": {"tessera", "agrifm"},
+    "eurocropsml": {"agrifm"},
+    "breizhcrops": {"agrifm"},
 }
 
-# A pair runs iff its adaptation is strictly below this (CLEAN or MINOR; never SEVERE).
-RUN_CUTOFF: Adaptation = Adaptation.SEVERE
-
-_P, _E, _T, _N = Precedent.PAPER, Precedent.EQUIVALENT, Precedent.THIRD_PARTY, Precedent.NONE
-_CLEAN, _MINOR, _SEVERE = Adaptation.CLEAN, Adaptation.MINOR, Adaptation.SEVERE
-
-# benchmark name -> model name -> (precedent, adaptation). Mirrors the README matrix.
-# Benchmark keys are the BENCHMARKS module names used in main.py; model keys are the
-# cacheutils.ENCODERS keys.
-MATRIX: dict[str, dict[str, tuple[Precedent, Adaptation]]] = {
-    "cropharvest": {
-        "raw": (_N, _CLEAN),  # reality-check control: always runs, no precedent, native features
-        "presto": (_P, _CLEAN),
-        "olmoearth": (_P, _CLEAN),
-        "galileo": (_P, _CLEAN),
-        "tessera": (_E, _SEVERE),
-        "agrifm": (_N, _SEVERE),
-    },
-    "eurocropsml": {
-        "raw": (_N, _CLEAN),
-        "presto": (_E, _CLEAN),
-        "olmoearth": (_E, _CLEAN),
-        "galileo": (_E, _CLEAN),
-        "tessera": (_E, _MINOR),
-        "agrifm": (_N, _SEVERE),
-    },
-    "breizhcrops": {
-        "raw": (_N, _CLEAN),
-        "presto": (_T, _CLEAN),
-        "olmoearth": (_P, _CLEAN),
-        "galileo": (_P, _CLEAN),
-        "tessera": (_E, _MINOR),
-        "agrifm": (_N, _SEVERE),
-    },
-    "pastis_r": {
-        "raw": (_N, _CLEAN),
-        "presto": (_N, _MINOR),
-        "olmoearth": (_P, _CLEAN),
-        "galileo": (_P, _CLEAN),
-        "tessera": (_P, _CLEAN),
-        "agrifm": (_E, _CLEAN),
-    },
+RUN_RANK: dict[tuple[str, str], int] = {
+    ("cropharvest", "presto"): 1,
+    ("cropharvest", "olmoearth"): 1,
+    ("cropharvest", "galileo"): 1,
+    ("eurocropsml", "presto"): 4,
+    ("eurocropsml", "olmoearth"): 4,
+    ("eurocropsml", "galileo"): 4,
+    ("eurocropsml", "tessera"): 6,
+    ("breizhcrops", "presto"): 3,
+    ("breizhcrops", "tessera"): 6,
+    ("breizhcrops", "olmoearth"): 1,
+    ("breizhcrops", "galileo"): 1,
+    ("pastis_r", "presto"): 8,
+    ("pastis_r", "tessera"): 1,
+    ("pastis_r", "agrifm"): 4,
+    ("pastis_r", "olmoearth"): 1,
+    ("pastis_r", "galileo"): 1,
 }
 
-
-def grade(benchmark: str, model: str) -> tuple[Precedent, Adaptation] | None:
-    """Return the (precedent, adaptation) cell for a pair, or None if ungraded."""
-    return MATRIX.get(benchmark, {}).get(model)
+MODEL_INPUT_MODALITIES: dict[str, tuple[str, ...]] = {
+    "raw": ("s2", "s1", "climate"),
+    "presto": ("s2", "s1", "climate", "latlon", "time"),
+    "galileo": ("s2", "s1", "time"),
+    "olmoearth": ("s2", "time"),
+    "tessera": ("s2", "s1", "time"),
+    "agrifm": ("s2",),
+}
 
 
 def rank(benchmark: str, model: str) -> int | None:
-    """Runnability rank (1 = best) for a pair, or None if ungraded."""
-    cell = grade(benchmark, model)
-    return RANK[cell] if cell is not None else None
+    """Return the table rank for an eligible non-raw pair."""
+    return RUN_RANK.get((benchmark, model))
 
 
 def is_eligible(benchmark: str, model: str) -> bool:
-    """True iff the pair is graded and its adaptation is below the run cutoff."""
-    cell = grade(benchmark, model)
-    return cell is not None and cell[1] < RUN_CUTOFF
+    """True when the model should run on the benchmark."""
+    return benchmark in BENCHMARKS and model in MODEL_ORDER and model not in BLOCKED_MODELS.get(benchmark, set())
 
 
 def eligible_models(benchmark: str) -> list[str]:
-    """Models that should run on ``benchmark``, best-rank first.
+    """Models that should run on ``benchmark``, sorted by the compatibility table rank."""
+    if benchmark not in BENCHMARKS:
+        raise KeyError(f"Benchmark {benchmark!r} not in compatibility table. Known: {sorted(BENCHMARKS)}")
+    order = {model: idx for idx, model in enumerate(MODEL_ORDER)}
+    models = [model for model in MODEL_ORDER if is_eligible(benchmark, model)]
+    return sorted(models, key=lambda model: (RUN_RANK.get((benchmark, model), 999), order[model]))
 
-    Raises ``KeyError`` if the benchmark is absent from the matrix, so a typo or a
-    new, ungraded benchmark fails loudly rather than silently running nothing.
-    """
-    if benchmark not in MATRIX:
-        raise KeyError(f"Benchmark {benchmark!r} not in compatibility matrix. Known: {sorted(MATRIX)}")
-    runnable = [model for model in MATRIX[benchmark] if is_eligible(benchmark, model)]
-    return sorted(runnable, key=lambda model: RANK[MATRIX[benchmark][model]])
+
+def input_modalities(model: str) -> tuple[str, ...]:
+    """Modalities consumed by ``model``; empty tuple if unregistered."""
+    return MODEL_INPUT_MODALITIES.get(model, ())

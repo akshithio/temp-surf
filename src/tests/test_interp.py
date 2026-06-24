@@ -6,7 +6,12 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from dataio.get_input import Benchmark
+from dataio.get_input import (
+    Benchmark,
+    ModalitySeries,
+    NativeSeries,
+    _synthetic_month_doy,
+)
 from diagnostics.interp import (
     AttributionBatch,
     BandSpec,
@@ -21,33 +26,46 @@ from evals.benchmarks.cropharvest import CH_CLIMATE_BANDS, CH_S1_BANDS, CH_S2_BA
 
 
 def _bench() -> Benchmark:
+    """Native-contract fixture: S2 band 0 separates the two label groups (0 vs 10), band 1 carries
+    the sample index. Each sample has 3 acquisitions (months 0-2)."""
     n, t = 4, 3
-    s2 = np.zeros((n, t, len(CH_S2_BANDS)), dtype=np.float32)
-    s2[:2, :, 0] = 0.0
-    s2[2:, :, 0] = 10.0
-    s2[:, :, 1] = np.arange(n, dtype=np.float32)[:, None]
+    months = np.arange(t, dtype=np.int64)
+    doy = _synthetic_month_doy(12)[months]
+    s2_series = []
+    for i in range(n):
+        s = np.zeros((t, len(CH_S2_BANDS)), dtype=np.float32)
+        s[:, 0] = 10.0 if i >= 2 else 0.0
+        s[:, 1] = float(i)
+        s2_series.append(s)
+    s1_series = [np.ones((t, len(CH_S1_BANDS)), dtype=np.float32) for _ in range(n)]
+    clim_series = [np.full((t, len(CH_CLIMATE_BANDS)), 2.0, dtype=np.float32) for _ in range(n)]
+
+    def _mod(series, bands):
+        return ModalitySeries(series, [months] * n, [doy] * n, [np.full(t, 2020, np.int64)] * n, bands)
+
+    native = NativeSeries(_mod(s2_series, CH_S2_BANDS), _mod(s1_series, CH_S1_BANDS), _mod(clim_series, CH_CLIMATE_BANDS))
     return Benchmark(
         name="tiny",
         label_kind="binary",
-        s2=s2,
-        s1=np.ones((n, t, len(CH_S1_BANDS)), dtype=np.float32),
-        climate=np.full((n, t, len(CH_CLIMATE_BANDS)), 2.0, dtype=np.float32),
-        s2_mask=np.ones((n, t), dtype=np.float32),
-        s1_mask=np.ones((n, t), dtype=np.float32),
-        climate_mask=np.ones((n, t), dtype=np.float32),
-        doy=np.tile(np.arange(1, t + 1, dtype=np.float32), (n, 1)),
+        native=native,
         labels=np.array([0, 0, 1, 1], dtype=np.int64),
         groups=np.array(["a", "b", "c", "d"], dtype=object),
         latlon=np.arange(n * 2, dtype=np.float32).reshape(n, 2),
-        s2_bands=CH_S2_BANDS,
-        s1_bands=CH_S1_BANDS,
-        climate_bands=CH_CLIMATE_BANDS,
+        years=np.full(n, 2020, dtype=np.int64),
     )
+
+
+def _band_cols(bench, modality: str) -> np.ndarray:
+    """Stack a modality's per-sample series into (n, t, c) (fixtures use equal-length samples)."""
+    return np.stack([np.asarray(v) for v in getattr(bench.native, modality).values])
 
 
 class FakeModel:
     def encode(self, bench):
-        return np.stack([bench.s2[:, :, 0].mean(axis=1), bench.s2[:, :, 1].mean(axis=1)], axis=1).astype(np.float32)
+        vals, _doy, _months, _bands = bench.native_series("s2")
+        b0 = np.array([v[:, 0].mean() for v in vals], dtype=np.float32)
+        b1 = np.array([v[:, 1].mean() for v in vals], dtype=np.float32)
+        return np.stack([b0, b1], axis=1)
 
 
 class FakeProbe:
@@ -71,9 +89,10 @@ def test_subset_benchmark_preserves_sample_alignment() -> None:
 
     out = subset_benchmark(bench, [3, 1])
 
-    assert out.s2.shape == (2, bench.timesteps, len(CH_S2_BANDS))
-    assert out.s1.shape == (2, bench.timesteps, len(CH_S1_BANDS))
-    assert out.climate.shape == (2, bench.timesteps, len(CH_CLIMATE_BANDS))
+    assert out.n_samples == 2
+    assert out.monthly("s2")[0].shape == (2, 12, len(CH_S2_BANDS))
+    assert len(out.native.s1.values) == 2
+    assert len(out.native.climate.values) == 2
     np.testing.assert_array_equal(out.labels, bench.labels[[3, 1]])
     np.testing.assert_array_equal(out.groups, bench.groups[[3, 1]])
     np.testing.assert_array_equal(out.latlon, bench.latlon[[3, 1]])
@@ -88,10 +107,11 @@ def test_perturb_band_permute_changes_only_selected_band() -> None:
 
     out = perturb_band(bench, spec, mode="permute", seed=0)
 
-    assert not np.array_equal(out.s2[:, :, 0], bench.s2[:, :, 0])
-    np.testing.assert_array_equal(out.s2[:, :, 1:], bench.s2[:, :, 1:])
-    np.testing.assert_array_equal(out.s1, bench.s1)
-    np.testing.assert_array_equal(out.climate, bench.climate)
+    base, new = _band_cols(bench, "s2"), _band_cols(out, "s2")
+    assert not np.array_equal(new[:, :, 0], base[:, :, 0])
+    np.testing.assert_array_equal(new[:, :, 1:], base[:, :, 1:])
+    np.testing.assert_array_equal(_band_cols(out, "s1"), _band_cols(bench, "s1"))
+    np.testing.assert_array_equal(_band_cols(out, "climate"), _band_cols(bench, "climate"))
 
 
 def test_perturb_band_zero_zeros_only_selected_band() -> None:
@@ -100,9 +120,10 @@ def test_perturb_band_zero_zeros_only_selected_band() -> None:
 
     out = perturb_band(bench, spec, mode="zero", seed=0)
 
-    assert np.all(out.s2[:, :, 1] == 0.0)
-    np.testing.assert_array_equal(out.s2[:, :, 0], bench.s2[:, :, 0])
-    np.testing.assert_array_equal(out.s2[:, :, 2:], bench.s2[:, :, 2:])
+    base, new = _band_cols(bench, "s2"), _band_cols(out, "s2")
+    assert np.all(new[:, :, 1] == 0.0)
+    np.testing.assert_array_equal(new[:, :, 0], base[:, :, 0])
+    np.testing.assert_array_equal(new[:, :, 2:], base[:, :, 2:])
 
 
 def test_permutation_importance_ranks_known_useful_band_first() -> None:

@@ -19,8 +19,8 @@ NAME = "geographic_ood"
 GROUP_KIND = "geography"
 HAS_TARGET = True
 # This regime is expected to yield exactly one split per curated holdout in bench.HOLDOUTS.
-# The runner (main._iter_splits) checks for any holdout that dropped out and routes it through
-# _regime_problem, so a partial matrix (e.g. 4 of 5 holdouts) is caught by STRICT_REGIMES.
+# The runner checks for any holdout that dropped out and routes it through regime_problem, so a
+# partial matrix (e.g. 4 of 5 holdouts) is caught by OVERWRITE_MODE.
 USES_CURATED_HOLDOUTS = True
 assign_domains = geography_domains
 
@@ -73,7 +73,7 @@ def iter_splits(y, groups, *, seed, holdouts, n_folds=None, val_group=None, **_)
     A curated holdout that cannot form a valid split (region absent, one-class test set, or a
     one-class training pool after excluding it) is dropped here with a reason printed; the
     runner separately detects the missing holdout and routes it through ``_regime_problem`` (so
-    ``STRICT_REGIMES`` turns the resulting incomplete matrix into a hard failure).
+    ``OVERWRITE_MODE`` turns the resulting incomplete matrix into a hard failure).
     """
     for holdout in holdouts:
         try:

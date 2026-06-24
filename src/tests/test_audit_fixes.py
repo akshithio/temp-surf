@@ -179,36 +179,30 @@ def test_append_jsonl_roundtrips_batch(tmp_path):
 # Strict regimes + target-only calibration + subset guard
 # --------------------------------------------------------------------------- #
 def test_dropped_curated_holdout_is_surfaced_and_strict_raises():
-    import main
+    from evals.regimes import base as RB
     groups = np.array(["A"] * 20 + ["B"] * 20 + ["C"] * 5, dtype=object)
     y = np.array([0, 1] * 20 + [0] * 5)          # C is one-class -> dropped
     bench = type("FB", (), {"name": "fb", "groups": groups})()
 
-    main._REGIME_PROBLEMS.clear()
-    saved = main.STRICT_REGIMES
-    try:
-        main.STRICT_REGIMES = False
-        list(main._iter_splits("geographic_ood", bench, y, holdouts=["A", "B", "C"], seed=0))
-        assert any("C" in reason for _, reg, reason in main._REGIME_PROBLEMS if reg == "geographic_ood")
+    RB.REGIME_PROBLEMS.clear()
+    list(RB.iter_splits("geographic_ood", bench, y, holdouts=["A", "B", "C"], seed=0, overwrite_mode=False))
+    assert any("C" in reason for _, reg, reason in RB.REGIME_PROBLEMS if reg == "geographic_ood")
 
-        main.STRICT_REGIMES = True
-        with pytest.raises(RuntimeError):
-            list(main._iter_splits("geographic_ood", bench, y, holdouts=["A", "B", "C"], seed=0))
-    finally:
-        main.STRICT_REGIMES = saved
+    with pytest.raises(RuntimeError):
+        list(RB.iter_splits("geographic_ood", bench, y, holdouts=["A", "B", "C"], seed=0, overwrite_mode=True))
 
 
-def test_strict_regimes_defaults_true():
+def test_overwrite_mode_defaults_false():
     import importlib
 
     import main
-    saved = os.environ.pop("STRICT_REGIMES", None)
+    saved = os.environ.pop("OVERWRITE_MODE", None)
     try:
         importlib.reload(main)
-        assert main.STRICT_REGIMES is True       # in-file default is strict
+        assert main.OVERWRITE_MODE is False       # in-file default is False (lenient)
     finally:
         if saved is not None:
-            os.environ["STRICT_REGIMES"] = saved
+            os.environ["OVERWRITE_MODE"] = saved
         importlib.reload(main)
 
 
@@ -226,16 +220,22 @@ def test_galileo_point_path_uses_real_masks_and_months():
         from models.galileo import _GALILEO_S2_GROUP_IDS, GalileoModel
     except Exception as exc:  # galileo package / weights stub unavailable in this env
         pytest.skip(f"galileo import unavailable: {exc}")
-    n, t = 2, 12
-    doy = np.tile(np.array([15, 46, 75, 106, 136, 167, 197, 228, 259, 289, 320, 350]), (n, 1))
-    s2_mask = np.ones((n, t), np.float32)
-    s2_mask[:, 3] = 0.0  # timestep 3 unobserved
-    bench = type("B", (), {
-        "s2": np.ones((n, t, 11), np.float32), "s1": np.zeros((n, t, 2), np.float32),
-        "s2_bands": ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12", "NDVI"],
-        "s1_bands": ["VV", "VH"], "s2_mask": s2_mask, "s1_mask": np.zeros((n, t), np.float32),
-        "doy": doy,
-    })()
+    from dataio.get_input import Benchmark, ModalitySeries, NativeSeries, _synthetic_month_doy
+
+    n = 2
+    obs_months = np.array([0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11], dtype=np.int64)  # month 3 (April) unobserved
+    doy = _synthetic_month_doy(12)[obs_months].astype(np.float32)
+    s2_bands = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12", "NDVI"]
+    s2 = ModalitySeries(
+        [np.ones((len(obs_months), 11), np.float32) for _ in range(n)],
+        [obs_months] * n, [doy] * n, [np.full(len(obs_months), 2019, np.int64)] * n, s2_bands,
+    )
+    native = NativeSeries(s2=s2, s1=ModalitySeries.absent(n), climate=ModalitySeries.absent(n))
+    bench = Benchmark(
+        name="pastis_r", label_kind="segmentation", native=native,
+        labels=np.zeros(n, np.int64), groups=np.array(["a", "b"], dtype=object),
+        latlon=np.zeros((n, 2), np.float32), years=np.full(n, 2019, np.int64),
+    )
     *_, s_t_m, _, _, _, months = GalileoModel()._bench_to_galileo(bench)
     # months follow the calendar (0..11), not a constant July(6)
     assert months[0].tolist() == list(range(12))
@@ -279,21 +279,20 @@ def test_target_sweep_shared_test_and_full_pool_oracle():
 # Run-signature guard (#1)
 # --------------------------------------------------------------------------- #
 def test_run_signature_guard_rejects_mismatch(tmp_path, monkeypatch):
-    import main
+    from utils import runstate
     d = tmp_path / "results"
     d.mkdir()
-    monkeypatch.setattr(main, "OVERWRITE_MODE", "skip")
-    main._check_run_signature(d, "sigAAAA")                    # empty dir is fine
-    main._publish_run_signature(d, "sigAAAA")
-    main._check_run_signature(d, "sigAAAA")                    # same signature resumes fine
+    runstate.check_run_signature(d, "sigAAAA", overwrite_mode=False)                    # empty dir is fine
+    runstate.publish_run_signature(d, "sigAAAA")
+    runstate.check_run_signature(d, "sigAAAA", overwrite_mode=False)                    # same signature resumes fine
     with pytest.raises(RuntimeError):
-        main._check_run_signature(d, "sigDIFFERENT")           # different config refuses to mix
+        runstate.check_run_signature(d, "sigDIFFERENT", overwrite_mode=False)           # different config refuses to mix
     # results present but UNSIGNED -> also refused (stale/foreign adoption)
     d2 = tmp_path / "results2"
     d2.mkdir()
     (d2 / "probe_results.jsonl").write_text('{"a": 1}\n')
     with pytest.raises(RuntimeError):
-        main._check_run_signature(d2, "sigAAAA")
+        runstate.check_run_signature(d2, "sigAAAA", overwrite_mode=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -383,20 +382,19 @@ def test_require_dense_cache_rejects_extra_tile(tmp_path, monkeypatch):
 
 
 def test_run_signature_rejects_empty_or_corrupt(tmp_path, monkeypatch):
-    import main
+    from utils import runstate
     d = tmp_path / "r"
     d.mkdir()
-    monkeypatch.setattr(main, "OVERWRITE_MODE", "skip")
     (d / "run_signature.txt").write_text("")   # crashed/corrupt publish
     with pytest.raises(RuntimeError):
-        main._check_run_signature(d, "sigAAAA")
+        runstate.check_run_signature(d, "sigAAAA", overwrite_mode=False)
 
 
 # --------------------------------------------------------------------------- #
 # Round-7: LEAVE_ONE_DOMAIN_OUT completeness + enriched run signature
 # --------------------------------------------------------------------------- #
 def test_leave_one_domain_out_dropped_domain_surfaced(monkeypatch):
-    import main
+    from evals.regimes import base as RB
     from evals.regimes.base import Split
 
     class StubRegime:
@@ -416,28 +414,41 @@ def test_leave_one_domain_out_dropped_domain_surfaced(monkeypatch):
                 tr = np.flatnonzero(groups != d)
                 yield Split(f"koppen_{d}", tr, idx, np.array([], dtype=int), domain=d)
 
-    monkeypatch.setattr(main, "load_regime", lambda name: StubRegime)
-    monkeypatch.setattr(main, "STRICT_REGIMES", False)
-    main._REGIME_PROBLEMS.clear()
+    monkeypatch.setattr(RB, "load_regime", lambda name: StubRegime)
+    RB.REGIME_PROBLEMS.clear()
     bench = type("B", (), {"name": "b"})()
-    list(main._iter_splits("climate_ood", bench, np.array([0, 1, 0, 1, 0, 1]), holdouts=None, seed=0))
-    assert any("C" in reason for _, reg, reason in main._REGIME_PROBLEMS if reg == "climate_ood")
+    list(RB.iter_splits(
+        "climate_ood",
+        bench,
+        np.array([0, 1, 0, 1, 0, 1]),
+        holdouts=None,
+        seed=0,
+        overwrite_mode=False,
+    ))
+    assert any("C" in reason for _, reg, reason in RB.REGIME_PROBLEMS if reg == "climate_ood")
 
 
 def test_run_signature_includes_seeds_and_enc_kwargs():
-    import main
-    base = main._run_signature("raw", "tag", ["random_id"], [0, 1, 2], {"device": "cpu"})
-    assert main._run_signature("raw", "tag", ["random_id"], [0, 1], {"device": "cpu"}) != base   # seeds matter
-    assert main._run_signature("raw", "tag", ["random_id"], [0, 1, 2],
-                               {"device": "cpu", "weights_path": "/x"}) != base                  # enc kwargs matter
-    assert main._run_signature("raw", "tag", ["random_id"], [0, 1, 2], {"device": "cuda"}) == base  # device ignored
+    from utils import runstate
+    kwargs = dict(
+        active_probes=["logistic"],
+        budget_regimes={"source": [0], "target": [0, 0.1]},
+        max_samples=None,
+        max_dense_pixels=50_000,
+    )
+    base = runstate.run_signature("raw", "tag", ["random_id"], [0, 1, 2], {"device": "cpu"}, **kwargs)
+    assert runstate.run_signature("raw", "tag", ["random_id"], [0, 1], {"device": "cpu"}, **kwargs) != base
+    assert runstate.run_signature(
+        "raw", "tag", ["random_id"], [0, 1, 2], {"device": "cpu", "weights_path": "/x"}, **kwargs
+    ) != base
+    assert runstate.run_signature("raw", "tag", ["random_id"], [0, 1, 2], {"device": "cuda"}, **kwargs) == base
 
 
 # --------------------------------------------------------------------------- #
 # Round-8: partial-resume prune, custom-weights cache key, signature includes cacheutils
 # --------------------------------------------------------------------------- #
 def test_prune_partial_budgets_removes_surviving_scope(tmp_path):
-    import main
+    from utils import runstate
     rows_path = tmp_path / "probe_results.jsonl"
     preds_path = tmp_path / "predictions.jsonl"
 
@@ -451,7 +462,7 @@ def test_prune_partial_budgets_removes_surviving_scope(tmp_path):
     IOU.append_jsonl(preds_path, [{**row(0, "held_out"), "sample_id": 1}])
     base = (0, "geographic_ood", "t", "erm", "logistic")
     rerun = {(*base, "target", 0)}                       # budget 0 will be regenerated (both scopes)
-    kept = main._prune_partial_budgets(rows, rows_path, preds_path, rerun)
+    kept = runstate.prune_partial_budgets(rows, rows_path, preds_path, rerun)
     assert [r["label_budget"] for r in kept] == [5]      # the partial budget-0 row was pruned
     assert [r["label_budget"] for r in IOU.read_jsonl(rows_path)] == [5]   # jsonl rewritten
     assert IOU.read_jsonl(preds_path) == []              # its prediction pruned too
@@ -470,22 +481,34 @@ def test_custom_weights_path_changes_embedding_cache_key(tmp_path):
 
 
 def test_run_signature_includes_cacheutils_in_code_hash():
-    import main
+    from utils import runstate
+    kwargs = dict(
+        active_probes=["logistic"],
+        budget_regimes={"source": [0], "target": [0, 0.1]},
+        max_samples=None,
+        max_dense_pixels=50_000,
+    )
     # the code hash folds cacheutils.py; sanity: signature is stable and non-empty (the hashed set
     # is exercised), and changing seeds (a separate input) changes it.
-    sig = main._run_signature("raw", "tag", ["random_id"], [0], {"device": "cpu"})
-    assert sig and sig == main._run_signature("raw", "tag", ["random_id"], [0], {"device": "cpu"})
+    sig = runstate.run_signature("raw", "tag", ["random_id"], [0], {"device": "cpu"}, **kwargs)
+    assert sig and sig == runstate.run_signature("raw", "tag", ["random_id"], [0], {"device": "cpu"}, **kwargs)
 
 
 def test_run_signature_reflects_override_checkpoint_content(tmp_path):
-    import main
+    from utils import runstate
     wp = tmp_path / "agrifm.pth"
     wp.write_bytes(b"weights-v1" + b"\0" * 64)
     enc = {"device": "cpu", "weights_path": str(wp)}
-    sig1 = main._run_signature("agrifm", "tag", ["geographic_ood"], [0], enc)
+    kwargs = dict(
+        active_probes=["logistic"],
+        budget_regimes={"source": [0], "target": [0, 0.1]},
+        max_samples=None,
+        max_dense_pixels=50_000,
+    )
+    sig1 = runstate.run_signature("agrifm", "tag", ["geographic_ood"], [0], enc, **kwargs)
     # SAME path, different content (cold cache = a between-runs replace) -> signature MUST change
     mtime = wp.stat().st_mtime
     wp.write_bytes(b"weights-v2" + b"\0" * 64)
     os.utime(wp, (mtime, mtime))
     C._hash_file_content.cache_clear()
-    assert main._run_signature("agrifm", "tag", ["geographic_ood"], [0], enc) != sig1
+    assert runstate.run_signature("agrifm", "tag", ["geographic_ood"], [0], enc, **kwargs) != sig1

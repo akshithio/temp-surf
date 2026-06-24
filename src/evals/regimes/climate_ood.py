@@ -9,8 +9,8 @@ Split: strict leave-one-domain-out, the SAME mechanism as ``geographic_ood`` —
 climate gap is directly comparable to the region gap and you can ask "does the
 geographic failure reduce to a climate failure?". HAS_TARGET = True.
 
-Requires sample coordinates + the staged Köppen grid; where either is absent the runner
-(``main._iter_splits``) catches the failure and skips this regime for that benchmark.
+Requires sample coordinates + the staged Köppen grid; where either is absent the runner catches the
+failure and skips this regime for that benchmark.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ NAME = "climate_ood"
 GROUP_KIND = "climate"
 HAS_TARGET = True
 # Leave-one-domain-out over discovered domains: the runner checks that every non-unknown domain
-# yielded a split and routes any dropped (degenerate) domain through _regime_problem so STRICT
+# yielded a split and routes any dropped (degenerate) domain through regime_problem so OVERWRITE_MODE
 # catches a partial climate matrix.
 LEAVE_ONE_DOMAIN_OUT = True
 

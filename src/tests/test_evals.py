@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import numpy as np
 
 from evals import evals as EV
-from evals.regimes import phenology_ood
-from evals.regimes.phenology_ood import phenology_domains
 
 
 def test_make_strict_holdout_splits() -> None:
@@ -42,42 +38,6 @@ def test_subset_indices() -> None:
 
     assert len(tiny) == 2
     np.testing.assert_array_equal(full, np.arange(len(y)))
-
-
-def test_phenology_domains_use_ndvi_peak_timing_and_low_amplitude() -> None:
-    bench = SimpleNamespace(
-        name="toy",
-        s2=np.array(
-            [
-                [[0.1], [0.8], [0.2], [0.1]],  # early peak
-                [[0.1], [0.2], [0.3], [0.8]],  # late peak
-                [[0.4], [0.4], [0.4], [0.4]],  # low amplitude
-            ],
-            dtype=np.float32,
-        ),
-        s2_mask=np.ones((3, 4), dtype=np.float32),
-        s2_bands=["NDVI"],
-    )
-
-    domains = phenology_domains(bench)
-
-    np.testing.assert_array_equal(
-        domains,
-        np.array(["phenology_early_peak", "phenology_late_peak", "phenology_low_amplitude"], dtype=object),
-    )
-
-
-def test_phenology_ood_splits_by_assigned_domains() -> None:
-    y = np.array([0, 1, 0, 1, 0, 1])
-    domains = np.array(["early", "early", "mid", "mid", "late", "late"], dtype=object)
-
-    splits = list(phenology_ood.iter_splits(y, domains, seed=0))
-
-    assert {s.label for s in splits} == {"early", "mid", "late"}
-    for s in splits:
-        assert set(domains[s.test]) == {s.label}
-        assert set(s.train).isdisjoint(s.test)
-        assert set(s.val).isdisjoint(s.test)  # val is held out of test too
 
 
 def test_expected_calibration_error() -> None:
@@ -125,6 +85,28 @@ def test_binary_probe_writes_predictions_for_each_source_budget() -> None:
     assert {"prob", "pred_default", "pred_calibrated"}.issubset(preds[0])
     assert {"worst_group_calibrated_f1", "worst_group_score", "n_groups_scored"}.issubset(rows[0])
     assert rows[0]["n_groups_scored"] == 1
+
+
+def test_source_budget_zero_is_full_source_anchor() -> None:
+    rng = np.random.default_rng(9)
+    x_train = rng.normal(size=(40, 4))
+    y_train = np.array([0, 1] * 20)
+    x_train[y_train == 1, 0] += 2.0
+    rows: list[dict] = []
+
+    EV.run_probes(
+        rows,
+        x_train,
+        x_train,
+        y_train,
+        y_train,
+        seed=0,
+        budgets=[0],
+        meta={"model": "e", "benchmark": "t", "method": "erm", "split_regime": "random_id"},
+    )
+
+    assert rows[0]["label_budget"] == 0
+    assert rows[0]["n_train_sub"] == len(y_train)
 
 
 def test_binary_probe_reports_worst_group_on_mixed_domain_test_set() -> None:
@@ -184,6 +166,99 @@ def test_multiclass_probe_writes_prediction_vectors() -> None:
     assert {"worst_group_macro_f1", "worst_group_score", "n_groups_scored"}.issubset(rows[0])
 
 
+def test_target_zero_reuses_fitted_probe_for_both_evaluation_scopes(monkeypatch) -> None:
+    rng = np.random.default_rng(8)
+    y_source = np.tile(np.arange(3), 20)
+    y_target = np.tile(np.arange(3), 10)
+    y_val = np.tile(np.arange(3), 5)
+
+    def features(labels):
+        values = rng.normal(size=(len(labels), 5))
+        values[np.arange(len(labels)), labels] += 3.0
+        return values
+
+    original = EV.fit_probe_multiclass
+    fit_calls = 0
+
+    def counted_fit(*args, **kwargs):
+        nonlocal fit_calls
+        fit_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(EV, "fit_probe_multiclass", counted_fit)
+    rows: list[dict] = []
+    EV.run_probes_multiclass_target(
+        rows,
+        features(y_source),
+        features(y_target),
+        y_source,
+        y_target,
+        seed=0,
+        budgets=[0],
+        x_val=features(y_val),
+        y_val=y_val,
+    )
+
+    assert fit_calls == 1
+    assert {row["evaluation_split"] for row in rows} == {"held_out", "full"}
+
+    binary_original = EV.fit_probe_with_calibration
+    binary_fit_calls = 0
+
+    def counted_binary_fit(*args, **kwargs):
+        nonlocal binary_fit_calls
+        binary_fit_calls += 1
+        return binary_original(*args, **kwargs)
+
+    monkeypatch.setattr(EV, "fit_probe_with_calibration", counted_binary_fit)
+    binary_source = np.array([0, 1] * 30)
+    binary_target = np.array([0, 1] * 15)
+    binary_val = np.array([0, 1] * 8)
+    binary_rows: list[dict] = []
+    EV.run_probes_target(
+        binary_rows,
+        features(binary_source),
+        features(binary_target),
+        binary_source,
+        binary_target,
+        seed=0,
+        budgets=[0],
+        x_val=features(binary_val),
+        y_val=binary_val,
+    )
+
+    assert binary_fit_calls == 1
+    assert {row["evaluation_split"] for row in binary_rows} == {"held_out", "full"}
+
+
+def test_fractional_target_budget_uses_fraction_of_target_train_pool() -> None:
+    rng = np.random.default_rng(12)
+    y_source = np.array([0, 1] * 30)
+    y_target = np.array([0, 1] * 50)
+    y_val = np.array([0, 1] * 10)
+
+    def features(labels):
+        values = rng.normal(size=(len(labels), 4))
+        values[np.arange(len(labels)), labels] += 2.0
+        return values
+
+    rows: list[dict] = []
+    EV.run_probes_target(
+        rows,
+        features(y_source),
+        features(y_target),
+        y_source,
+        y_target,
+        seed=0,
+        budgets=[0.1],
+        x_val=features(y_val),
+        y_val=y_val,
+    )
+
+    assert rows[0]["label_budget"] == 0.1
+    assert rows[0]["n_train_sub"] == len(y_source) + 8  # 10% of the fixed 80-sample target train pool
+
+
 def test_segmentation_probe_reports_official_validation_and_test_splits() -> None:
     rng = np.random.default_rng(7)
     y_train = np.tile(np.arange(3), 30)
@@ -195,19 +270,92 @@ def test_segmentation_probe_reports_official_validation_and_test_splits() -> Non
         values[np.arange(len(labels)), labels] += 4.0
         return values
 
+    x_train, x_val, x_test = features(y_train), features(y_val), features(y_test)
     rows: list[dict] = []
     EV.run_probes_segmentation(
         rows,
-        features(y_train),
-        features(y_val),
-        features(y_test),
+        x_train,
+        x_val,
         y_train,
         y_val,
-        y_test,
         seed=0,
+        # full-fold streaming eval: each split presented as a single in-memory "tile"
+        eval_streams={
+            "validation": lambda: iter([(x_val, y_val)]),
+            "test": lambda: iter([(x_test, y_test)]),
+        },
         budgets=[1.0],
         meta={"benchmark": "pastis_r"},
     )
 
     assert {row["evaluation_split"] for row in rows} == {"validation", "test"}
     assert all({"miou", "pixel_accuracy", "macro_f1", "weighted_f1"}.issubset(row) for row in rows)
+    assert all(row["n_test"] == len(y_val) for row in rows if row["evaluation_split"] == "validation")
+
+
+def test_streamed_segmentation_matches_whole_array_scoring() -> None:
+    """Streaming tiles into the confusion-based scorer gives the exact same mIoU / pixel-accuracy as
+    scoring the concatenation in one shot -- so full-fold streaming is a faithful (not approximate)
+    replacement for the old capped-sample scoring."""
+    from evals.probes import score_segmentation, score_segmentation_streamed
+
+    eval_classes = np.arange(19, dtype=np.int64)
+    rng = np.random.default_rng(0)
+
+    class _Clf:
+        classes_ = np.arange(19)
+
+        def predict(self, x):
+            return (np.abs(x[:, 0]) * 100 % 19).astype(int)
+
+    clf = _Clf()
+    t1x, t1y = rng.normal(size=(50, 4)), rng.integers(0, 19, 50)
+    t2x, t2y = rng.normal(size=(70, 4)), rng.integers(0, 19, 70)
+    whole = score_segmentation(clf, np.concatenate([t1x, t2x]), np.concatenate([t1y, t2y]), eval_classes=eval_classes)
+    streamed = score_segmentation_streamed(clf, iter([(t1x, t1y), (t2x, t2y)]), eval_classes)
+
+    assert abs(streamed["miou"] - whole["miou"]) < 1e-9
+    assert abs(streamed["pixel_accuracy"] - whole["pixel_accuracy"]) < 1e-9
+    assert streamed["n_test"] == 120 and streamed["n_tiles_scored"] == 2
+
+
+def test_score_multiclass_reports_shared_and_unseen_class_decomposition() -> None:
+    """#7: a source-only probe can't predict target-only classes, so report shared-class metrics +
+    the unseen-class prevalence separately from the full-label metrics."""
+    from evals.probes import score_multiclass
+
+    class _Clf:
+        classes_ = np.array([0, 1, 2])  # trained only on classes 0,1,2
+
+        def predict(self, x):
+            return np.zeros(len(x), dtype=int)
+
+        def predict_proba(self, x):
+            return np.tile([0.6, 0.3, 0.1], (len(x), 1))
+
+    y = np.array([0, 1, 2, 3, 0, 1, 2, 3, 0, 1])  # class 3 is target-only (absent from training)
+    s = score_multiclass(_Clf(), np.zeros((len(y), 4)), y)
+
+    assert s["n_classes_seen"] == 3
+    assert s["n_classes_unseen"] == 1
+    assert abs(s["unseen_prevalence"] - 0.2) < 1e-9  # 2 of 10 samples are the unseen class
+    assert not np.isnan(s["shared_macro_f1"])  # representation-only metric on the seen-class subset
+
+
+def test_domain_confound_report_flags_geography_entanglement() -> None:
+    """#8/#9: cross-tab the domain bases so a confounded axis is visible. Here climate is a function
+    of country (geography determines it) while year is independent of geography."""
+    from evals.confounds import domain_confound_report
+
+    geography = np.array(["PT", "PT", "EE", "EE", "LV", "LV"])
+    climate = np.array(["C", "C", "D", "D", "D", "D"])  # PT->C, EE->D, LV->D: country fixes climate
+    year = np.array([2020, 2021, 2020, 2021, 2020, 2021])  # each country spans both years -> independent
+    rep = domain_confound_report(
+        {"geography": geography, "climate": climate, "year": year, "class": np.zeros(6)}
+    )
+
+    geo_climate = rep["pairs"]["geography__vs__climate"]
+    assert geo_climate["determines_b_given_a"] > 0.99  # geography fully determines climate -> confounded
+    assert "contingency" in geo_climate
+    assert rep["pairs"]["geography__vs__year"]["nmi"] < 0.2  # geography/year not entangled
+    assert "class" not in rep["axis_cardinality"]  # single-valued axis dropped

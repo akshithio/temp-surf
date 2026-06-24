@@ -21,6 +21,8 @@ import numpy as np
 
 from dataio.get_input import (
     Benchmark,
+    ModalitySeries,
+    NativeSeries,
     _synthetic_month_doy,
 )
 
@@ -41,6 +43,7 @@ SPLIT_REGIMES = ["random_id", "geographic_ood"]
 BZ_X_BANDS = ["B1", "B10", "B11", "B12", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9"]
 BZ_S2_KEEP = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12"]
 BZ_S2_BANDS = BZ_S2_KEEP + ["NDVI"]
+BZ_S2_BANDS_ALL = BZ_X_BANDS + ["NDVI"]  # ALL native L1C bands + computed NDVI (no pre-selection)
 # Only the four FRH NUTS-3 regions, matching the published BreizhCrops fold (frh01+frh02 train,
 # frh03 val, frh04 test). belle-ile is deliberately EXCLUDED: including it would put it in the
 # training pool and break the published-anchor comparison.
@@ -103,14 +106,16 @@ def load_benchmark(
     seed: int = 0,
     regions: list[str] | None = None,
 ) -> Benchmark:
-    """Load BreizhCrops L1C S2 time series as 12-step parcels (crop-type classification).
+    """Load BreizhCrops L1C parcels at their native cadence (crop-type classification).
 
-    Uses the ``breizhcrops`` package to read each NUTS-3 region's variable-length L1C
-    parcels, keeps the 10 S2 bands + a computed NDVI, rescales reflectance to DN (x1e4,
-    matching the other benchmarks), and linspace-resamples each parcel to 12 timesteps with
-    a synthetic monthly DOY. ``groups`` = region (geographic holdout; frh04 is the paper's
-    test region). S2-only (no S1 / climate). ``latlon`` is joined per parcel id from the
-    parcel shapefile (``_bz_parcel_latlon``); parcels with no geometry stay NaN.
+    Uses the ``breizhcrops`` package to read each NUTS-3 region's variable-length L1C parcels,
+    keeps ALL native bands + a computed NDVI, rescales reflectance to DN (x1e4, matching the other
+    benchmarks), and carries the FULL acquisition series (no resampling) so models do their own
+    temporal handling. ``groups`` = region (geographic holdout; frh04 is the paper's test region).
+    S2-only (no S1 / climate). ``latlon`` is joined per parcel id from the parcel shapefile
+    (``_bz_parcel_latlon``); parcels with no geometry stay NaN. NOTE: real per-acquisition dates are
+    not exposed by this loader, so each parcel's acquisitions are assigned an even synthetic spread
+    over the calendar year -- the full cadence is preserved, only the month labels are approximate.
     """
     try:
         import breizhcrops as bzh
@@ -119,11 +124,9 @@ def load_benchmark(
 
     base = root / "breizhcrops"
     regions = regions or BZ_REGIONS
-    col = {b: i for i, b in enumerate(BZ_X_BANDS)}
-    keep_idx = [col[b] for b in BZ_S2_KEEP]
-    b4i, b8i = col["B4"], col["B8"]
+    b4i, b8i = BZ_X_BANDS.index("B4"), BZ_X_BANDS.index("B8")
 
-    s2_list: list[np.ndarray] = []
+    series: list[np.ndarray] = []
     labels: list[int] = []
     groups: list[str] = []
     latlons: list[tuple[float, float]] = []
@@ -139,45 +142,40 @@ def load_benchmark(
             b4, b8 = x[:, b4i], x[:, b8i]
             denom = b8 + b4
             ndvi = np.divide(b8 - b4, denom, out=np.zeros_like(b4), where=denom != 0)
-            s2 = np.concatenate([x[:, keep_idx], ndvi[:, None]], axis=1)  # (T, 11)
-            s2_list.append(_resample_fixed(s2, BZ_TIMESTEPS))
+            series.append(np.concatenate([x, ndvi[:, None]], axis=1).astype(np.float32))  # all 13 bands + NDVI
             labels.append(int(y))
             groups.append(region)
             latlons.append(latlon_map.get(int(fid), (np.nan, np.nan)))
 
-    if not s2_list:
+    if not series:
         raise ValueError(f"No BreizhCrops parcels parsed from {base}")
 
-    order = np.arange(len(s2_list))
+    order = np.arange(len(series))
     if shuffle:
         order = np.random.default_rng(seed).permutation(order)
     if max_samples:
         order = order[:max_samples]
-    s2 = np.stack([s2_list[i] for i in order]).astype(np.float32)
+    series = [series[i] for i in order]
     labels_arr = np.asarray([labels[i] for i in order], dtype=np.int64)
     groups_arr = np.asarray([groups[i] for i in order], dtype=object)
     latlon_arr = np.asarray([latlons[i] for i in order], dtype=np.float32)
 
-    n = len(s2)
-    doy = np.tile(_synthetic_month_doy(BZ_TIMESTEPS), (n, 1))
-    ones = np.ones((n, BZ_TIMESTEPS), dtype=np.float32)
-    zeros = np.zeros((n, BZ_TIMESTEPS), np.float32)
+    n = len(series)
+    months = [np.clip((np.arange(len(s)) / max(len(s) - 1, 1) * 11).round().astype(np.int64), 0, 11) for s in series]
+    doy = [_synthetic_month_doy(12)[m].astype(np.float32) for m in months]
+    years_l = [np.full(len(s), 2017, dtype=np.int64) for s in series]
+    native = NativeSeries(
+        s2=ModalitySeries(series, months, doy, years_l, BZ_S2_BANDS_ALL),
+        s1=ModalitySeries.absent(n),
+        climate=ModalitySeries.absent(n),
+    )
     return Benchmark(
         name="breizhcrops",
         label_kind="multiclass",
-        s2=s2,
-        s1=np.zeros((n, BZ_TIMESTEPS, 2), np.float32),
-        climate=np.zeros((n, BZ_TIMESTEPS, 0), np.float32),
-        s2_mask=ones.copy(),
-        s1_mask=zeros.copy(),
-        climate_mask=zeros.copy(),
-        doy=doy,
+        native=native,
         labels=labels_arr,
         groups=groups_arr,
         latlon=latlon_arr,
-        s2_bands=BZ_S2_BANDS,
-        s1_bands=["VV", "VH"],
-        climate_bands=[],
         label_names=_bz_class_names(base),
         years=np.full(n, 2017, np.int64),
     )

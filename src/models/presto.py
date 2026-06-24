@@ -86,7 +86,10 @@ DEFAULT_PRESTO_WEIGHTS = _INPUT / "models" / "presto" / PRESTO_HF_FILENAME
 # February). This is start_month=1 verbatim from presto/eval/cropharvest_eval.py. Benchmarks
 # absent from this map (e.g. EuroCropsML, harmonized to calendar Jan-Dec monthly composites
 # whose timestep 0 really is January) fall back to deriving the start month from day-of-year.
-PRESTO_START_MONTH: dict[str, int] = {"cropharvest": 1}
+# The monthly view (bench.monthly) is always calendar-ordered (Jan first), so timestep 0 is
+# January for every benchmark and the start month is derived from the view's doy. (No per-benchmark
+# override is needed now that temporal aggregation is the model's own, on a canonical Jan-Dec grid.)
+PRESTO_START_MONTH: dict[str, int] = {}
 
 # Which Benchmark modality supplies each Presto band (None = never available).
 _BAND_MODALITY: dict[str, str | None] = {
@@ -137,7 +140,7 @@ def _default_load_model(weights_path: str | None) -> Any:
     # verified checksum rather than flipping this back.
     model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
     model.eval()
-    return model.model
+    return model.encoder
 
 
 @dataclass
@@ -163,27 +166,34 @@ class PrestoModel:
             self._model.to(self.device)
             self._model.eval()
 
-    # ---- input assembly (verifiable without Presto) ------------------------
+    # ---- input assembly (to_native; verifiable without Presto) -------------
     def to_presto_inputs(
         self, bench: Benchmark
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Assemble (x, mask, dynamic_world, latlons, months) as numpy arrays.
 
+        Presto is a month-cadence model, so its ``to_native`` requests each modality's monthly
+        composite (``bench.monthly``) of the FULL native band set and maps the 17 Presto bands by
+        name. The monthly grid is calendar-ordered (Jan-first), so the start month is January.
+
         x:    (N, T, 17) normalized; mask: (N, T, 17) 1==missing;
         dynamic_world: (N, T) all-missing; latlons: (N, 2); months: (N,).
         """
-        n, t = bench.s2.shape[0], bench.s2.shape[1]
+        s2_vals, s2_msk, doy_arr, s2_bands = bench.monthly("s2")
+        s1_vals, s1_msk, _, s1_bands = bench.monthly("s1")
+        clim_vals, clim_msk, _, clim_bands = bench.monthly("climate")
+        n, t = s2_vals.shape[0], s2_vals.shape[1]
         x = np.zeros((n, t, PRESTO_NUM_BANDS), dtype=np.float32)
         mask = np.ones((n, t, PRESTO_NUM_BANDS), dtype=np.float32)  # default missing
 
         # Per-modality (name -> column) lookup and per-timestep availability.
         cols = {
-            "s2": {b: i for i, b in enumerate(bench.s2_bands)},
-            "s1": {b: i for i, b in enumerate(bench.s1_bands)},
-            "climate": {b: i for i, b in enumerate(bench.climate_bands)},
+            "s2": {b: i for i, b in enumerate(s2_bands)},
+            "s1": {b: i for i, b in enumerate(s1_bands)},
+            "climate": {b: i for i, b in enumerate(clim_bands)},
         }
-        arrays = {"s2": bench.s2, "s1": bench.s1, "climate": bench.climate}
-        avail = {"s2": bench.s2_mask, "s1": bench.s1_mask, "climate": bench.climate_mask}
+        arrays = {"s2": s2_vals, "s1": s1_vals, "climate": clim_vals}
+        avail = {"s2": s2_msk, "s1": s1_msk, "climate": clim_msk}
 
         for b_idx, band in enumerate(PRESTO_BANDS):
             modality = _BAND_MODALITY[band]
@@ -207,7 +217,7 @@ class PrestoModel:
         months = (
             np.full(n, start_month, dtype=np.int64)
             if start_month is not None
-            else _doy_to_month(bench.doy[:, 0])
+            else _doy_to_month(doy_arr[:, 0])
         )
         return x, mask, dynamic_world, latlons, months
 

@@ -105,55 +105,78 @@ def band_specs(bench: Any) -> list[BandSpec]:
 
 
 def subset_benchmark(bench: Any, indices: Iterable[int]) -> Any:
-    """Return a row-subset benchmark while preserving metadata fields."""
+    """Return a row-subset benchmark (native per-sample series + metadata), preserving structure."""
+    from dataio.get_input import ModalitySeries, NativeSeries
+
     idx = np.asarray(list(indices), dtype=np.int64)
-    sample_fields = {
-        "s2",
-        "s1",
-        "climate",
-        "s2_mask",
-        "s1_mask",
-        "climate_mask",
-        "doy",
-        "labels",
-        "groups",
-        "latlon",
-        "years",  # per-sample too -> must be subset/reordered with the rest, not left full-length
+
+    def _sub(ms: ModalitySeries) -> ModalitySeries:
+        return ModalitySeries(
+            values=[ms.values[i] for i in idx],
+            months=[ms.months[i] for i in idx],
+            doy=[ms.doy[i] for i in idx],
+            years=[ms.years[i] for i in idx],
+            bands=list(ms.bands),
+        )
+
+    native = NativeSeries(_sub(bench.native.s2), _sub(bench.native.s1), _sub(bench.native.climate))
+    updates: dict[str, Any] = {
+        "native": native,
+        "labels": np.asarray(bench.labels)[idx],
+        "groups": np.asarray(bench.groups)[idx],
+        "latlon": np.asarray(bench.latlon)[idx],
     }
-    updates = {}
-    for name in sample_fields:
-        val = getattr(bench, name, None)
-        if val is None:
-            continue
-        arr = np.asarray(val)
-        if arr.ndim == 0:  # scalar / unset placeholder -> nothing to subset
-            continue
-        updates[name] = arr[idx].copy()
+    if getattr(bench, "years", None) is not None and np.asarray(bench.years).ndim:
+        updates["years"] = np.asarray(bench.years)[idx]
     if is_dataclass(bench):
         valid = {f.name for f in fields(bench)}
         return replace(bench, **{k: v for k, v in updates.items() if k in valid})
-
     data = dict(getattr(bench, "__dict__", {}))
     data.update(updates)
     return type(bench)(**data)
 
 
 def perturb_band(bench: Any, spec: BandSpec, mode: str = "permute", seed: int = 0) -> Any:
-    """Perturb a single raw input band and return a benchmark copy."""
+    """Perturb a single native input band (across every sample's series) and return a copy.
+
+    ``zero`` blanks the band; ``permute`` reassigns the band ACROSS samples (breaking its link to
+    the label, the permutation-importance perturbation), resampling the donor to each sample's
+    length so it is well-defined on the variable-length native series.
+    """
     if mode not in {"permute", "zero"}:
         raise ValueError(f"Unknown perturbation mode {mode!r}; expected 'permute' or 'zero'.")
-    out = subset_benchmark(bench, np.arange(getattr(bench, spec.modality).shape[0]))
-    arr = getattr(out, spec.modality).copy()
-    if spec.index < 0 or spec.index >= arr.shape[2]:
-        raise IndexError(f"{spec.modality}.{spec.band} index {spec.index} is outside shape {arr.shape}.")
+    out = subset_benchmark(bench, np.arange(bench.n_samples))
+    ms = getattr(out.native, spec.modality)
+    if not ms.bands or spec.index < 0 or spec.index >= len(ms.bands):
+        raise IndexError(f"{spec.modality}.{spec.band} index {spec.index} is outside {len(ms.bands)} bands.")
+    n = len(ms.values)
     if mode == "zero":
-        arr[:, :, spec.index] = 0.0
+        new_values = []
+        for series in ms.values:
+            v = np.array(series, copy=True)
+            if v.size:
+                v[:, spec.index] = 0.0
+            new_values.append(v)
     else:
-        order = np.random.default_rng(seed).permutation(arr.shape[0])
-        if arr.shape[0] > 1 and np.array_equal(order, np.arange(arr.shape[0])):
+        order = np.random.default_rng(seed).permutation(n)
+        if n > 1 and np.array_equal(order, np.arange(n)):
             order = np.roll(order, 1)
-        arr[:, :, spec.index] = arr[order, :, spec.index]
-    setattr(out, spec.modality, arr)
+        donors = [np.asarray(ms.values[order[i]])[:, spec.index].copy() for i in range(n)]
+        new_values = []
+        for i, series in enumerate(ms.values):
+            v = np.array(series, copy=True)
+            if v.size:
+                donor, ti = donors[i], v.shape[0]
+                if len(donor) == ti:
+                    col = donor
+                elif len(donor) == 0:
+                    col = np.zeros(ti, dtype=v.dtype)
+                else:  # ragged: resample the donor band to this sample's length
+                    pos = np.clip((np.arange(ti) / max(ti - 1, 1) * (len(donor) - 1)).round().astype(int), 0, len(donor) - 1)
+                    col = donor[pos]
+                v[:, spec.index] = col
+            new_values.append(v)
+    ms.values = new_values
     return out
 
 

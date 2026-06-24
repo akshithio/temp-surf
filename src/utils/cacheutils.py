@@ -116,10 +116,10 @@ def bench_tag(benchmark: str, kwargs: dict) -> str:
     data = _input_fingerprint(INPUT_ROOT / benchmark)
     data_version = os.environ.get("DATA_VERSION", "").strip()
     suffix = f"__dv-{data_version}" if data_version else ""
-    # STRICT_DATA changes which samples survive loading (corrupt/missing are excluded vs raise),
+    # OVERWRITE_MODE changes which samples survive loading (corrupt/missing are excluded vs raise),
     # so it is part of the assembled-benchmark identity -- otherwise a permissive cache would be
     # silently reused by a strict run, skipping the strict check entirely.
-    if os.environ.get("STRICT_DATA", "").strip().lower() not in ("", "0", "false", "no"):
+    if os.environ.get("OVERWRITE_MODE", "").strip().lower() not in ("", "0", "false", "no"):
         suffix += "__strict"
     return f"{params}__code-{code}__data-{data}{suffix}"
 
@@ -197,7 +197,7 @@ _CHECKPOINT_SPECS: dict[str, tuple[str, str | None, str | None, str | None]] = {
                   "+code@0e11e448946f8ca259593435194e9faa14a58c77"),
     "galileo": ("hf", None, None, "nasaharvest/galileo@f039dd5dde966a931baeda47eb680fa89b253e4e:base"),
     "agrifm": ("local", "AGRIFM_WEIGHTS", "models/agrifm/AgriFM.pth", None),
-    "tessera": ("local", "TESSERA_WEIGHTS", "models/tessera/tessera_v1_1_mpc_model.pt", None),
+    "tessera": ("local", "TESSERA_WEIGHTS", "models/tessera/tessera_v1_1_mpc_encoder.pt", None),
     "raw": ("raw", None, None, None),  # no checkpoint; identity is the RAW_MODE featurization
 }
 
@@ -333,12 +333,12 @@ def require_dense_cache(bench: PastisBenchmark, benchmark: str, model_name: str,
 
 
 def extract_and_cache(
-    bench: Any, benchmark, model_name, tag, overwrite="skip", **enc_kwargs
+    bench: Any, benchmark, model_name, tag, overwrite=False, **enc_kwargs
 ) -> np.ndarray:
     """Cache and return the frozen-model embedding matrix for a benchmark."""
     path = embedding_cache_path(bench, benchmark, model_name, tag, enc_kwargs.get("weights_path"))
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and overwrite != "override":
+    if path.exists() and not overwrite:
         return np.load(path).astype(np.float32, copy=False)
     model = build_model(model_name, **enc_kwargs)
     print(f"  encoding {model_name} ...", flush=True)
@@ -369,7 +369,7 @@ def extract_dense_and_cache(
     benchmark: str,
     model_name: str,
     tag: str,
-    overwrite: str = "skip",
+    overwrite: bool = False,
     **enc_kwargs,
 ) -> Path:
     """Encode a lazy spatial benchmark one tile at a time.
@@ -386,7 +386,7 @@ def extract_dense_and_cache(
         fold_dir.mkdir(parents=True, exist_ok=True)
         feature_path = fold_dir / f"{tile_id}.npy"
         label_path = fold_dir / f"{tile_id}.labels.npy"
-        if feature_path.exists() and label_path.exists() and overwrite != "override":
+        if feature_path.exists() and label_path.exists() and not overwrite:
             continue
         if model is None:
             model = build_model(model_name, **enc_kwargs)
@@ -415,46 +415,84 @@ def extract_dense_and_cache(
     return root
 
 
+def _dense_label_paths(emb_dir: Path, folds: set[int], patch_ids: set[int] | None = None) -> list[Path]:
+    """Sorted ``*.labels.npy`` paths for ``folds``, optionally restricted to an original-patch set."""
+    paths = sorted(
+        path
+        for fold in sorted(folds)
+        for path in (emb_dir / f"fold_{fold}").glob("*.labels.npy")
+    )
+    if patch_ids is not None:
+        wanted = {int(p) for p in patch_ids}
+        paths = [p for p in paths if int(p.name.split("_", 1)[0]) in wanted]
+    return paths
+
+
+def dense_fold_patches(emb_dir: Path, folds: set[int]) -> list[int]:
+    """Sorted unique original 128x128 patch ids cached for ``folds`` (filename-only, no pixel load).
+
+    Used by the dense target sweep to draw its 80/20 split over whole patches.
+    """
+    return sorted({int(p.name.split("_", 1)[0]) for p in _dense_label_paths(emb_dir, folds)})
+
+
 def load_dense_samples(
     emb_dir: Path,
     folds: set[int],
     max_pixels: int,
     seed: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load a deterministic bounded pixel sample from cached dense tile features.
+    patch_ids: set[int] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load a deterministic bounded pixel SAMPLE from cached dense tile features -- for TRAINING.
 
-    Returns ``(features, labels, groups, tile_ids)`` where ``tile_ids`` is an
-    integer index per pixel identifying which tile it came from (for per-tile
-    metrics like per-tile mIoU).
+    Returns ``(features, labels, groups, tile_ids, patch_ids)``; ``patch_ids`` (per pixel) is the
+    original 128x128 patch each pixel belongs to. ``patch_ids=`` restricts to those patches (used to
+    build the target few-shot / oracle training pool). For EVALUATION use :func:`iter_dense_tiles`
+    (every pixel, streamed) -- this capped sample is appropriate only for fitting the probe.
     """
-    label_paths = sorted(
-        path
-        for fold in sorted(folds)
-        for path in (emb_dir / f"fold_{fold}").glob("*.labels.npy")
-    )
+    label_paths = _dense_label_paths(emb_dir, folds, patch_ids)
     if not label_paths:
-        raise FileNotFoundError(f"No dense caches for folds {sorted(folds)} under {emb_dir}")
+        raise FileNotFoundError(f"No dense caches for folds {sorted(folds)} (patches={patch_ids}) under {emb_dir}")
     rng = np.random.default_rng(seed)
     per_tile = max(1, int(np.ceil(max_pixels / len(label_paths))))
     feature_parts: list[np.ndarray] = []
     label_parts: list[np.ndarray] = []
     group_parts: list[np.ndarray] = []
     tile_parts: list[np.ndarray] = []
+    patch_parts: list[np.ndarray] = []
     for tile_idx, label_path in enumerate(label_paths):
         feature_path = label_path.with_name(label_path.name.replace(".labels.npy", ".npy"))
         labels = np.load(label_path, mmap_mode="r")
         features = np.load(feature_path, mmap_mode="r")
         take = rng.choice(len(labels), size=min(per_tile, len(labels)), replace=False)
         fold = int(label_path.parent.name.removeprefix("fold_"))
+        patch_id = int(label_path.name.split("_", 1)[0])  # filename is "{patch}_{row}_{col}.labels.npy"
         feature_parts.append(np.asarray(features[take], dtype=np.float32))
         label_parts.append(np.asarray(labels[take], dtype=np.int64))
         group_parts.append(np.full(len(take), fold, dtype=np.int64))
         tile_parts.append(np.full(len(take), tile_idx, dtype=np.int64))
+        patch_parts.append(np.full(len(take), patch_id, dtype=np.int64))
     x = np.concatenate(feature_parts)
     y = np.concatenate(label_parts)
     groups = np.concatenate(group_parts)
     tile_ids = np.concatenate(tile_parts)
+    patch_ids_out = np.concatenate(patch_parts)
     if len(y) > max_pixels:
         take = rng.choice(len(y), size=max_pixels, replace=False)
-        x, y, groups, tile_ids = x[take], y[take], groups[take], tile_ids[take]
-    return x, y, groups, tile_ids
+        x, y, groups, tile_ids, patch_ids_out = x[take], y[take], groups[take], tile_ids[take], patch_ids_out[take]
+    return x, y, groups, tile_ids, patch_ids_out
+
+
+def iter_dense_tiles(emb_dir: Path, folds: set[int], patch_ids: set[int] | None = None):
+    """Yield ``(features (n, D) float32, labels (n,) int64)`` for EVERY cached tile -- full, no
+    subsample -- optionally restricted to an original-patch set.
+
+    This is the full-fold streaming evaluation source: scoring a probe tile-by-tile over every
+    valid pixel gives the exact fold mIoU (and credible per-tile worst-case), instead of the noisy
+    estimate a capped pixel sample would give. One tile (<=64x64 pixels) is in memory at a time.
+    """
+    for label_path in _dense_label_paths(emb_dir, folds, patch_ids):
+        feature_path = label_path.with_name(label_path.name.replace(".labels.npy", ".npy"))
+        labels = np.asarray(np.load(label_path), dtype=np.int64)
+        features = np.asarray(np.load(feature_path), dtype=np.float32)
+        yield features, labels

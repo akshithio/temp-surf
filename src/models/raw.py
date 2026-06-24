@@ -34,8 +34,16 @@ RAW_MODE = os.environ.get("RAW_MODE", "flatten")  # flatten | stats
 
 
 def _stack_modalities(bench) -> np.ndarray:
-    """Concatenate S2, S1, climate time series into one ``(N, T, C)`` array."""
-    parts = [np.asarray(a, dtype=np.float32) for a in (bench.s2, bench.s1, bench.climate) if a.shape[-1] > 0]
+    """Concatenate the monthly S2, S1, climate views into one ``(N, T, C)`` array.
+
+    The raw control isn't a learned encoder, so it just takes each modality's monthly composite
+    (all native bands) and concatenates -- a cheap, fixed-length spectral-temporal featurization.
+    """
+    parts = []
+    for modality in ("s2", "s1", "climate"):
+        values = bench.monthly(modality)[0]  # (N, 12, C)
+        if values.shape[-1] > 0:
+            parts.append(np.asarray(values, dtype=np.float32))
     return np.concatenate(parts, axis=2)
 
 

@@ -3,14 +3,14 @@
 OlmoEarth (Ai2) is a ViT-Base (114M params) Earth observation foundation model
 trained on Sentinel-2 L2A, Sentinel-1, and Landsat spatial chips. We use it
 frozen: construct a :class:`MaskedOlmoEarthSample` from a :class:`Benchmark`,
-run ``model.model``, pool the spatial-temporal feature map, and get
+run the loaded model's encoder, pool the spatial-temporal feature map, and get
 ``(N, 768)`` embeddings.
 
 Authoritative input contract (from olmoearth_pretrain docs):
   * ``sentinel2_l2a`` : (B, H, W, T, C=12) float32, band order = OLMOEARTH_S2_BANDS
-  * ``sentinel2_l2a_mask`` : (B, H, W, T, S=1) float32, ONLINE_MODEL value
+  * ``sentinel2_l2a_mask`` : (B, H, W, T, S=1) float32, ONLINE_ENCODER value
   * ``timestamps``   : (B, T, 3) long, [day, month-0-indexed, year]
-  * model.model(sample, fast_pass=True, patch_size=4)["tokens_and_masks"].sentinel2_l2a
+  * model.encoder(sample, fast_pass=True, patch_size=4)["tokens_and_masks"].sentinel2_l2a
     -> (B, H', W', T, S, D=768)
 """
 
@@ -68,7 +68,8 @@ _BENCH_TO_OLMOEARTH_IDX: dict[str, int] = {
     "B8A": 7,
     "B11": 8,
     "B12": 9,
-    # B01 -> 10, B09 -> 11: not present in CropHarvest / EuroCropsML Benchmark arrays
+    "B1": 10,  # B01 — now carried natively (EuroCropsML); zero-filled where the source lacks it
+    "B9": 11,  # B09 — carried natively (CropHarvest, EuroCropsML); previously dropped by the loaders
 }
 
 # --------------------------------------------------------------------------- #
@@ -84,7 +85,7 @@ DEFAULT_OLMOEARTH_WEIGHTS = _INPUT / "models" / "olmoearth-v1_1-base"
 def _default_load_model(weights_path: str | Path | None = None) -> Any:
     """Load the full OlmoEarth v1.1-Base model from Hugging Face.
 
-    Returns the full model (model + decoder).  Callers access ``model.model``.
+    Returns the pretrained encoder used by the pinned package's evaluation wrapper.
     """
     from huggingface_hub import snapshot_download
     from olmoearth_pretrain.model_loader import load_model_from_path
@@ -100,8 +101,8 @@ def _default_load_model(weights_path: str | Path | None = None) -> Any:
             allow_patterns=["config.json", "weights.pth"],
         )
     model = load_model_from_path(model_dir)
-    model.eval()
-    return model
+    model.encoder.eval()
+    return model.encoder
 
 
 @dataclass
@@ -142,22 +143,23 @@ class OlmoEarthModel:
         images : (N, S, S, T, 12) float32
             Point-level series broadcast to the configured spatial tile size.
         masks   : (N, S, S, T, B) float32
-            Availability mask filled with ONLINE_MODEL value where data exists.
+            Availability mask filled with ONLINE_ENCODER value where data exists.
         timestamps : (N, T, 3) int64
             [day, month, year] for every observation.
         """
         from olmoearth_pretrain.datatypes import MaskValue
 
-        n, t = bench.s2.shape[0], bench.s2.shape[1]
-        bench_s2_bands: list[str] = bench.s2_bands
-        bench_idx = {b: i for i, b in enumerate(bench_s2_bands)}
+        s2_vals, s2_msk, doy_arr, s2_bands = bench.monthly("s2")
+        n, t = s2_vals.shape[0], s2_vals.shape[1]
+        bench_idx = {b: i for i, b in enumerate(s2_bands)}
 
-        # Build (N, T, 12) — map available bands, zero-fill missing ones
+        # Build (N, T, 12) — map available bands, zero-fill missing ones. The full native band set
+        # means B01/B09 are now mapped where the source provides them (previously dropped upstream).
         x = np.zeros((n, t, OLMOEARTH_NUM_S2_BANDS), dtype=np.float32)
         mapped = np.zeros(OLMOEARTH_NUM_S2_BANDS, dtype=bool)
         for oe_band, oe_idx in _BENCH_TO_OLMOEARTH_IDX.items():
             if oe_band in bench_idx:
-                x[:, :, oe_idx] = bench.s2[:, :, bench_idx[oe_band]]
+                x[:, :, oe_idx] = s2_vals[:, :, bench_idx[oe_band]]
                 mapped[oe_idx] = True
 
         # Apply OlmoEarth's normalizer (COMPUTED strategy from pretrain stats)
@@ -167,7 +169,7 @@ class OlmoEarthModel:
         normalizer = Normalizer(Strategy.COMPUTED)
         x = normalizer.normalize(Modality.SENTINEL2_L2A, x).astype(np.float32)
         x[:, :, ~mapped] = 0.0
-        x *= np.asarray(bench.s2_mask, dtype=np.float32)[:, :, None]
+        x *= np.asarray(s2_msk, dtype=np.float32)[:, :, None]
 
         # Tile the pixel/parcel series to a constant SxS spatial chip (a spatial ViT cannot
         # ingest a 1x1 chip); the model then patches/pools over a valid spatial grid.
@@ -176,13 +178,13 @@ class OlmoEarthModel:
 
         num_band_sets = 1
         if self._model is not None:
-            tokenization = getattr(self._model.model, "tokenization_config", None)
+            tokenization = getattr(self._model, "tokenization_config", None)
             if tokenization is not None:
                 num_band_sets = tokenization.get_num_bandsets("sentinel2_l2a")
-        observed = np.asarray(bench.s2_mask, dtype=bool)[:, None, None, :, None]
+        observed = np.asarray(s2_msk, dtype=bool)[:, None, None, :, None]
         avail = np.where(
             observed,
-            float(MaskValue.ONLINE_MODEL.value),
+            float(MaskValue.ONLINE_ENCODER.value),
             float(MaskValue.MISSING.value),
         )
         avail = np.broadcast_to(avail, (n, s, s, t, num_band_sets)).copy().astype(np.float32)
@@ -192,7 +194,7 @@ class OlmoEarthModel:
             years = bench.years
         else:
             years = np.full(n, 2021, dtype=np.int64)
-        doy = np.clip(np.asarray(bench.doy, dtype=np.int64), 1, 365)
+        doy = np.clip(np.asarray(doy_arr, dtype=np.int64), 1, 365)
         reference = np.datetime64("2001-01-01") + (doy - 1).astype("timedelta64[D]")
         months = reference.astype("datetime64[M]").astype(np.int64) % 12
         month_start = reference.astype("datetime64[M]").astype("datetime64[D]")
@@ -223,14 +225,14 @@ class OlmoEarthModel:
             sentinel2_l2a=torch.from_numpy(dummy_bands).to(dev),
             sentinel2_l2a_mask=torch.full(
                 (B, H, W, T, 1),
-                MaskValue.ONLINE_MODEL.value,
+                MaskValue.ONLINE_ENCODER.value,
                 dtype=torch.float32,
                 device=dev,
             ),
             timestamps=torch.tensor([15, 0, 2021], device=dev).reshape(B, 1, 3).expand(B, T, 3),
         )
 
-        model = self._model.model
+        model = self._model
 
         class _MacWrap(torch.nn.Module):
             def __init__(self):
@@ -266,7 +268,7 @@ class OlmoEarthModel:
             from olmoearth_pretrain.nn.pooling import PoolingType, pool_unmasked_tokens
 
             fast_pass = not (sample.sentinel2_l2a_mask == MaskValue.MISSING.value).any().item()
-            tokens = self._model.model(sample, fast_pass=fast_pass, patch_size=eff_patch)["tokens_and_masks"]
+            tokens = self._model(sample, fast_pass=fast_pass, patch_size=eff_patch)["tokens_and_masks"]
             pooled = pool_unmasked_tokens(tokens, PoolingType.MEAN)
             out.append(pooled.detach().cpu().numpy().astype(np.float32))
 
@@ -280,25 +282,29 @@ class OlmoEarthModel:
         from olmoearth_pretrain.data.normalize import Normalizer, Strategy
         from olmoearth_pretrain.datatypes import MaskedOlmoEarthSample, MaskValue
 
-        from evals.benchmarks.pastis_r import PASTIS_S2_BANDS
+        from evals.benchmarks.pastis_r import PASTIS_S2_BANDS, _monthly_patch
 
-        height, width, timesteps = tile.height, tile.width, tile.s2.shape[0]
+        # OlmoEarth uses a calendar-month timestamp grid (consistent with how it treats the
+        # classification benchmarks via bench.monthly), so it composites the native tile to months
+        # here; empty months are masked. Reproduces the pre-native-refactor monthly tile bit-for-bit.
+        s2_m, s2_mask = _monthly_patch(tile.s2, tile.s2_months)  # (12, 10, H, W), (12,)
+        height, width, timesteps = tile.height, tile.width, s2_m.shape[0]
         values = np.zeros((1, height, width, timesteps, OLMOEARTH_NUM_S2_BANDS), dtype=np.float32)
         columns = {band: index for index, band in enumerate(PASTIS_S2_BANDS)}
         mapped = np.zeros(OLMOEARTH_NUM_S2_BANDS, dtype=bool)
         for band, target_index in _BENCH_TO_OLMOEARTH_IDX.items():
             if band in columns:
-                values[0, :, :, :, target_index] = tile.s2[:, columns[band]].transpose(1, 2, 0)
+                values[0, :, :, :, target_index] = s2_m[:, columns[band]].transpose(1, 2, 0)
                 mapped[target_index] = True
         values = Normalizer(Strategy.COMPUTED).normalize(Modality.SENTINEL2_L2A, values).astype(np.float32)
         values[:, :, :, :, ~mapped] = 0.0
-        values *= tile.s2_mask[None, None, None, :, None]
+        values *= s2_mask[None, None, None, :, None]
 
-        tokenization = self._model.model.tokenization_config
+        tokenization = self._model.tokenization_config
         band_sets = tokenization.get_num_bandsets("sentinel2_l2a")
         mask = np.where(
-            tile.s2_mask[None, None, None, :, None] > 0,
-            float(MaskValue.ONLINE_MODEL.value),
+            s2_mask[None, None, None, :, None] > 0,
+            float(MaskValue.ONLINE_ENCODER.value),
             float(MaskValue.MISSING.value),
         )
         mask = np.broadcast_to(mask, (1, height, width, timesteps, band_sets)).copy().astype(np.float32)
@@ -311,7 +317,7 @@ class OlmoEarthModel:
             sentinel2_l2a_mask=torch.from_numpy(mask).to(self.device),
             timestamps=torch.from_numpy(timestamps).to(self.device),
         )
-        output = self._model.model(sample, fast_pass=False, patch_size=8)["tokens_and_masks"]
+        output = self._model(sample, fast_pass=False, patch_size=8)["tokens_and_masks"]
         tokens = output.sentinel2_l2a
         observed = (output.sentinel2_l2a_mask != MaskValue.MISSING.value).unsqueeze(-1)
         spatial_tokens = (tokens * observed).sum(dim=(3, 4)) / observed.sum(dim=(3, 4)).clamp_min(1)

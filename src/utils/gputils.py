@@ -71,26 +71,36 @@ def take_shard(items: list) -> list:
 def fan_out(num_shards: int | None = None) -> int:
     """Launch one sharded ``main.py`` per GPU in parallel; tee per-shard logs.
 
-    Each child gets ``CUDA_VISIBLE_DEVICES=i`` (so it sees exactly one GPU as
-    cuda:0) plus the shard env, and runs the disjoint subset of (model, benchmark)
-    pairs. Returns the max child exit code. Falls back to a single process if no
-    GPUs are visible.
+    Each child gets ``CUDA_VISIBLE_DEVICES=i`` (so it sees exactly one GPU as cuda:0) plus the shard
+    env, and runs the disjoint, round-robin subset of (model, benchmark) pairs. Returns the max child
+    exit code; falls back to a single process if no GPUs are visible.
+
+    MULTI-MACHINE: the (model, benchmark) pairs are sharded GLOBALLY across all participating GPUs.
+    Set two env vars per machine so each GPU gets a unique GLOBAL shard index out of the GLOBAL total
+    (see docs/multi_machine.md):
+      * ``RB_SHARD_BASE``  -- this machine's first global shard index (default 0). Set it to the sum
+        of GPU counts on the machines ordered before this one.
+      * ``RB_NUM_SHARDS``  -- the GLOBAL number of shards = total GPUs across all machines.
+    Single-box runs need neither (base 0, total = local GPU count) and behave exactly as before.
     """
-    n = num_shards or max(1, gpu_count())
+    local_gpus = num_shards or max(1, gpu_count())
+    base = int(os.environ.get("RB_SHARD_BASE", "0"))
+    total = int(os.environ.get(NUM_SHARDS_ENV, str(base + local_gpus)))  # GLOBAL shard count
     scratch = REPO / "data"
     log_dir = scratch / "output" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    per_shard_cores = max(1, (os.cpu_count() or 2) // n)
+    per_shard_cores = max(1, (os.cpu_count() or 2) // local_gpus)
     procs = []
-    for i in range(n):
+    for i in range(local_gpus):
+        shard = base + i
         env = {
             **os.environ,
             "CUDA_VISIBLE_DEVICES": str(i),
-            SHARD_ENV: str(i),
-            NUM_SHARDS_ENV: str(n),
+            SHARD_ENV: str(shard),
+            NUM_SHARDS_ENV: str(total),
             "LOKY_MAX_CPU_COUNT": str(per_shard_cores),
         }
-        log = open(log_dir / f"shard_{i}.log", "w")
+        log = open(log_dir / f"shard_{shard}.log", "w")
         proc = subprocess.Popen(
             [sys.executable, "-u", "main.py"],
             cwd=str(REPO / "src"),
@@ -98,13 +108,13 @@ def fan_out(num_shards: int | None = None) -> int:
             stdout=log,
             stderr=subprocess.STDOUT,
         )
-        print(f"[gputils] shard {i + 1}/{n} -> GPU {i} | pid {proc.pid} | log {log.name}", flush=True)
+        print(f"[gputils] shard {shard}/{total} -> GPU {i} | pid {proc.pid} | log {log.name}", flush=True)
         procs.append((proc, log))
     code = 0
     for proc, log in procs:
         code = max(code, proc.wait())
         log.close()
-    print(f"[gputils] all {n} shard(s) done (max exit code {code})", flush=True)
+    print(f"[gputils] all {local_gpus} local shard(s) done (max exit code {code})", flush=True)
     return code
 
 

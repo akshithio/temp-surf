@@ -48,7 +48,7 @@ OBSERVATION_BUCKETS = tuple(range(8, 257, 8))
 
 _REPO = Path(__file__).resolve().parents[2]
 _INPUT = Path(os.environ.get("ROBUSTNESS_INPUT", _REPO / "data" / "input"))
-DEFAULT_WEIGHTS = _INPUT / "models" / "tessera" / "tessera_v1_1_mpc_model.pt"
+DEFAULT_WEIGHTS = _INPUT / "models" / "tessera" / "tessera_v1_1_mpc_encoder.pt"
 
 
 class CustomGRUCell(nn.Module):
@@ -193,7 +193,7 @@ class TesseraModel:
         if not path.exists():
             raise FileNotFoundError(
                 f"TESSERA v1.1 MPC weights not found at {path}. Download "
-                "tessera_v1_1_mpc_model.pt and set TESSERA_WEIGHTS or weights_path."
+                "tessera_v1_1_mpc_encoder.pt and set TESSERA_WEIGHTS or weights_path."
             )
         model = TesseraV11Model()
         # weights_only=True blocks arbitrary code execution during unpickling (the checkpoint is a
@@ -205,6 +205,10 @@ class TesseraModel:
             key = key.removeprefix("_orig_mod.")
             if key.startswith(("projector.", "segmented_matryoshka_projector.")):
                 continue
+            # The released v1.1 encoder checkpoint uses ``transformer_encoder`` while this
+            # self-contained inference implementation names the equivalent module
+            # ``transformer_model``.
+            key = key.replace(".transformer_encoder.", ".transformer_model.")
             cleaned[key] = value
         missing, unexpected = model.load_state_dict(cleaned, strict=False)
         if missing or unexpected:
@@ -230,28 +234,39 @@ class TesseraModel:
         return values
 
     def _prepare_streams(self, bench: Benchmark) -> dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        s2_raw = self._select_bands(bench.s2, TESSERA_S2_BANDS, bench.s2_bands)
-        s1_raw = self._scale_s1(self._select_bands(bench.s1, TESSERA_S1_BANDS, bench.s1_bands))
+        """Per-sample (S2, merged-S1) streams from the benchmark's NATIVE acquisition series.
+
+        TESSERA's ``to_native``: it takes the FULL per-sample series with real day-of-year (bucketed
+        up to OBSERVATION_BUCKETS) and z-scores it -- not a fixed monthly composite. S1 is used when
+        the benchmark provides it, else an empty stream (S2-only benchmarks). Samples are grouped by
+        (s2_len, s1_len) so each group batches together.
+        """
+        s2_values, s2_doy, _s2_months, s2_bands = bench.native_series("s2")
+        s1_values, s1_doy, _s1_months, s1_bands = bench.native_series("s1")
+        s2_cols = [s2_bands.index(b) for b in TESSERA_S2_BANDS]  # raises if a required S2 band is absent
+        has_s1 = all(b in s1_bands for b in TESSERA_S1_BANDS)
+        s1_cols = [s1_bands.index(b) for b in TESSERA_S1_BANDS] if has_s1 else []
+        n_s1 = len(TESSERA_S1_BANDS)
         groups: dict[tuple[int, int], list[tuple[int, np.ndarray, np.ndarray]]] = {}
-
         for index in range(bench.n_samples):
-            streams = []
-            for values, mask, mean, std in (
-                (s2_raw[index], bench.s2_mask[index], S2_BAND_MEAN, S2_BAND_STD),
-                (s1_raw[index], bench.s1_mask[index], S1_BAND_MEAN, S1_BAND_STD),
-            ):
-                valid = np.flatnonzero(np.asarray(mask) > 0)
-                target = _bucket_size(max(1, len(valid)))
-                if len(valid) == 0:
-                    stream = np.zeros((target, values.shape[1] + 1), dtype=np.float32)
-                else:
-                    take = valid[_resample_indices(len(valid), target)]
-                    normalized = (values[take] - mean) / (std + 1e-9)
-                    stream = np.concatenate([normalized, np.asarray(bench.doy[index])[take, None]], axis=1).astype(np.float32)
-                streams.append(stream)
-            key = (streams[0].shape[0], streams[1].shape[0])
-            groups.setdefault(key, []).append((index, streams[0], streams[1]))
-
+            s2v = np.asarray(s2_values[index], dtype=np.float32)[:, s2_cols]
+            s2_stream = self._stream(
+                s2v, np.ones(len(s2v), np.float32), np.asarray(s2_doy[index], np.float32),
+                S2_BAND_MEAN, S2_BAND_STD,
+            )
+            if has_s1 and len(s1_values[index]):
+                s1v = self._scale_s1(np.asarray(s1_values[index], dtype=np.float32)[:, s1_cols])
+                s1_stream = self._stream(
+                    s1v, np.ones(len(s1v), np.float32), np.asarray(s1_doy[index], np.float32),
+                    S1_BAND_MEAN, S1_BAND_STD,
+                )
+            else:  # benchmark has no native radar -> an all-missing S1 stream
+                s1_stream = self._stream(
+                    np.zeros((0, n_s1), np.float32), np.zeros(0, np.float32), np.zeros(0, np.float32),
+                    S1_BAND_MEAN, S1_BAND_STD,
+                )
+            key = (s2_stream.shape[0], s1_stream.shape[0])
+            groups.setdefault(key, []).append((index, s2_stream, s1_stream))
         return {
             key: (
                 np.asarray([item[0] for item in items], dtype=np.int64),
@@ -260,6 +275,17 @@ class TesseraModel:
             )
             for key, items in groups.items()
         }
+
+    @staticmethod
+    def _stream(values: np.ndarray, mask: np.ndarray, doy: np.ndarray, mean, std) -> np.ndarray:
+        """One ``(T_bucket, C+1)`` stream: keep valid steps, resample to a bucket size, z-score, append doy."""
+        valid = np.flatnonzero(np.asarray(mask) > 0)
+        target = _bucket_size(max(1, len(valid)))
+        if len(valid) == 0:
+            return np.zeros((target, values.shape[1] + 1), dtype=np.float32)
+        take = valid[_resample_indices(len(valid), target)]
+        normalized = (values[take] - mean) / (std + 1e-9)
+        return np.concatenate([normalized, np.asarray(doy)[take, None]], axis=1).astype(np.float32)
 
     def compute_macs(self) -> int:
         self._ensure_loaded()
