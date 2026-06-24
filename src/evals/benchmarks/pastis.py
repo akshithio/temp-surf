@@ -10,6 +10,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -19,8 +20,10 @@ from dataio.get_input import (
     NativeSeries,
     _synthetic_month_doy,
 )
+from evals.probes import FeatureTransform, _apply, fit_probe_multiclass, score_segmentation_streamed
+from utils import perfutils as perf
 
-BENCHMARK = "pastis_r"
+BENCHMARK = "pastis"
 LABEL_KIND = "segmentation"
 TRAIN_FOLDS = {1, 2, 3}
 VAL_FOLDS = {4}
@@ -226,7 +229,7 @@ def _pastis_pixel_benchmark(
         climate=ModalitySeries.absent(n),
     )
     return Benchmark(
-        name="pastis_r",
+        name="pastis",
         label_kind="segmentation",
         native=native,
         labels=labels[valid].astype(np.int64),
@@ -248,7 +251,7 @@ def load_benchmark(
     S2 and ascending-orbit S1 are monthly aggregated only when a 64x64 tile is
     requested. ``max_samples`` limits source patches, not pixels or tiles.
     """
-    base = root / "pastis_r"
+    base = root / "pastis"
     if not (base / "metadata.geojson").exists():
         raise FileNotFoundError(f"PASTIS metadata not found: {base / 'metadata.geojson'}")
     geo = json.loads((base / "metadata.geojson").read_text())
@@ -294,7 +297,7 @@ def load_benchmark(
     if not patches:
         raise ValueError(f"No PASTIS patches parsed from {base}")
     return PastisBenchmark(
-        name="pastis_r",
+        name="pastis",
         label_kind="segmentation",
         patches=tuple(patches),
         tile_size=PASTIS_TILE_SIZE,
@@ -305,3 +308,120 @@ def load_benchmark(
 def make_targets(bench) -> tuple[np.ndarray, np.ndarray]:
     """Dense targets are loaded tile-wise by the segmentation runner."""
     return np.empty(0, dtype=np.int64), bench.groups
+
+
+def _validate_source_budgets(budgets: list[float | int]) -> None:
+    bad = [budget for budget in budgets if float(budget) <= 0.0 or float(budget) > 1.0]
+    if bad:
+        raise ValueError(f"source budgets must be fractions in (0, 1]; invalid: {bad}")
+
+
+def run_probes_segmentation(
+    rows: list[dict[str, Any]],
+    x_train: np.ndarray,
+    x_val: np.ndarray,
+    y_train: np.ndarray,
+    y_val: np.ndarray,
+    seed: int,
+    *,
+    eval_streams: dict[str, Any],
+    transform: FeatureTransform | None = None,
+    budgets: list[float],
+    meta: dict[str, Any] | None = None,
+    family: str = "logistic",
+) -> None:
+    """PASTIS source-fraction sweep, scored on every valid pixel in each evaluation fold."""
+    _validate_source_budgets(budgets)
+    meta = dict(meta or {})
+    x_train = _apply(transform, x_train)
+    x_val = _apply(transform, x_val)
+    eval_classes = np.arange(19, dtype=np.int64)
+    for budget in budgets:
+        sub_seed = perf._budget_seed(seed, budget)
+        sub = perf.subset_indices(y_train, float(budget), sub_seed, stratify=True)
+        clf, probe_meta = fit_probe_multiclass(
+            x_train[sub], y_train[sub], sub_seed, x_val=x_val, y_val=y_val, family=family
+        )
+        for split_name, tiles in eval_streams.items():
+            rows.append({
+                **meta,
+                "evaluation_split": split_name,
+                "budget_type": "source",
+                "label_budget": budget,
+                "seed": seed,
+                "n_train_sub": int(len(sub)),
+                **probe_meta,
+                **score_segmentation_streamed(clf, tiles(), eval_classes, transform=transform),
+            })
+
+
+def run_probes_segmentation_target(
+    rows: list[dict[str, Any]],
+    x_source: np.ndarray,
+    y_source: np.ndarray,
+    seed: int,
+    *,
+    target_patches: Any,
+    sample_target: Any,
+    stream_target: Any,
+    x_val: np.ndarray,
+    y_val: np.ndarray,
+    transform: FeatureTransform | None = None,
+    budgets: list[int | float],
+    meta: dict[str, Any] | None = None,
+    family: str = "logistic",
+    target_id_budget: float | int = -1,
+) -> None:
+    """Patch-level dense few-shot / oracle curve with a full-target zero-shot anchor."""
+    meta = dict(meta or {})
+    x_source = _apply(transform, x_source)
+    eval_classes = np.arange(19, dtype=np.int64)
+    patches = np.array(sorted({int(p) for p in target_patches}))
+    all_patches = set(patches.tolist())
+    degenerate = len(patches) < 2
+    split_rng = np.random.default_rng(perf._budget_seed(seed, 0.5))
+    perm = split_rng.permutation(patches)
+    n_test_patches = max(1, int(round(0.2 * len(patches)))) if not degenerate else len(patches)
+    test_patches = set(perm[:n_test_patches].tolist())
+    pool_order = [int(p) for p in perm.tolist() if p not in test_patches]
+
+    for budget in budgets:
+        if budget != 0 and (degenerate or not pool_order):
+            continue
+        sub_seed = perf._budget_seed(seed, budget)
+        cal_x, cal_y, tune_internal = x_val, y_val, False
+        if budget == 0:
+            x_tr, y_tr = x_source, y_source
+        elif budget == target_id_budget:
+            xo, yo = sample_target(set(pool_order), sub_seed)[:2]
+            x_tr, y_tr = _apply(transform, xo), yo
+            cal_x, cal_y, tune_internal = None, None, True
+        else:
+            k = min(len(pool_order), perf._target_budget_count(budget, len(pool_order)))
+            xf, yf = sample_target(set(pool_order[:k]), sub_seed)[:2]
+            x_tr = np.concatenate([x_source, _apply(transform, xf)])
+            y_tr = np.concatenate([y_source, yf])
+        clf, probe_meta = fit_probe_multiclass(
+            x_tr, y_tr, sub_seed, x_val=cal_x, y_val=cal_y, family=family, tune_internal=tune_internal
+        )
+        rows.append({
+            **meta,
+            "evaluation_split": "held_out",
+            "budget_type": "target",
+            "label_budget": budget,
+            "seed": seed,
+            "n_train_sub": int(len(y_tr)),
+            **probe_meta,
+            **score_segmentation_streamed(clf, stream_target(test_patches), eval_classes, transform=transform),
+        })
+        if budget == 0:
+            rows.append({
+                **meta,
+                "evaluation_split": "full",
+                "budget_type": "target",
+                "label_budget": budget,
+                "seed": seed,
+                "n_train_sub": int(len(y_tr)),
+                **probe_meta,
+                **score_segmentation_streamed(clf, stream_target(all_patches), eval_classes, transform=transform),
+            })

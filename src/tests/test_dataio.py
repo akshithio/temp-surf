@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from dataio.get_input import get_input
-from evals.benchmarks.pastis_r import PastisBenchmark
+from evals.benchmarks.pastis import PastisBenchmark
 from utils import cacheutils, ioutils
 
 
@@ -17,7 +17,7 @@ def test_get_input_rejects_unknown_benchmark() -> None:
 
 
 def test_pastis_is_lazy_and_yields_64_pixel_tiles(tmp_path) -> None:
-    base = tmp_path / "pastis_r"
+    base = tmp_path / "pastis"
     for directory in ("DATA_S2", "DATA_S1A", "ANNOTATIONS"):
         (base / directory).mkdir(parents=True)
     properties = {
@@ -35,7 +35,7 @@ def test_pastis_is_lazy_and_yields_64_pixel_tiles(tmp_path) -> None:
     target[0, 0, 0] = 19
     np.save(base / "ANNOTATIONS" / "TARGET_10000.npy", target)
 
-    bench = get_input("pastis_r", root=tmp_path, shuffle=False)
+    bench = get_input("pastis", root=tmp_path, shuffle=False)
     tiles = list(bench.iter_tiles())
 
     assert isinstance(bench, PastisBenchmark)
@@ -86,7 +86,7 @@ def test_load_cached_embeddings_reads_existing_matrix(tmp_path, monkeypatch) -> 
 def test_pastis_tile_is_native_cadence_and_models_aggregate_their_own_way() -> None:
     """The PASTIS tile carries the native acquisition cadence; per-pixel models then aggregate it:
     TESSERA uses the full series, Presto/Galileo/OlmoEarth composite to a 12-month grid."""
-    from evals.benchmarks.pastis_r import PastisTile, _monthly_patch
+    from evals.benchmarks.pastis import PastisTile, _monthly_patch
 
     rng = np.random.default_rng(0)
     t_native = 24  # native cadence, 2 acquisitions per calendar month (vs the old fixed 12)

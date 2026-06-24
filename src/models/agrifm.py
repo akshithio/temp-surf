@@ -1,8 +1,8 @@
 """AgriFM frozen-model wrapper (runs the published S2 model, no mmcv needed).
 
-AgriFM (Li et al. 2025, arXiv:2505.21357) is a multi-source temporal foundation
-model: per-modality 3D patch embeds (HLSL30 / Sentinel-2 / MODIS) feeding ONE shared
-Video-Swin-Transformer backbone. The public code is at https://github.com/flyakon/AgriFM
+AgriFM is a multi-source temporal foundation model: per-modality 3D patch 
+embeds (HLSL30 / Sentinel-2 / MODIS) feeding ONE shared Video-Swin-Transformer
+backbone. The public code is at https://github.com/flyakon/AgriFM
 and the CC0 weights (`AgriFM.pth`) are distributed via GLASS/OneDrive.
 
 We use the Sentinel-2 branch. The model architecture (SwinTransformer3D) is vendored
@@ -235,7 +235,7 @@ class AgriFMModel:
     def encode_dense(self, tile) -> np.ndarray:
         """Encode one PASTIS tile natively and upsample the 2D feature grid."""
         self._ensure_loaded()
-        from evals.benchmarks.pastis_r import PASTIS_S2_BANDS
+        from evals.benchmarks.pastis import PASTIS_S2_BANDS
 
         columns = {band: index for index, band in enumerate(PASTIS_S2_BANDS)}
         indices = [columns[band] for band in AGRIFM_S2_BANDS]
