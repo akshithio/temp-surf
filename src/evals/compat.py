@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-BENCHMARKS: tuple[str, ...] = ("cropharvest", "eurocropsml", "breizhcrops", "pastis_r")
+BENCHMARKS: tuple[str, ...] = ("cropharvest", "eurocropsml", "breizhcrops", "pastis")
 MODEL_ORDER: tuple[str, ...] = ("presto", "tessera", "agrifm", "olmoearth", "galileo", "raw")
 
 BLOCKED_MODELS: dict[str, set[str]] = {
@@ -23,11 +23,11 @@ RUN_RANK: dict[tuple[str, str], int] = {
     ("breizhcrops", "tessera"): 6,
     ("breizhcrops", "olmoearth"): 1,
     ("breizhcrops", "galileo"): 1,
-    ("pastis_r", "presto"): 8,
-    ("pastis_r", "tessera"): 1,
-    ("pastis_r", "agrifm"): 4,
-    ("pastis_r", "olmoearth"): 1,
-    ("pastis_r", "galileo"): 1,
+    ("pastis", "presto"): 8,
+    ("pastis", "tessera"): 1,
+    ("pastis", "agrifm"): 4,
+    ("pastis", "olmoearth"): 1,
+    ("pastis", "galileo"): 1,
 }
 
 MODEL_INPUT_MODALITIES: dict[str, tuple[str, ...]] = {

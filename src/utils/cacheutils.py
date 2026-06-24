@@ -1,10 +1,3 @@
-"""Cache-keyed benchmark assembly + model embedding extraction.
-
-Every cache key includes a hash of the code that produced it (loader, model source),
-so any code change self-invalidates the cache.  The caller never has to clear
-``data/cache/`` by hand.
-"""
-
 from __future__ import annotations
 
 import functools
@@ -14,13 +7,14 @@ import inspect
 import os
 import pickle
 import re
+import uuid
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from dataio import get_input as GI
-from evals.benchmarks.pastis_r import PastisBenchmark
+from evals.benchmarks.pastis import PastisBenchmark
 from utils import perfutils as perf
 
 REPO = Path(__file__).resolve().parents[2]
@@ -35,7 +29,7 @@ BENCHMARK_MODULES: dict[str, str] = {
     "cropharvest": "evals/benchmarks/cropharvest",
     "eurocropsml": "evals/benchmarks/eurocropsml",
     "breizhcrops": "evals/benchmarks/breizhcrops",
-    "pastis_r": "evals/benchmarks/pastis_r",
+    "pastis": "evals/benchmarks/pastis",
 }
 
 MODELS: dict[str, tuple[str, str]] = {
@@ -69,17 +63,18 @@ def _hash_str(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()[:10]
 
 
-def _input_fingerprint(bench_dir: Path) -> str:
-    """Fingerprint a dataset dir -- folds DATA changes into the cache key.
+def _atomic_tmp(path: Path) -> Path:
+    return path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
 
-    Default (``DATA_FINGERPRINT`` unset or ``deep``): a full RECURSIVE walk hashing every
-    file's ``relpath:size:mtime``. This is automatic correctness -- it catches added/removed/
-    renamed files AND surgical in-place edits of deep files. On a local FS (cranberry scratch,
-    where the real runs happen) walking even EuroCropsML's ~700k files is a few seconds, paid
-    once per process. Over a high-latency mount (e.g. sshfs on the Mac) it is slow, so set
-    ``DATA_FINGERPRINT=top`` to fall back to the cheap top-level-only stat there. ``$DATA_VERSION``
-    (folded into ``bench_tag``) remains an explicit override on top of either mode.
-    """
+
+def _update_file_content_hash(path: str | Path, h: Any) -> None:
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+
+
+def _input_fingerprint(bench_dir: Path) -> str:
+    """Fingerprint a dataset dir; deep mode hashes paths and bytes, top mode hashes directory stats."""
     h = hashlib.sha256()
     mode = os.environ.get("DATA_FINGERPRINT", "deep").strip().lower()
     try:
@@ -92,9 +87,10 @@ def _input_fingerprint(bench_dir: Path) -> str:
                 dirs.sort()
                 rel = os.path.relpath(root, bench_dir)
                 for name in sorted(files):
+                    fp = os.path.join(root, name)
                     try:
-                        st = os.stat(os.path.join(root, name))
-                        h.update(f"{rel}/{name}:{st.st_size}:{int(st.st_mtime)}".encode())
+                        h.update(f"{rel}/{name}\0".encode())
+                        _update_file_content_hash(fp, h)
                     except OSError:
                         h.update(f"{rel}/{name}:<missing>".encode())
     except OSError:
@@ -103,13 +99,7 @@ def _input_fingerprint(bench_dir: Path) -> str:
 
 
 def bench_tag(benchmark: str, kwargs: dict) -> str:
-    """Identity of an assembled benchmark: params + loader-code hash + input-data hash.
-
-    Any change to the params, to get_input.py, to the benchmark's spec file, or to the
-    staged input files yields a new tag -- so the bench pickle AND the embeddings derived
-    from it self-invalidate. The data hash is recursive by default (see ``_input_fingerprint``);
-    ``$DATA_VERSION`` is an additional explicit override folded into the tag.
-    """
+    """Identity of an assembled benchmark: params + loader-code hash + input-data hash."""
     params = "_".join(f"{k}-{kwargs[k]}" for k in sorted(kwargs)) or "default"
     spec_path = REPO / "src" / (BENCHMARK_MODULES[benchmark].replace(".", "/") + ".py")
     code = _hash_files(BENCH_SRC, spec_path)
@@ -125,12 +115,7 @@ def bench_tag(benchmark: str, kwargs: dict) -> str:
 
 
 def cached_bench(benchmark: str, tag: str, **kwargs):
-    """Load the assembled Benchmark from a content-keyed pickle cache (build on miss).
-
-    Assembling a benchmark reads tens of thousands of small files -- the dominant CPU
-    cost; re-runs load one pickle. ``tag`` (see ``bench_tag``) makes the cache
-    self-invalidating on loader-code or input-data changes. Lives under ``data/cache``.
-    """
+    """Load the assembled Benchmark from a content-keyed pickle cache (build on miss)."""
     path = CACHE_DIR / "benchmark" / f"{benchmark}__{tag}.pkl"
     if path.exists():
         try:
@@ -140,17 +125,17 @@ def cached_bench(benchmark: str, tag: str, **kwargs):
     with perf.measure(f"bench.load/{benchmark}", tag=tag):
         bench = GI.get_input(benchmark, root=INPUT_ROOT, **kwargs)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_bytes(pickle.dumps(bench))
-    os.replace(tmp, path)
+    tmp = _atomic_tmp(path)
+    try:
+        tmp.write_bytes(pickle.dumps(bench))
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
     return bench
 
 
 def build_model(name: str, **kwargs) -> Any:
-    """Instantiate a model, passing only the kwargs it actually accepts.
-
-    (Lets us hand ``device`` to everything; models without that field silently ignore it.)
-    """
+    """Instantiate a model, passing only accepted kwargs."""
     mod_path, cls_name = MODELS[name]
     cls = getattr(importlib.import_module(mod_path), cls_name)
     accepted = set(inspect.signature(cls).parameters)
@@ -170,6 +155,14 @@ def _model_source_files(model_name: str) -> list[Path]:
         util_path = REPO / "src" / "utils" / "models" / f"{name}.py"
         if util_path.exists() and util_path not in files:
             files.append(util_path)
+            try:
+                util_text = util_path.read_text()
+            except OSError:
+                util_text = ""
+            if re.search(r"from\s+utils\.gputils\s+import|import\s+utils\.gputils", util_text):
+                gputils_path = REPO / "src" / "utils" / "gputils.py"
+                if gputils_path not in files:
+                    files.append(gputils_path)
     return files
 
 
@@ -357,10 +350,13 @@ def extract_and_cache(
         n_features=model.embedding_dim,
     )
     arr = arr.astype(EMB_DTYPE, copy=False)  # cache dtype; round BEFORE returning so a single-process
-    tmp = path.with_name(path.name + ".tmp")  # run probes on the exact same values a two-stage (load
-    with open(tmp, "wb") as f:                 # from cache) run would -- no fp16-vs-fp32 drift.
-        np.save(f, arr)
-    os.replace(tmp, path)
+    tmp = _atomic_tmp(path)  # run probes on the exact same values a two-stage load would.
+    try:
+        with open(tmp, "wb") as f:
+            np.save(f, arr)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
     return arr.astype(np.float32, copy=False)
 
 
@@ -408,10 +404,13 @@ def extract_dense_and_cache(
             (feature_path, features, EMB_DTYPE),
             (label_path, labels, "uint8"),
         ):
-            tmp = path.with_name(path.name + ".tmp")
-            with open(tmp, "wb") as handle:
-                np.save(handle, np.asarray(values, dtype=dtype))
-            os.replace(tmp, path)
+            tmp = _atomic_tmp(path)
+            try:
+                with open(tmp, "wb") as handle:
+                    np.save(handle, np.asarray(values, dtype=dtype))
+                os.replace(tmp, path)
+            finally:
+                tmp.unlink(missing_ok=True)
     return root
 
 

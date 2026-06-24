@@ -22,7 +22,7 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("A CUDA device is required for the PASTIS-R smoke test")
     benchmark = get_input(
-        "pastis_r",
+        "pastis",
         root=cacheutils.INPUT_ROOT,
         max_samples=MAX_PATCHES,
         shuffle=False,

@@ -203,7 +203,7 @@ LOADERS: dict[str, str] = {
     "cropharvest": "evals.benchmarks.cropharvest",
     "eurocropsml": "evals.benchmarks.eurocropsml",
     "breizhcrops": "evals.benchmarks.breizhcrops",
-    "pastis_r": "evals.benchmarks.pastis_r",
+    "pastis": "evals.benchmarks.pastis",
 }
 
 

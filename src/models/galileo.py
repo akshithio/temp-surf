@@ -350,7 +350,7 @@ class GalileoModel:
     def encode_dense(self, tile) -> np.ndarray:
         """Return a per-pixel PASTIS feature map from native spatial tokens."""
         self._ensure_loaded()
-        from evals.benchmarks.pastis_r import PASTIS_S1_BANDS, PASTIS_S2_BANDS, _monthly_patch
+        from evals.benchmarks.pastis import PASTIS_S1_BANDS, PASTIS_S2_BANDS, _monthly_patch
 
         # Galileo fuses S1 + S2 per timestep, so it composites the native tile to a common monthly
         # grid (its own temporal aggregation, matching how it treats the classification benchmarks);

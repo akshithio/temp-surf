@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from evals import evals as EV
 
@@ -79,34 +80,34 @@ def test_binary_probe_writes_predictions_for_each_source_budget() -> None:
     )
 
     assert [r["label_budget"] for r in rows] == [0.5, 1.0]
+    assert {r["evaluation_split"] for r in rows} == {"test"}
     assert len(preds) == 12
     assert {p["label_budget"] for p in preds} == {0.5, 1.0}
+    assert {p["evaluation_split"] for p in preds} == {"test"}
     assert {p["sample_id"] for p in preds} == set(range(100, 106))
     assert {"prob", "pred_default", "pred_calibrated"}.issubset(preds[0])
     assert {"worst_group_calibrated_f1", "worst_group_score", "n_groups_scored"}.issubset(rows[0])
     assert rows[0]["n_groups_scored"] == 1
 
 
-def test_source_budget_zero_is_full_source_anchor() -> None:
+def test_source_budget_zero_is_rejected() -> None:
     rng = np.random.default_rng(9)
     x_train = rng.normal(size=(40, 4))
     y_train = np.array([0, 1] * 20)
     x_train[y_train == 1, 0] += 2.0
     rows: list[dict] = []
 
-    EV.run_probes(
-        rows,
-        x_train,
-        x_train,
-        y_train,
-        y_train,
-        seed=0,
-        budgets=[0],
-        meta={"model": "e", "benchmark": "t", "method": "erm", "split_regime": "random_id"},
-    )
-
-    assert rows[0]["label_budget"] == 0
-    assert rows[0]["n_train_sub"] == len(y_train)
+    with pytest.raises(ValueError, match="source budgets"):
+        EV.run_probes(
+            rows,
+            x_train,
+            x_train,
+            y_train,
+            y_train,
+            seed=0,
+            budgets=[0],
+            meta={"model": "e", "benchmark": "t", "method": "erm", "split_regime": "random_id"},
+        )
 
 
 def test_binary_probe_reports_worst_group_on_mixed_domain_test_set() -> None:
@@ -285,7 +286,7 @@ def test_segmentation_probe_reports_official_validation_and_test_splits() -> Non
             "test": lambda: iter([(x_test, y_test)]),
         },
         budgets=[1.0],
-        meta={"benchmark": "pastis_r"},
+        meta={"benchmark": "pastis"},
     )
 
     assert {row["evaluation_split"] for row in rows} == {"validation", "test"}
@@ -317,6 +318,24 @@ def test_streamed_segmentation_matches_whole_array_scoring() -> None:
     assert abs(streamed["miou"] - whole["miou"]) < 1e-9
     assert abs(streamed["pixel_accuracy"] - whole["pixel_accuracy"]) < 1e-9
     assert streamed["n_test"] == 120 and streamed["n_tiles_scored"] == 2
+
+
+def test_streamed_segmentation_rejects_invalid_labels() -> None:
+    from evals.probes import score_segmentation_streamed
+
+    class _Clf:
+        def predict(self, x):
+            return np.array([0, 99])
+
+    with pytest.raises(ValueError, match="predictions"):
+        score_segmentation_streamed(_Clf(), iter([(np.zeros((2, 3)), np.array([0, 1]))]), np.arange(3))
+
+    class _GoodClf:
+        def predict(self, x):
+            return np.array([0, 1])
+
+    with pytest.raises(ValueError, match="labels"):
+        score_segmentation_streamed(_GoodClf(), iter([(np.zeros((2, 3)), np.array([0, 99]))]), np.arange(3))
 
 
 def test_score_multiclass_reports_shared_and_unseen_class_decomposition() -> None:

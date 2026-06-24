@@ -47,7 +47,7 @@ Simplest, no env math: give each machine a disjoint slice of the config in `main
 # machine X
 BENCHMARKS = ["cropharvest", "eurocropsml"]
 # machine Y
-BENCHMARKS = ["breizhcrops", "pastis_r"]
+BENCHMARKS = ["breizhcrops", "pastis"]
 ```
 
 (Or run a single process per box with one GPU via `python main.py`.) Just make sure the slices are
@@ -61,7 +61,7 @@ it up correctly:
 
 | Must match | Why | How it's enforced / checked |
 |---|---|---|
-| **Code commit** (`src/`) | Different probe/loader/model code → different numbers | `_run_signature` hashes `probes.py`, `evals.py`, `main.py`, `ioutils.py`, `cacheutils.py`, the model wrapper, and every regime file. A results dir with a *different* signature is **refused** on resume (unless `OVERWRITE_MODE=True`). |
+| **Code commit** (`src/`) | Different probe/loader/model code → different numbers | `_run_signature` hashes `main.py`, the probe/eval/confound/perf utilities, cache/run-state utilities, the model wrapper and its helper files, and every regime file. A results dir with a *different* signature is **refused** on resume (unless `OVERWRITE_MODE=True`). |
 | **Staged input data** | Different data → different embeddings | `bench_tag` folds a recursive content fingerprint of `data/input/benchmarks/<bench>` into every cache key. If a machine has stale/different data, its caches won't collide with the others' (different key). |
 | **Model weights** | Different checkpoint → different embeddings | `_checkpoint_fingerprint` folds the resolved checkpoint's identity into the embedding cache key (and the run signature). |
 | **Config block in `main.py`** | `SEEDS`, `ACTIVE_PROBES`, `SPLIT_REGIMES`, `MAX_SAMPLES`, `MAX_DENSE_PIXELS` all change results | Folded into `_run_signature`; a mismatch is refused on resume. |
@@ -70,7 +70,7 @@ it up correctly:
 
 ### Caches are content-keyed → safe to share
 `data/cache/` (benchmark pickles + embeddings) is keyed by code+data+checkpoint hashes and written
-atomically (`tmp` + `os.replace`). Two shards that happen to touch the same model/benchmark cache
+atomically (unique temp path + `os.replace`). Two shards that happen to touch the same model/benchmark cache
 are safe — at worst one embedding is computed twice. So a **shared** `data/` (e.g. the cranberry
 scratch over sshfs) is fine and avoids re-encoding the same pair twice.
 
@@ -82,8 +82,8 @@ Run through this on **each** machine before kicking off its shard:
 2. **Env built**: `uv pip install -e .` from the project conda env; `python -c "import torch, sklearn"`
    works; `ruff check src` and `pytest src/tests -q` pass (catches a broken sync).
 3. **Data staged & identical**: `data/input/benchmarks/<bench>` present for every benchmark this shard
-   will touch, and byte-identical to the other machines (same source). If you changed staged data in
-   a way the cheap fingerprint can't see, bump `DATA_VERSION` **identically everywhere**.
+   will touch, and byte-identical to the other machines (same source). If you intentionally run with
+   `DATA_FINGERPRINT=top`, bump `DATA_VERSION` **identically everywhere** after any staged-data edit.
 4. **Weights present** for every model this shard will run (`data/input/models/...`, or the
    `*_WEIGHTS` env overrides) — set the same way on every machine.
 5. **GPU visible**: `nvidia-smi` shows the expected GPUs; `python -c "import torch; print(torch.cuda.device_count())"`.

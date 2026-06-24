@@ -1,11 +1,8 @@
-"""Raw-feature baseline (the reality-check control, not a foundation model).
+"""Raw-feature baseline 
 
-This is the required "do the FMs actually beat cheap spectral-temporal cues?" baseline.
-It is NOT a learned encoder: it turns each sample's multimodal time series directly into
-a feature vector and feeds it to the same probe / regime / budget machinery as every FM,
-so a fair comparison falls out for free. Especially important on LEM-Brazil, where raw
-red-edge / NIR / NDVI already separates the classes — if an FM cannot beat this, the
-"representation" is not buying anything there.
+This is a baseline and not a learned encoder. It turns each sample's multimodal time
+series directly into a feature vector and feeds it to the same machinery as every FM,
+for a fair comparison. 
 
 Modes (``RAW_MODE`` / ``mode``):
   * ``flatten`` (default) — concat S2+S1+climate over time, flattened to ``(N, T*C)``.

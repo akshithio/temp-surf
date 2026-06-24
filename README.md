@@ -200,7 +200,7 @@ data/input/benchmarks/cropharvest/
 data/input/benchmarks/eurocropsml/
     preprocess/*.npz
     split/latvia_portugal_vs_estonia/...
-data/input/benchmarks/pastis_r/
+data/input/benchmarks/pastis/
     metadata.geojson
     DATA_S2/S2_<patch>.npy
     DATA_S1A/S1A_<patch>.npy
@@ -290,7 +290,7 @@ GPU smoke tests on cranberry use fixed in-file configuration:
 ```bash
 cd src
 python tests/smoke_models.py
-python tests/smoke_pastis_r.py
+python tests/smoke_pastis.py
 ```
 
 Edit the config block at the top of `src/main.py`, then run:
@@ -303,7 +303,7 @@ Recommended core-scope configuration (you list only the benchmarks; the
 compatibility matrix decides which models run on each):
 
 ```python
-BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis_r"]
+BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis"]
 RUN_STAGES = ["gen_embeddings", "probing"]
 SPLIT_REGIMES = ["random_id", "geographic_ood"]
 ACTIVE_PROBES = ["logistic"]
@@ -317,7 +317,7 @@ SEEDS = [0]
 Configuration reference:
 
 ```python
-BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis_r"]
+BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis"]
 RUN_STAGES = ["gen_embeddings", "probing"]
 SPLIT_REGIMES = ["random_id", "geographic_ood"]
 ACTIVE_PROBES = ["logistic"]  # add "mlp" later if linear-probe gaps are ambiguous

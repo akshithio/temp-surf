@@ -282,7 +282,7 @@ class OlmoEarthModel:
         from olmoearth_pretrain.data.normalize import Normalizer, Strategy
         from olmoearth_pretrain.datatypes import MaskedOlmoEarthSample, MaskValue
 
-        from evals.benchmarks.pastis_r import PASTIS_S2_BANDS, _monthly_patch
+        from evals.benchmarks.pastis import PASTIS_S2_BANDS, _monthly_patch
 
         # OlmoEarth uses a calendar-month timestamp grid (consistent with how it treats the
         # classification benchmarks via bench.monthly), so it composites the native tile to months

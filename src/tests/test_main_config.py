@@ -27,7 +27,7 @@ def test_main_dispatches_config_to_run_pair(monkeypatch) -> None:
     monkeypatch.setattr(main.gputils, "take_shard", lambda pairs: pairs[:1])
     monkeypatch.setattr(main.gputils, "shard_indices", lambda: (0, 1))
     monkeypatch.setattr(main.gputils, "device", lambda: "cpu")
-    monkeypatch.setattr(main.EV, "run_pair", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(main, "run_pair", lambda **kwargs: calls.append(kwargs))
     monkeypatch.setattr(main.regime_base, "report_regime_problems", lambda: None)
 
     assert main.main() == 0
@@ -56,10 +56,10 @@ def test_compatibility_table_excludes_only_blocked_pairs() -> None:
     assert compat.eligible_models("cropharvest") == ["presto", "olmoearth", "galileo", "raw"]
     assert compat.eligible_models("eurocropsml") == ["presto", "olmoearth", "galileo", "tessera", "raw"]
     assert compat.eligible_models("breizhcrops") == ["olmoearth", "galileo", "presto", "tessera", "raw"]
-    assert compat.eligible_models("pastis_r") == ["tessera", "olmoearth", "galileo", "agrifm", "presto", "raw"]
+    assert compat.eligible_models("pastis") == ["tessera", "olmoearth", "galileo", "agrifm", "presto", "raw"]
 
     assert not compat.is_eligible("cropharvest", "tessera")
     assert not compat.is_eligible("cropharvest", "agrifm")
     assert not compat.is_eligible("eurocropsml", "agrifm")
     assert not compat.is_eligible("breizhcrops", "agrifm")
-    assert compat.is_eligible("pastis_r", "agrifm")
+    assert compat.is_eligible("pastis", "agrifm")

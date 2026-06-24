@@ -26,7 +26,7 @@ dependencies = [
     "torchvision==0.22.1",
     # NOTE: presto is intentionally NOT a uv-resolved dependency. Upstream presto pins a wall of
     # stale exact versions (torch==2.0, numpy==1.23.5, einops==0.6.0, ...) that conflict with this
-    # project and with olmoearth. It is installed `--no-deps` from git in sync.sh after `uv sync`.
+    # project and with olmoearth. It is installed `--no-deps` from git after `uv sync`.
     "webdataset",
     "xarray",
 ]
