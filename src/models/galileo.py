@@ -25,7 +25,7 @@ import thop
 import torch
 import torch.nn.functional as F
 
-from utils.galileoutil import (
+from utils.models.galileoutil import (
     SPACE_BAND_GROUPS_IDX,
     SPACE_BANDS,
     SPACE_TIME_BANDS,

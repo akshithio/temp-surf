@@ -42,7 +42,7 @@ except ImportError:
 if TYPE_CHECKING:
     from dataio.get_input import Benchmark
 
-from utils.agrifmutils import SwinTransformer3D
+from utils.models.agrifmutils import SwinTransformer3D
 
 AGRIFM_S2_BANDS = ["B2", "B3", "B4", "B8", "B5", "B6", "B7", "B8A", "B11", "B12"]
 AGRIFM_NUM_FRAMES = 32

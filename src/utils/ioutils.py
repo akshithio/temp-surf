@@ -451,12 +451,6 @@ def compute_deltas(
         pred_by.setdefault(tuple(p.get(k) for k in keys), {}).setdefault(p.get("split_regime"), []).append(p)
 
     combos = sorted({tuple(r.get(k) for k in keys) for r in rows}, key=lambda t: tuple(str(x) for x in t))
-    # Secondary OOD regimes to surface (every *_ood except the primary geographic_ood that are
-    # actually present in the results): climate_ood, temporal_ood, phenology_ood, ...
-    secondary_ood_regimes = sorted({
-        str(r.get("split_regime")) for r in rows
-        if str(r.get("split_regime", "")).endswith("_ood") and r.get("split_regime") != "geographic_ood"
-    })
     out_rows: list[dict[str, Any]] = []
     for combo in combos:
         # ID test-set label stats (from the random_id anchor rows) -> chance/no-skill floor
@@ -567,22 +561,6 @@ def compute_deltas(
                         "delta_sample_ci_lo": lo_s, "delta_sample_ci_hi": hi_s,
                         "n_id_samples": len(id_preds), "n_ood_samples": len(ood_preds),
                     })
-            # Secondary OOD axes (climate / temporal / phenology): same ID-minus-OOD at target
-            # budget 0, surfaced as ood_<axis> / delta_<axis>. geographic_ood is the primary
-            # ood/delta above; this lifts every OTHER declared OOD regime into deltas.csv too
-            # (previously only phenology was surfaced, so climate/temporal silently had no columns).
-            for ood_regime in secondary_ood_regimes:
-                axis = ood_regime[:-4] if ood_regime.endswith("_ood") else ood_regime
-                # deployment scope = full-target zero-shot (fall back to held_out for old results);
-                # never average the two scopes together.
-                ovals = _first_vals(ood_regime, "target", 0.0, combo, metric, ("full", "test", "held_out"))
-                if ovals:
-                    oa = np.asarray(ovals)
-                    row[f"ood_{axis}"] = float(oa.mean())
-                    row[f"ood_{axis}_std"] = float(oa.std())
-                    row[f"ood_{axis}_min"] = float(oa.min())
-                    row[f"delta_{axis}"] = idm - float(oa.mean())
-
             # --- inherent-difficulty decomposition ---
             # target-ID upper-bound (budget -1): train on the 80% target pool, test on the fixed
             # held-out 20%. The decomposition compares it to the zero-shot on that SAME held-out

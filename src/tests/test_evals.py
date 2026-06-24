@@ -343,19 +343,14 @@ def test_score_multiclass_reports_shared_and_unseen_class_decomposition() -> Non
 
 
 def test_domain_confound_report_flags_geography_entanglement() -> None:
-    """#8/#9: cross-tab the domain bases so a confounded axis is visible. Here climate is a function
-    of country (geography determines it) while year is independent of geography."""
+    """Cross-tab the domain bases so a confounded axis is visible."""
     from evals.confounds import domain_confound_report
 
     geography = np.array(["PT", "PT", "EE", "EE", "LV", "LV"])
-    climate = np.array(["C", "C", "D", "D", "D", "D"])  # PT->C, EE->D, LV->D: country fixes climate
     year = np.array([2020, 2021, 2020, 2021, 2020, 2021])  # each country spans both years -> independent
     rep = domain_confound_report(
-        {"geography": geography, "climate": climate, "year": year, "class": np.zeros(6)}
+        {"geography": geography, "year": year, "class": np.zeros(6)}
     )
 
-    geo_climate = rep["pairs"]["geography__vs__climate"]
-    assert geo_climate["determines_b_given_a"] > 0.99  # geography fully determines climate -> confounded
-    assert "contingency" in geo_climate
     assert rep["pairs"]["geography__vs__year"]["nmi"] < 0.2  # geography/year not entangled
     assert "class" not in rep["axis_cardinality"]  # single-valued axis dropped

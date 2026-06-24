@@ -34,7 +34,6 @@ SEEDS = [0]
 # Downstream loaders use this to decide whether partial/corrupt inputs warn or fail.
 os.environ["OVERWRITE_MODE"] = "1" if OVERWRITE_MODE else ""
 
-
 def main() -> int:
     enc_kwargs = {"device": gputils.device()}
 
