@@ -4,7 +4,7 @@ Train and test are drawn from the SAME region pool (80/10/10 stratified), so thi
 is the easy in-distribution upper bound, not a transfer test. There is no target
 region, so no few-shot target-budget sweep applies (``HAS_TARGET = False``).
 
-Regime-module contract (consumed by the runner in ``main.py`` via ``importlib``):
+Regime-module contract:
   * ``NAME``       -- regime id, identical to this module's filename.
   * ``HAS_TARGET`` -- whether OOD target-budget sweeps are meaningful.
   * ``iter_splits(y, groups, *, seed, holdouts, n_folds)`` -> yields ``(label, train_idx, test_idx)``.

@@ -357,13 +357,14 @@ def compute_deltas(
     metrics: list[str],
     *,
     predictions: list[dict[str, Any]] | None = None,
+    id_source_budget: float | int = 1.0,
     n_boot: int = 2000,
     n_boot_sample: int = 1000,
     seed: int = 0,
 ) -> list[dict[str, Any]]:
     """ID→OOD drop per metric and per (model, benchmark, method).
 
-    ``id``  = metric on the random-split in-distribution anchor (random_id, source budget 1.0).
+    ``id``  = metric on the configured random-split in-distribution source-budget anchor.
     ``ood`` = metric on the curated geographic holdout (geographic_ood, target budget 0).
     ``target_id`` = metric on the *target-ID upper bound* (geographic_ood, target budget -1):
       train on 80 % of the target region (no source), test on remaining 20 %.  This
@@ -435,7 +436,8 @@ def compute_deltas(
     for combo in combos:
         # ID test-set label stats (from the random_id anchor rows) -> chance/no-skill floor
         id_stat = [r for r in rows if r.get("split_regime") == "random_id" and r.get("budget_type") == "source"
-                   and _close(r.get("label_budget"), 1.0) and all(r.get(k) == combo[i] for i, k in enumerate(keys))]
+                   and _close(r.get("label_budget"), id_source_budget)
+                   and all(r.get(k) == combo[i] for i, k in enumerate(keys))]
 
         def _avg(field: str, id_stat=id_stat):
             xs = [float(r[field]) for r in id_stat if r.get(field) is not None]
@@ -443,12 +445,12 @@ def compute_deltas(
         pos_rate, n_cls, majority = _avg("test_pos_rate"), _avg("test_n_classes"), _avg("test_majority_rate")
 
         # Sample-level bootstrap inputs MUST be the same quantity as `delta`: the ID anchor
-        # (random_id source budget 1.0) and the OOD anchor (geographic_ood target budget 0).
+        # (configured random_id source-budget anchor) and the OOD anchor (geographic_ood target budget 0).
         # `pred_by` holds every budget's predictions, so filter to the anchors before stacking
         # (otherwise the CI would mix all source fractions / zero-shot+few-shot+oracle).
         id_preds = [
             p for p in pred_by.get(combo, {}).get("random_id", [])
-            if p.get("budget_type") == "source" and _close(p.get("label_budget"), 1.0)
+            if p.get("budget_type") == "source" and _close(p.get("label_budget"), id_source_budget)
         ]
         # Primary OOD anchor = the FULL-target zero-shot (evaluation_split "full"); fall back to
         # the held-out rows for older results that predate the full-target anchor.
@@ -460,7 +462,7 @@ def compute_deltas(
         ood_preds = _ood_full or _ood_preds_all
 
         for metric in metrics:
-            id_vals = vals("random_id", "source", 1.0, combo, metric)
+            id_vals = vals("random_id", "source", id_source_budget, combo, metric)
             ood_vals = vals("geographic_ood", "target", 0.0, combo, metric, es="full") \
                 or vals("geographic_ood", "target", 0.0, combo, metric, es="held_out")
             if not id_vals or not ood_vals:

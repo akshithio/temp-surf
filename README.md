@@ -16,7 +16,7 @@ method or probe operates on those cached matrices.
 ## Current Scope
 
 - **Robustness axis:** deployment-style domain transfer through geographic and
-  phenology-based holdouts.
+  geographic, climate, and temporal holdouts.
 - **Benchmarks:** binary crop/non-crop (CropHarvest), multiclass crop-type
   (EuroCropsML, BreizhCrops), and semantic segmentation (PASTIS-R).
 - **Models:** Presto, OlmoEarth v1.1-Base, Galileo v1 Base, AgriFM, and TESSERA v1.1.
@@ -62,28 +62,9 @@ encode bounded pixel batches. Dense tile caches are resumable.
 
 **Model × benchmark compatibility**
 
-Not every model runs meaningfully on every benchmark. Each `(benchmark, model)`
-cell carries two independent grades — **precedent** (how strongly the literature
-sanctions the baseline) and **adaptation** (how far the wrapper bends the model's
-native input). The matrix is the single source of truth in
-[`src/evals/compat.py`](src/evals/compat.py): you specify only `BENCHMARKS`, and
-the runner reads off which models run on each.
-
-| Model | CropHarvest | EuroCropsML | BreizhCrops | PASTIS-R |
-|---|:--:|:--:|:--:|:--:|
-| Presto | 📄 | 🔗 | ⚠️ | 🆕 🚧 |
-| TESSERA | 🔗 🔴 | 🔗 🚧 | 🔗 🚧 | 📄 |
-| AgriFM | 🆕 🔴 | 🆕 🔴 | 🆕 🔴 | 🔗 |
-| OlmoEarth | 📄 | 🔗 | 📄 | 📄 |
-| Galileo | 📄 | 🔗 | 📄 | 📄 |
-
-*Precedent:* 📄 own paper, this exact benchmark · 🔗 own paper, equivalent benchmark
-· ⚠️ third-party run only · 🆕 no precedent. *Adaptation:* (none) native input · 🚧
-minor/defensible · 🔴 severe (off-distribution input or no native pathway).
-
-A pair is **eligible to run iff its adaptation is not severe** (🔴 excluded — the
-number would misrepresent the model). Eligibility per benchmark (✅ runs, rank in
-parens; ❌ skipped):
+Not every model runs meaningfully on every benchmark. The compatibility table in
+[`src/evals/compat.py`](src/evals/compat.py) is the single source of truth: you
+specify only `BENCHMARKS`, and the runner reads off which models run on each.
 
 | Model | CropHarvest | EuroCropsML | BreizhCrops | PASTIS-R |
 |---|:--:|:--:|:--:|:--:|
@@ -92,9 +73,9 @@ parens; ❌ skipped):
 | AgriFM | ❌ (12) | ❌ (12) | ❌ (12) | ✅ (4) |
 | OlmoEarth | ✅ (1) | ✅ (4) | ✅ (1) | ✅ (1) |
 | Galileo | ✅ (1) | ✅ (4) | ✅ (1) | ✅ (1) |
+| raw baseline | ✅ (n/a) | ✅ (n/a) | ✅ (n/a) | ✅ (n/a) |
 
-Every benchmark clears ≥3 eligible models. The full grade rationale and the rank
-table live in the design doc's *A Compatibility Matrix*.
+Every benchmark clears at least three eligible learned models, plus the raw baseline.
 
 **Split regimes**
 
@@ -107,7 +88,6 @@ those domains become train/test splits:
 |---|---|---:|---|
 | `random_id` | geography | 1 | Random stratified 80/10/10 split. Train and test share regions/domains (in-distribution upper bound). |
 | `geographic_ood` | geography | 1 / ≤5 holdouts | Strict leave-region/source-out. CropHarvest: curated holdouts (togo, ethiopia, lem-brazil, rwanda, togo-eval). EuroCropsML: Estonia. BreizhCrops: frh04. |
-| `phenology_ood` | NDVI phenology | ≤4 practical domains | Assigns domains from loaded NDVI behavior (`low_amplitude`, `early_peak`, `mid_peak`, `late_peak`) and holds each phenology domain out in turn. |
 
 Each regime yields a train/val/test split; the binary probe calibrates its
 decision threshold on that held-out `val` (a source-side validation set for the
@@ -229,7 +209,7 @@ data/input/models/presto/model-f317d103.pth
 data/input/models/olmoearth-v1_1-base/
 data/input/models/agrifm/AgriFM.pth
 data/input/models/agrifm/source/
-data/input/models/tessera/tessera_v1_1_mpc_model.pt
+data/input/models/tessera/tessera_v1_1_mpc_encoder.pt
 ```
 
 ---
@@ -325,8 +305,13 @@ compatibility matrix decides which models run on each):
 ```python
 BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis_r"]
 RUN_STAGES = ["gen_embeddings", "probing"]
-SPLIT_REGIMES = ["random_id", "geographic_ood", "phenology_ood"]
-SEEDS = [0, 1]
+SPLIT_REGIMES = ["random_id", "geographic_ood"]
+ACTIVE_PROBES = ["logistic"]
+BUDGET_REGIMES = {
+    "source": [0.05, 0.10, 0.25, 0],
+    "target": [0, 5, 10, 25, 50, EV.TARGET_ID_UPPER_BOUND],
+}
+SEEDS = [0]
 ```
 
 Configuration reference:
@@ -334,11 +319,16 @@ Configuration reference:
 ```python
 BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis_r"]
 RUN_STAGES = ["gen_embeddings", "probing"]
-SPLIT_REGIMES = ["random_id", "geographic_ood", "phenology_ood"]
+SPLIT_REGIMES = ["random_id", "geographic_ood"]
+ACTIVE_PROBES = ["logistic"]  # add "mlp" later if linear-probe gaps are ambiguous
+BUDGET_REGIMES = {
+    "source": [0.05, 0.10, 0.25, 0],  # 0 = full-source ID anchor; other values are source fractions
+    "target": [0, 5, 10, 25, 50, EV.TARGET_ID_UPPER_BOUND],
+}
 MAX_SAMPLES = None            # None = all samples
 MAX_DENSE_PIXELS = 50_000     # sampled PASTIS pixels per fold partition
-SEEDS = [0, 1]
-OVERWRITE_MODE = "skip"       # "skip" resumes; "override" reruns cached outputs
+SEEDS = [0]                   # expand to [0, 1, 2] for additional bulk runs
+OVERWRITE_MODE = False       # False resumes; True overwrites cached outputs and enables strict mode
 ```
 
 Set `RUN_STAGES = ["gen_embeddings"]` to build or refresh embedding caches without
@@ -357,10 +347,10 @@ data/input/models/presto/model-f317d103.pth
 If it is missing, the wrapper downloads `torchgeo/presto`'s `model-f317d103.pth` into
 that path.
 
-TESSERA uses the model-only v1.1 MPC checkpoint:
+TESSERA uses the encoder-only v1.1 MPC checkpoint:
 
 ```text
-data/input/models/tessera/tessera_v1_1_mpc_model.pt
+data/input/models/tessera/tessera_v1_1_mpc_encoder.pt
 ```
 
 Download it from the [official TESSERA v1.1 release](https://drive.google.com/file/d/1t-gfTxi3Hg_uJXpJ9etROCRgKt2myfJ2/view).
@@ -384,7 +374,7 @@ Everything is cache-backed and resumable:
   with atomic writes.
 - Probe results append to `probe_results.jsonl`; per-sample predictions append to
   `predictions.jsonl` for every probe cell.
-- Restarting with `OVERWRITE_MODE="skip"` skips finished cells and regenerates derived
+- Restarting with `OVERWRITE_MODE=False` skips finished cells and regenerates derived
   tables from the JSONL logs.
 
 To split work across GPUs:

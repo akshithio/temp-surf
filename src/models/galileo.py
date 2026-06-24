@@ -200,39 +200,36 @@ class GalileoModel:
         st_m  : (N, 4)            float32 — all 1 (masked)
         months: (N, T)            int64   — calendar month (0-indexed) per timestep from doy
         """
-        n, t = bench.s2.shape[0], bench.s2.shape[1]
+        s2_vals, s2_msk, doy_arr, s2_bands = bench.monthly("s2")
+        s1_vals, s1_msk, _, s1_bands = bench.monthly("s1")
+        n, t = s2_vals.shape[0], s2_vals.shape[1]
 
-        # Build per-modality band-to-column lookups
-        s2_idx = {b: i for i, b in enumerate(bench.s2_bands)} if bench.s2 is not None else {}
-        s1_idx = {b: i for i, b in enumerate(bench.s1_bands)} if bench.s1 is not None else {}
+        # Build per-modality band-to-column lookups (full native band sets)
+        s2_idx = {b: i for i, b in enumerate(s2_bands)}
+        s1_idx = {b: i for i, b in enumerate(s1_bands)}
 
         # -- space_time_x: (N, 1, 1, T, 13) ---------------------------------
         x_st = np.zeros((n, 1, 1, t, len(SPACE_TIME_BANDS)), dtype=np.float32)
         for bname, gidx in _BENCH_TO_GALILEO_ST_IDX.items():
             if bname in s2_idx:
-                x_st[:, 0, 0, :, gidx] = bench.s2[:, :, s2_idx[bname]]
+                x_st[:, 0, 0, :, gidx] = s2_vals[:, :, s2_idx[bname]]
             elif bname in s1_idx:
-                x_st[:, 0, 0, :, gidx] = bench.s1[:, :, s1_idx[bname]]
+                x_st[:, 0, 0, :, gidx] = s1_vals[:, :, s1_idx[bname]]
 
         # Normalize space_time_x (z-score per band)
         x_st = (x_st - GALILEO_NORM_13_MEAN) / GALILEO_NORM_13_STD
 
         # -- masks -----------------------------------------------------------
-        # s_t_m: (N, 1, 1, T, 7) — 1 = masked, 0 = available. A group is available at a
-        # timestep ONLY where that modality is actually observed there (per-timestep
-        # s2_mask / s1_mask), exactly like the dense path. Marking every timestep available
-        # because an array exists fed zero-filled missing months / padded steps to the model
-        # as if they were real observations (and unmasked the all-zero placeholder S1 on the
-        # S2-only benchmarks).
+        # s_t_m: (N, 1, 1, T, 7) — 1 = masked, 0 = available. A group is available at a timestep
+        # ONLY where that modality is actually observed there (the monthly view's per-month mask),
+        # so empty months and the placeholder S1 on S2-only benchmarks stay masked.
         s_t_m = np.ones((n, 1, 1, t, len(SPACE_TIME_BANDS_GROUPS_IDX)), dtype=np.float32)
-        if bench.s2 is not None:
-            s2_obs = np.asarray(bench.s2_mask) if getattr(bench, "s2_mask", None) is not None else np.ones((n, t))
-            s2_masked = (s2_obs <= 0).astype(np.float32)  # (n, t): 1 where NOT observed
+        if s2_bands:
+            s2_masked = (s2_msk <= 0).astype(np.float32)  # (n, t): 1 where NOT observed
             for gid in _GALILEO_S2_GROUP_IDS:
                 s_t_m[:, 0, 0, :, gid] = s2_masked
-        if bench.s1 is not None:
-            s1_obs = np.asarray(bench.s1_mask) if getattr(bench, "s1_mask", None) is not None else np.ones((n, t))
-            s_t_m[:, 0, 0, :, 0] = (s1_obs <= 0).astype(np.float32)  # S1 is the first group
+        if s1_bands:
+            s_t_m[:, 0, 0, :, 0] = (s1_msk <= 0).astype(np.float32)  # S1 is the first group
 
         # -- empty modalities (all masked) -----------------------------------
         sp_x = np.zeros((n, 1, 1, len(SPACE_BANDS)), dtype=np.float32)
@@ -243,19 +240,14 @@ class GalileoModel:
         st_m = np.ones((n, len(STATIC_BAND_GROUPS_IDX)), dtype=np.float32)
 
         # -- months ----------------------------------------------------------
-        # Real calendar month (0-indexed) per timestep from day-of-year — Galileo's temporal
-        # encoding is month-aware, so a constant "July" misrepresents the season for every
-        # sample. Falls back to July only if the benchmark carries no doy at all.
-        if getattr(bench, "doy", None) is not None:
-            doy = np.clip(np.asarray(bench.doy, dtype=np.int64), 1, 365)
-            months = (
-                (np.datetime64("2001-01-01") + (doy - 1).astype("timedelta64[D]"))
-                .astype("datetime64[M]")
-                .astype(np.int64)
-                % 12
-            ).astype(np.int64)
-        else:
-            months = np.full((n, t), 6, dtype=np.int64)
+        # Real calendar month (0-indexed) per timestep from the monthly view's day-of-year.
+        doy = np.clip(np.asarray(doy_arr, dtype=np.int64), 1, 365)
+        months = (
+            (np.datetime64("2001-01-01") + (doy - 1).astype("timedelta64[D]"))
+            .astype("datetime64[M]")
+            .astype(np.int64)
+            % 12
+        ).astype(np.int64)
 
         return x_st, sp_x, t_x, st_x, s_t_m, sp_m, t_m, st_m, months
 
@@ -358,13 +350,18 @@ class GalileoModel:
     def encode_dense(self, tile) -> np.ndarray:
         """Return a per-pixel PASTIS feature map from native spatial tokens."""
         self._ensure_loaded()
-        from evals.benchmarks.pastis_r import PASTIS_S1_BANDS, PASTIS_S2_BANDS
+        from evals.benchmarks.pastis_r import PASTIS_S1_BANDS, PASTIS_S2_BANDS, _monthly_patch
 
-        height, width, timesteps = tile.height, tile.width, tile.s2.shape[0]
+        # Galileo fuses S1 + S2 per timestep, so it composites the native tile to a common monthly
+        # grid (its own temporal aggregation, matching how it treats the classification benchmarks);
+        # empty months are masked. This reproduces the pre-native-refactor monthly tile bit-for-bit.
+        s2_m, s2_mask = _monthly_patch(tile.s2, tile.s2_months)  # (12, 10, H, W), (12,)
+        s1_m, s1_mask = _monthly_patch(tile.s1, tile.s1_months)
+        height, width, timesteps = tile.height, tile.width, s2_m.shape[0]
         x = np.zeros((1, height, width, timesteps, len(SPACE_TIME_BANDS)), dtype=np.float32)
         sources = {
-            **{band: tile.s2[:, index] for index, band in enumerate(PASTIS_S2_BANDS)},
-            **{band: tile.s1[:, index] for index, band in enumerate(PASTIS_S1_BANDS)},
+            **{band: s2_m[:, index] for index, band in enumerate(PASTIS_S2_BANDS)},
+            **{band: s1_m[:, index] for index, band in enumerate(PASTIS_S1_BANDS)},
         }
         red, nir = sources["B4"], sources["B8"]
         sources["NDVI"] = np.divide(nir - red, nir + red, out=np.zeros_like(red), where=(nir + red) != 0)
@@ -380,9 +377,9 @@ class GalileoModel:
             (1, height, width, timesteps, len(SPACE_TIME_BANDS_GROUPS_IDX)), dtype=np.float32
         )
         for timestep in range(timesteps):
-            if tile.s2_mask[timestep]:
+            if s2_mask[timestep]:
                 space_time_mask[:, :, :, timestep, _GALILEO_S2_GROUP_IDS] = 0.0
-            if tile.s1_mask[timestep]:
+            if s1_mask[timestep]:
                 space_time_mask[:, :, :, timestep, 0] = 0.0
         args = (
             x,

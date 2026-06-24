@@ -773,11 +773,15 @@ class GalileoNativeModel(GalileoBase):
 
         with (folder / CONFIG_FILENAME).open("r") as f:
             config = json.load(f)
-            model_config = config["model"]
-            model_config = model_config["model"]
+            model_section = config["model"]
+            # Pinned Galileo releases store the inference model under ``encoder``. Retain the
+            # nested ``model`` fallback for older exported folders.
+            model_config = model_section.get("encoder", model_section.get("model"))
+            if model_config is None:
+                raise ValueError(f"Expected model.encoder or model.model in {folder / CONFIG_FILENAME}")
         model = cls(**model_config)
 
-        state_dict = torch.load(folder / MODEL_FILENAME, map_location=device)
+        state_dict = torch.load(folder / MODEL_FILENAME, map_location=device, weights_only=True)
         for key in list(state_dict.keys()):
             state_dict[key.replace(".backbone", "")] = state_dict.pop(key)
         model.load_state_dict(state_dict)

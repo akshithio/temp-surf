@@ -15,6 +15,8 @@ import numpy as np
 
 from dataio.get_input import (
     Benchmark,
+    ModalitySeries,
+    NativeSeries,
     _synthetic_month_doy,
 )
 
@@ -56,10 +58,21 @@ class PastisPatch:
 
 @dataclass(frozen=True)
 class PastisTile:
-    """One monthly 64x64 PASTIS-R tile passed to dense models."""
+    """One NATIVE-cadence 64x64 PASTIS-R tile passed to dense models.
+
+    ``s2`` / ``s1`` are ``(T, C, H, W)`` at the patch's native acquisition cadence (NO temporal
+    aggregation here); ``s2_months`` / ``s1_months`` are each acquisition's calendar month (0-11).
+    Each model does its OWN temporal handling in its encode path -- Galileo/OlmoEarth/raw/Presto
+    monthly-composite (Galileo/OlmoEarth fuse modalities on a common monthly grid; Presto/raw are
+    month-cadence models), TESSERA consumes the full per-modality cadence, AgriFM resamples to its
+    frame count. ``s2_mask`` / ``s1_mask`` are all-ones (every native acquisition is a real
+    observation), kept for the dense models that read a per-timestep availability mask.
+    """
 
     s2: np.ndarray
     s1: np.ndarray
+    s2_months: np.ndarray
+    s1_months: np.ndarray
     s2_mask: np.ndarray
     s1_mask: np.ndarray
     labels: np.ndarray
@@ -78,8 +91,8 @@ class PastisTile:
         return _pastis_pixel_benchmark(
             self.s2,
             self.s1,
-            self.s2_mask,
-            self.s1_mask,
+            self.s2_months,
+            self.s1_months,
             self.labels.reshape(-1),
             self.valid.reshape(-1),
             self.fold,
@@ -112,19 +125,20 @@ class PastisBenchmark:
         return np.repeat([patch.fold for patch in self.patches], tiles_per_patch).astype(np.int64)
 
     def iter_tiles(self, folds: set[int] | None = None):
-        """Yield ``(tile_id, fold, pixel_benchmark, labels)`` lazily.
+        """Yield ``(tile_id, fold, native_tile, labels)`` lazily, at the patch's NATIVE cadence.
 
-        Pixels with the PASTIS void label (19) are removed. Background (0) is
-        retained because it is an evaluated class in the published protocol.
+        Pixels with the PASTIS void label (19) are removed. Background (0) is retained because it is
+        an evaluated class in the published protocol. No temporal aggregation happens here -- each
+        model aggregates the native cadence in its own encode path (see ``PastisTile``).
         """
         for patch in self.patches:
             if folds is not None and patch.fold not in folds:
                 continue
-            s2 = np.load(patch.s2_path, mmap_mode="r")
-            s1 = np.load(patch.s1_path, mmap_mode="r")
+            s2 = np.load(patch.s2_path, mmap_mode="r")  # (T_s2, 10, 128, 128) native cadence
+            s1 = np.load(patch.s1_path, mmap_mode="r")  # (T_s1, 3, 128, 128)
             target = np.load(patch.target_path, mmap_mode="r")[0]
-            s2_monthly, s2_mask = _monthly_patch(s2, patch.s2_months)
-            s1_monthly, s1_mask = _monthly_patch(s1, patch.s1_months)
+            s2_ones = np.ones(s2.shape[0], dtype=np.float32)
+            s1_ones = np.ones(s1.shape[0], dtype=np.float32)
 
             for row in range(0, target.shape[0], self.tile_size):
                 for col in range(0, target.shape[1], self.tile_size):
@@ -134,10 +148,12 @@ class PastisBenchmark:
                     valid = labels != self.ignore_index
                     tile_id = f"{patch.patch_id}_{row // self.tile_size}_{col // self.tile_size}"
                     tile = PastisTile(
-                        s2=s2_monthly[:, :, ys, xs],
-                        s1=s1_monthly[:, :, ys, xs],
-                        s2_mask=s2_mask,
-                        s1_mask=s1_mask,
+                        s2=np.asarray(s2[:, :, ys, xs], dtype=np.float32),  # one tile materialized from mmap
+                        s1=np.asarray(s1[:, :, ys, xs], dtype=np.float32),
+                        s2_months=patch.s2_months,
+                        s1_months=patch.s1_months,
+                        s2_mask=s2_ones,
+                        s1_mask=s1_ones,
                         labels=labels,
                         valid=valid,
                         fold=patch.fold,
@@ -174,37 +190,48 @@ def _monthly_patch(values: np.ndarray, months: np.ndarray) -> tuple[np.ndarray, 
 def _pastis_pixel_benchmark(
     s2: np.ndarray,
     s1: np.ndarray,
-    s2_mask: np.ndarray,
-    s1_mask: np.ndarray,
+    s2_months: np.ndarray,
+    s1_months: np.ndarray,
     labels: np.ndarray,
     valid: np.ndarray,
     fold: int,
 ) -> Benchmark:
-    """Convert one spatial tile to a bounded batch of valid pixel time series."""
+    """Convert one NATIVE-cadence spatial tile to a bounded batch of valid pixel time series.
+
+    ``s2`` / ``s1`` are ``(T, C, H, W)`` at the native acquisition cadence; ``s2_months`` /
+    ``s1_months`` give each acquisition's calendar month. Every native acquisition is a real
+    observation, so a pixel's per-modality series is the full cadence -- Presto then composites it to
+    monthly, TESSERA uses it whole.
+    """
     _, _, height, width = s2.shape
-    s2_pixels = s2.transpose(2, 3, 0, 1).reshape(height * width, PASTIS_TIMESTEPS, -1)[valid]
-    s1_pixels = s1.transpose(2, 3, 0, 1).reshape(height * width, PASTIS_TIMESTEPS, -1)[valid]
+    t_s2, t_s1 = s2.shape[0], s1.shape[0]
+    s2_pixels = s2.transpose(2, 3, 0, 1).reshape(height * width, t_s2, -1)[valid]
+    s1_pixels = s1.transpose(2, 3, 0, 1).reshape(height * width, t_s1, -1)[valid].astype(np.float32)
     red = s2_pixels[:, :, PASTIS_S2_BANDS.index("B4")]
     nir = s2_pixels[:, :, PASTIS_S2_BANDS.index("B8")]
     ndvi = np.divide(nir - red, nir + red, out=np.zeros_like(red), where=(nir + red) != 0)
     s2_pixels = np.concatenate([s2_pixels, ndvi[:, :, None]], axis=2).astype(np.float32)
     n = int(valid.sum())
+    doy_tbl = _synthetic_month_doy(12)
+
+    def _modality(pixels: np.ndarray, months: np.ndarray, bands: list[str]) -> ModalitySeries:
+        months = np.asarray(months, dtype=np.int64)
+        doy = doy_tbl[months % 12].astype(np.float32)
+        years = np.full(len(months), 2019, dtype=np.int64)
+        return ModalitySeries([pixels[i] for i in range(n)], [months] * n, [doy] * n, [years] * n, bands)
+
+    native = NativeSeries(
+        s2=_modality(s2_pixels, s2_months, PASTIS_S2_BANDS + ["NDVI"]),
+        s1=_modality(s1_pixels, s1_months, list(PASTIS_S1_BANDS)),
+        climate=ModalitySeries.absent(n),
+    )
     return Benchmark(
         name="pastis_r",
         label_kind="segmentation",
-        s2=s2_pixels,
-        s1=s1_pixels.astype(np.float32),
-        climate=np.zeros((n, PASTIS_TIMESTEPS, 0), dtype=np.float32),
-        s2_mask=np.broadcast_to(s2_mask, (n, PASTIS_TIMESTEPS)).copy(),
-        s1_mask=np.broadcast_to(s1_mask, (n, PASTIS_TIMESTEPS)).copy(),
-        climate_mask=np.zeros((n, PASTIS_TIMESTEPS), dtype=np.float32),
-        doy=np.broadcast_to(_synthetic_month_doy(PASTIS_TIMESTEPS), (n, PASTIS_TIMESTEPS)).copy(),
+        native=native,
         labels=labels[valid].astype(np.int64),
         groups=np.full(n, fold, dtype=np.int64),
         latlon=np.zeros((n, 2), dtype=np.float32),
-        s2_bands=PASTIS_S2_BANDS + ["NDVI"],
-        s1_bands=PASTIS_S1_BANDS,
-        climate_bands=[],
         years=np.full(n, 2019, dtype=np.int64),
     )
 
@@ -259,11 +286,11 @@ def load_benchmark(
 
     if missing:
         # A partial release must be visible: don't silently evaluate over the patches that happen
-        # to be present. Loud warning; raise under STRICT_DATA so a partial release fails outright.
+        # to be present. Loud warning; raise under OVERWRITE_MODE so a partial release fails outright.
         msg = f"PASTIS: {missing}/{len(order)} metadata patches have missing .npy files in {base}"
-        if os.environ.get("STRICT_DATA", "").strip().lower() not in ("", "0", "false", "no"):
-            raise ValueError(msg + " (STRICT_DATA is set)")
-        print(f"   !! {msg} -- those patches are skipped (set STRICT_DATA=1 to fail instead)", flush=True)
+        if os.environ.get("OVERWRITE_MODE", "").strip().lower() not in ("", "0", "false", "no"):
+            raise ValueError(msg + " (OVERWRITE_MODE is set)")
+        print(f"   !! {msg} -- those patches are skipped (set OVERWRITE_MODE=1 to fail instead)", flush=True)
     if not patches:
         raise ValueError(f"No PASTIS patches parsed from {base}")
     return PastisBenchmark(

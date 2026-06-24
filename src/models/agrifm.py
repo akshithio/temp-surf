@@ -11,7 +11,7 @@ compiled mmcv is needed. We pair it with the S2 patch embed (a single 3D conv) a
 load the matching weights straight from ``AgriFM.pth``.
 
 Architecture is read directly off the released checkpoint
-(``model.S2_patch_emd.{weights,bias}`` + shared ``model.backbone.*``):
+(``encoder.S2_patch_emd.{weights,bias}`` + shared ``encoder.backbone.*``):
 patch embed = Conv3d(10→128, kernel/stride (4,4,4)); backbone Swin embed_dim=128,
 depths [2,2,18,2], heads [4,8,16,32], window (8,7,7) → 1024-d.
 
@@ -118,6 +118,22 @@ class _AgriFMS2Model(nn.Module):
         return self.backbone(self.patch_emd(inputs))
 
 
+def _split_s2_checkpoint(state_dict: dict) -> tuple[dict, dict]:
+    """Extract the released S2 patch embed and backbone, accepting the legacy root name."""
+    patch_sd, back_sd = {}, {}
+    for key, value in state_dict.items():
+        for root in ("encoder", "model"):
+            patch_prefix = f"{root}.S2_patch_emd."
+            backbone_prefix = f"{root}.backbone."
+            if key.startswith(patch_prefix):
+                patch_sd[key[len(patch_prefix):]] = value
+                break
+            if key.startswith(backbone_prefix):
+                back_sd[key[len(backbone_prefix):]] = value
+                break
+    return patch_sd, back_sd
+
+
 def _default_load_model(weights_path: str | Path, device: str) -> Any:
     weights = Path(weights_path).expanduser().resolve()
     if not weights.exists():
@@ -131,14 +147,9 @@ def _default_load_model(weights_path: str | Path, device: str) -> Any:
 
     model = _AgriFMS2Model(SwinTransformer3D)
 
-    ck = torch.load(weights, map_location="cpu")
+    ck = torch.load(weights, map_location="cpu", weights_only=True)
     ck = ck.get("state_dict", ck) if isinstance(ck, dict) else ck
-    patch_sd, back_sd = {}, {}
-    for k, v in ck.items():
-        if k.startswith("model.S2_patch_emd."):
-            patch_sd[k[len("model.S2_patch_emd."):]] = v
-        elif k.startswith("model.backbone."):
-            back_sd[k[len("model.backbone."):]] = v
+    patch_sd, back_sd = _split_s2_checkpoint(ck)
     model.patch_emd.load_state_dict(patch_sd, strict=True)
     miss, unexp = model.backbone.load_state_dict(back_sd, strict=False)
     # buffers (relative_position_index, attn_mask) are recomputed at init and may be absent
@@ -178,15 +189,16 @@ class AgriFMModel:
 
     def to_agrifm_series(self, bench: Benchmark) -> np.ndarray:
         """Return normalized S2 series in AgriFM band order as (N, 32, 10)."""
-        col = {band: idx for idx, band in enumerate(bench.s2_bands)}
+        s2_vals, s2_msk, _doy, s2_bands = bench.monthly("s2")
+        col = {band: idx for idx, band in enumerate(s2_bands)}
         missing = [band for band in AGRIFM_S2_BANDS if band not in col]
         if missing:
             raise KeyError(f"Benchmark is missing AgriFM Sentinel-2 bands: {missing}")
 
         idx = [col[band] for band in AGRIFM_S2_BANDS]
-        frame_idx = _frame_indices(bench.s2.shape[1], self.num_frames)
-        x = bench.s2[:, frame_idx, :][:, :, idx].astype(np.float32)
-        mask = bench.s2_mask[:, frame_idx].astype(np.float32)
+        frame_idx = _frame_indices(s2_vals.shape[1], self.num_frames)
+        x = s2_vals[:, frame_idx, :][:, :, idx].astype(np.float32)
+        mask = s2_msk[:, frame_idx].astype(np.float32)
 
         x = (x - AGRIFM_MEAN) / (AGRIFM_STD + 1e-9)
         x *= mask[:, :, None]

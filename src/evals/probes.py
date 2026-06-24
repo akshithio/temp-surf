@@ -420,6 +420,15 @@ def score_multiclass(
     n_classes = len(getattr(clf, "classes_", []))
     perf.log_static("probe.macs/multiclass", macs=x_test.shape[1] * max(n_classes, 1), n_samples=len(y_test))
     _vals, _counts = np.unique(y_test, return_counts=True)
+    # Shared-vs-unseen-class decomposition. A source-only probe can NEVER predict a class absent
+    # from its training set (``clf.classes_``), so a transfer gap on the full label space mixes
+    # representation degradation with label-SUPPORT mismatch (target-only classes). ``shared_*``
+    # restrict scoring to test samples whose true class WAS seen in training (representation only);
+    # ``unseen_prevalence`` / ``n_classes_unseen`` size the support mismatch so the two are not
+    # collapsed into one robustness number (EuroCropsML's Estonia holdout has target-only crops).
+    seen = np.asarray(getattr(clf, "classes_", []))
+    seen_mask = np.isin(y_test, seen) if seen.size else np.zeros(len(y_test), dtype=bool)
+    n_unseen = int(len(set(np.unique(y_test).tolist()) - set(seen.tolist())))
     with warnings.catch_warnings():
         # Expected for multiclass at small label budgets: the probe can predict a class
         # absent from this test split. The metric handles it; the warning is just noise.
@@ -432,6 +441,19 @@ def score_multiclass(
             "macro_auc": macro_auc,
             "test_n_classes": int(len(_vals)),  # for the chance/no-skill floor
             "test_majority_rate": float(_counts.max() / len(y_test)),
+            "n_classes_seen": int(seen.size),
+            "n_classes_unseen": n_unseen,
+            "unseen_prevalence": float(1.0 - seen_mask.mean()) if len(y_test) else float("nan"),
+            "shared_macro_f1": (
+                float(f1_score(y_test[seen_mask], pred[seen_mask], average="macro", zero_division=0))
+                if seen_mask.any() else float("nan")
+            ),
+            "shared_balanced_accuracy": (
+                float(balanced_accuracy_score(y_test[seen_mask], pred[seen_mask])) if seen_mask.any() else float("nan")
+            ),
+            "shared_accuracy": (
+                float(accuracy_score(y_test[seen_mask], pred[seen_mask])) if seen_mask.any() else float("nan")
+            ),
         }
     if return_per_sample:
         per_sample = {
@@ -546,3 +568,89 @@ def score_segmentation_per_tile(
         "worst_tile_miou": float(np.min(arr)),
         "n_tiles_scored": len(arr),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Full-fold (streamed) segmentation scoring — exact, not a pixel sample
+# --------------------------------------------------------------------------- #
+
+
+def _miou_from_confusion(conf: np.ndarray) -> float:
+    """mIoU over classes present in y_true (rows), from a confusion matrix; NaN if none present."""
+    conf = conf.astype(np.float64)
+    tp = np.diag(conf)
+    row, col = conf.sum(1), conf.sum(0)  # true support, predicted count
+    present = row > 0
+    union = row + col - tp
+    iou = np.divide(tp, union, out=np.zeros_like(tp), where=union > 0)
+    return float(iou[present].mean()) if present.any() else float("nan")
+
+
+def _segmentation_metrics_from_confusion(conf: np.ndarray, tile_mious: list[float]) -> dict[str, float]:
+    """Segmentation metrics from an accumulated confusion matrix (exact over all scored pixels).
+
+    Same definitions as :func:`score_segmentation` / :func:`score_segmentation_per_tile`: mIoU over
+    classes present in y_true, pixel accuracy, macro/weighted F1, and aggregated per-tile mIoU.
+    """
+    c = conf.astype(np.float64)
+    tp = np.diag(c)
+    row, col, total = c.sum(1), c.sum(0), c.sum()
+    present = row > 0
+    union = row + col - tp
+    iou = np.divide(tp, union, out=np.zeros_like(tp), where=union > 0)
+    prec = np.divide(tp, col, out=np.zeros_like(tp), where=col > 0)
+    rec = np.divide(tp, row, out=np.zeros_like(tp), where=row > 0)
+    f1 = np.divide(2 * prec * rec, prec + rec, out=np.zeros_like(tp), where=(prec + rec) > 0)
+    labelset = (row > 0) | (col > 0)  # classes present in y_true OR y_pred (sklearn macro default)
+    out = {
+        "miou": float(iou[present].mean()) if present.any() else float("nan"),
+        "pixel_accuracy": float(tp.sum() / total) if total > 0 else float("nan"),
+        "macro_f1": float(f1[labelset].mean()) if labelset.any() else 0.0,
+        "weighted_f1": float((row * f1).sum() / row.sum()) if row.sum() > 0 else 0.0,
+        "n_eval_classes": int(conf.shape[0]),
+        "n_present_classes": int(present.sum()),
+    }
+    if tile_mious:
+        arr = np.asarray(tile_mious)
+        out.update({
+            "mean_per_tile_miou": float(arr.mean()),
+            "worst_tile_miou": float(arr.min()),
+            "n_tiles_scored": len(arr),
+        })
+    else:
+        out.update({"mean_per_tile_miou": float("nan"), "worst_tile_miou": float("nan"), "n_tiles_scored": 0})
+    return out
+
+
+def score_segmentation_streamed(clf, tiles, eval_classes: np.ndarray, transform: FeatureTransform | None = None) -> dict[str, float]:
+    """Exact full-fold segmentation scoring by streaming tiles (one 64x64 tile in memory at a time).
+
+    ``tiles`` yields ``(features, labels)`` for EVERY valid pixel of the evaluation fold (see
+    ``cacheutils.iter_dense_tiles``); the probe predicts each tile and the result accumulates into a
+    global confusion matrix plus a per-tile mIoU list. This is the true full-fold mIoU and a
+    credible worst-tile mIoU, replacing the noisy estimate from a capped pixel sample. ``transform``
+    (the optional feature map) is applied per tile so it matches the fitted train features.
+    """
+    k = len(eval_classes)
+    conf = np.zeros((k, k), dtype=np.int64)
+    tile_mious: list[float] = []
+    n_pixels = 0
+    with perf.measure("probe.score/segmentation_streamed", n_features=-1):
+        for features, labels in tiles:
+            labels = np.asarray(labels)
+            if labels.size == 0:
+                continue
+            features = _apply(transform, np.asarray(features, dtype=np.float32))
+            pred = np.asarray(clf.predict(features))
+            lab = np.clip(labels.astype(np.int64), 0, k - 1)
+            prd = np.clip(pred.astype(np.int64), 0, k - 1)
+            tile_conf = np.zeros((k, k), dtype=np.int64)
+            np.add.at(tile_conf, (lab, prd), 1)
+            conf += tile_conf
+            miou_t = _miou_from_confusion(tile_conf)
+            if not np.isnan(miou_t):
+                tile_mious.append(miou_t)
+            n_pixels += int(labels.size)
+    metrics = _segmentation_metrics_from_confusion(conf, tile_mious)
+    metrics["n_test"] = n_pixels
+    return metrics

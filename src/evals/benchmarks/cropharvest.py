@@ -2,6 +2,11 @@
 
 The primary benchmark: real per-sample ``is_crop`` labels, evaluated under
 strict geographic holdout (one source region held out at a time).
+
+CropHarvest is distributed as 12 monthly steps per sample (a Feb-start agricultural year), so its
+"native" cadence is already monthly. The loader carries every native band (S1 VV/VH, all S2
+spectral incl B9, ERA5, SRTM, NDVI) with each step's true calendar month -- no band pre-selection.
+Each model selects what it needs via the Benchmark view accessors.
 """
 
 from __future__ import annotations
@@ -16,6 +21,8 @@ import numpy as np
 
 from dataio.get_input import (
     Benchmark,
+    ModalitySeries,
+    NativeSeries,
     _select_files,
     _synthetic_month_doy,
 )
@@ -23,22 +30,26 @@ from dataio.get_input import (
 BENCHMARK = "cropharvest"
 LABEL_KIND = "binary"
 HOLDOUTS = ["togo", "ethiopia", "lem-brazil", "rwanda", "togo-eval"]
-# Binary task with global coordinates and multi-year windows, so it supports the full
-# committed set: region, climate (Köppen via lat/lon), forward-time, and phenology
-# (clean on crop/non-crop, where it is NOT label-confounded).
-SPLIT_REGIMES = ["random_id", "geographic_ood", "climate_ood", "temporal_ood", "phenology_ood"]
+# Binary task with global coordinates and multi-year windows, so it supports the
+# committed set: region, climate (Köppen via lat/lon), and forward-time. (Phenology
+# was dropped: NDVI-phenology domains are confounded with the crop/non-crop label.)
+SPLIT_REGIMES = ["random_id", "geographic_ood", "climate_ood", "temporal_ood"]
 
 # --- Raw array band layout --------------------------------------------------
 # Raw 18-col array: [S1 VV,VH] + [S2: B2..B8A, B9, B11, B12] + [ERA5 temp,precip]
 #   + [SRTM elevation(15), slope(16)] + [NDVI(17)].
 CH_S1_IDXS = [0, 1]
-CH_S2_IDXS = [2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 17]  # B2..B12 (no B1/B10) + NDVI (col 17)
+CH_S2_IDXS_ALL = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 17]  # all S2 spectral (incl B9 at col 10) + NDVI (col 17)
 CH_CLIMATE_IDXS = [13, 14, 15, 16]  # temperature, precipitation, elevation, slope
-CH_MIN_CHANNELS = max(CH_S1_IDXS + CH_S2_IDXS + CH_CLIMATE_IDXS) + 1
+CH_MIN_CHANNELS = max(CH_S1_IDXS + CH_S2_IDXS_ALL + CH_CLIMATE_IDXS) + 1
 CH_S1_BANDS = ["VV", "VH"]
-CH_S2_BANDS = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12", "NDVI"]
+CH_S2_BANDS = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12", "NDVI"]
 CH_CLIMATE_BANDS = ["temperature", "precipitation", "elevation", "slope"]
 CH_TIMESTEPS = 12
+# CropHarvest's 12 steps are a Feb-start agricultural year (prev-Feb .. Jan), so step k's true
+# calendar month is CH_MONTHS[k]. The monthly view re-bins these to a Jan-Dec grid.
+CH_MONTHS = np.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0], dtype=np.int64)
+
 
 def _ch_window_year(export_end_date: str | None) -> int:
     """Calendar year at the MIDDLE of CropHarvest's 12-month window ending at
@@ -76,7 +87,7 @@ def load_benchmark(
     shuffle: bool = True,
     seed: int = 0,
 ) -> Benchmark:
-    """Rebuild CropHarvest crop/non-crop from raw per-sample h5 arrays."""
+    """Rebuild CropHarvest crop/non-crop from raw per-sample h5 arrays (native monthly cadence)."""
     base = root / "cropharvest"
     arrays_dir = base / "features" / "arrays"
     labels_geojson = base / "labels.geojson"
@@ -88,7 +99,7 @@ def load_benchmark(
     label_map = _load_ch_labels(labels_geojson)
     files = _select_files([p for p in arrays_dir.glob("*.h5") if p.is_file()], shuffle, seed, max_samples)
 
-    s2_list, s1_list, clim_list = [], [], []
+    s2_series, s1_series, clim_series = [], [], []
     labels, groups, latlons, years = [], [], [], []
     skipped = 0
     for path in files:
@@ -110,9 +121,9 @@ def load_benchmark(
             continue
         arr = np.nan_to_num(arr, nan=0.0)
         is_crop, lat, lon, year = label_map[key]
-        s2_list.append(arr[:, CH_S2_IDXS])
-        s1_list.append(arr[:, CH_S1_IDXS])
-        clim_list.append(arr[:, CH_CLIMATE_IDXS])
+        s2_series.append(arr[:, CH_S2_IDXS_ALL].astype(np.float32))
+        s1_series.append(arr[:, CH_S1_IDXS].astype(np.float32))
+        clim_series.append(arr[:, CH_CLIMATE_IDXS].astype(np.float32))
         labels.append(is_crop)
         groups.append(dataset)
         latlons.append((lat, lon))
@@ -121,34 +132,30 @@ def load_benchmark(
     if skipped:
         # Corrupt/malformed arrays must not silently shrink the dataset.
         msg = f"CropHarvest: {skipped} labeled arrays were unreadable/malformed in {arrays_dir}"
-        if os.environ.get("STRICT_DATA", "").strip().lower() not in ("", "0", "false", "no"):
-            raise ValueError(msg + " (STRICT_DATA is set)")
-        print(f"   !! {msg} -- those samples are skipped (set STRICT_DATA=1 to fail instead)", flush=True)
-    if not s2_list:
+        if os.environ.get("OVERWRITE_MODE", "").strip().lower() not in ("", "0", "false", "no"):
+            raise ValueError(msg + " (OVERWRITE_MODE is set)")
+        print(f"   !! {msg} -- those samples are skipped (set OVERWRITE_MODE=1 to fail instead)", flush=True)
+    if not s2_series:
         raise ValueError(f"No valid CropHarvest arrays parsed from {arrays_dir}")
 
-    n = len(s2_list)
-    s2 = np.stack(s2_list).astype(np.float32)
-    s1 = np.stack(s1_list).astype(np.float32)
-    climate = np.stack(clim_list).astype(np.float32)
-    doy = np.tile(_synthetic_month_doy(CH_TIMESTEPS), (n, 1))
-    ones = np.ones((n, CH_TIMESTEPS), dtype=np.float32)
+    n = len(s2_series)
+    # Shared per-step calendar months / day-of-year (identical for every sample); per-sample years.
+    doy_vals = _synthetic_month_doy(12)[CH_MONTHS].astype(np.float32)
+    months_l = [CH_MONTHS] * n
+    doy_l = [doy_vals] * n
+    years_l = [np.full(CH_TIMESTEPS, y, dtype=np.int64) for y in years]
+    native = NativeSeries(
+        s2=ModalitySeries(s2_series, months_l, doy_l, years_l, CH_S2_BANDS),
+        s1=ModalitySeries(s1_series, months_l, doy_l, years_l, CH_S1_BANDS),
+        climate=ModalitySeries(clim_series, months_l, doy_l, years_l, CH_CLIMATE_BANDS),
+    )
     return Benchmark(
         name="cropharvest",
         label_kind="binary",
-        s2=s2,
-        s1=s1,
-        climate=climate,
-        s2_mask=ones.copy(),
-        s1_mask=ones.copy(),
-        climate_mask=ones.copy(),
-        doy=doy,
+        native=native,
         labels=np.asarray(labels, dtype=np.int64),
         groups=np.asarray(groups, dtype=object),
         latlon=np.asarray(latlons, dtype=np.float32),
-        s2_bands=CH_S2_BANDS,
-        s1_bands=CH_S1_BANDS,
-        climate_bands=CH_CLIMATE_BANDS,
         years=np.asarray(years, dtype=np.int64),
     )
 

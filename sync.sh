@@ -84,7 +84,10 @@ conda config --append envs_dirs "$REMOTE_SCRATCH/envs" 2>/dev/null || true  # so
 [ -x "$REMOTE_SCRATCH/envs/robustness/bin/python" ] || conda env create -f environment.yml
 conda activate robustness
 echo "python: $(python --version)  uv: $(uv --version)  ruff: $(ruff --version)"
-uv sync --frozen
+# Install the locked project into the active scratch-backed conda environment. Without an explicit
+# project environment, `uv sync` creates a multi-GB .venv beside the repo on the home filesystem.
+# Keep conda-managed tools (ruff/uv) and the separately installed Presto package.
+UV_PROJECT_ENVIRONMENT="$CONDA_PREFIX" uv sync --frozen --inexact
 # presto is installed --no-deps (upstream pins torch==2.0/numpy==1.23.5/einops==0.6.0/... and would
 # wreck the resolved env); the project already provides the deps presto needs at runtime.
 uv pip install --no-deps "git+https://github.com/nasaharvest/presto.git@11e207a668a34336ced1d8e492a1bd5849b96c4a"
