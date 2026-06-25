@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pytest
 import torch
 
 from dataio.get_input import Benchmark, ModalitySeries, NativeSeries, _synthetic_month_doy
@@ -244,3 +245,23 @@ def test_olmoearth_default_loader_returns_pinned_encoder_api(tmp_path, monkeypat
     )
 
     assert olmoearth._default_load_model(model_dir) is encoder
+
+
+def test_pretrained_classification_smoke_runs_under_pytest() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for pretrained model smoke coverage")
+    if not (cacheutils.INPUT_ROOT / "cropharvest").exists():
+        pytest.skip("CropHarvest input is not staged")
+    from tests import smoke_models
+
+    smoke_models.main()
+
+
+def test_pretrained_dense_smoke_runs_under_pytest() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for dense pretrained model smoke coverage")
+    if not (cacheutils.INPUT_ROOT / "pastis").exists():
+        pytest.skip("PASTIS input is not staged")
+    from tests import smoke_pastis
+
+    smoke_pastis.main()

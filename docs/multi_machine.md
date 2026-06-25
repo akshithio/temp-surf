@@ -8,9 +8,9 @@ invariants every machine must agree on** so the results are comparable and never
 
 `main.py`'s unit of work is a `(model, benchmark)` pair (the compatibility matrix in
 `evals/compat.py` decides which models run on each benchmark — currently ~20 pairs). Each pair is
-**independent**: it builds its own benchmark cache, its own embedding cache, and writes to its own
-results directory `data/output/results/<model>/<benchmark>/`. Two different pairs never write to the
-same file. This is what makes splitting across machines safe.
+**independent** only when each machine has its own writable `data/cache` and `data/output` tree.
+Do not point multiple machines at the same `data/output`, even when shards are meant to be disjoint:
+reruns, logs, partial files, and accidental shard/config overlap become hard to audit.
 
 `gputils.take_shard` round-robins the pair list by `(RB_SHARD, RB_NUM_SHARDS)`, so shard `s` of `n`
 owns pairs `s, s+n, s+2n, …`. Sharding is by **whole pairs**, so a given `(model, benchmark)` is
@@ -22,17 +22,18 @@ Pick **one** of these. The GPU-shard approach is preferred (balances automatical
 
 ### A. Global GPU sharding (preferred)
 
-Treat every GPU across all machines as one global shard. `total = sum of GPU counts`. On each
-machine set its starting offset and the global total, then run the fan-out launcher:
+Treat every GPU across all machines as one global shard. `total = sum of GPU counts`. Set
+`LAUNCH_GPU_SHARDS = True` in `src/main.py`. On each machine set its starting offset and the global
+total, then run `main.py`:
 
 ```bash
 # Example: machine X has 2 GPUs, machine Y has 2 GPUs  -> 4 global shards.
 # On machine X (owns global shards 0,1):
-RB_SHARD_BASE=0 RB_NUM_SHARDS=4 ./sync.sh-equivalent  # then, in the repo on the box:
-cd src && RB_SHARD_BASE=0 RB_NUM_SHARDS=4 python utils/gputils.py
+RB_SHARD_BASE=0 RB_NUM_SHARDS=4  # then, in the repo on the box:
+cd src && RB_SHARD_BASE=0 RB_NUM_SHARDS=4 python main.py
 
 # On machine Y (owns global shards 2,3):
-cd src && RB_SHARD_BASE=2 RB_NUM_SHARDS=4 python utils/gputils.py
+cd src && RB_SHARD_BASE=2 RB_NUM_SHARDS=4 python main.py
 ```
 
 `fan_out` gives each local GPU a unique **global** shard index `RB_SHARD_BASE + i` out of
@@ -66,19 +67,31 @@ it up correctly:
 | **Model weights** | Different checkpoint → different embeddings | `_checkpoint_fingerprint` folds the resolved checkpoint's identity into the embedding cache key (and the run signature). |
 | **Config block in `main.py`** | `SEEDS`, `ACTIVE_PROBES`, `SPLIT_REGIMES`, `MAX_SAMPLES`, `MAX_DENSE_PIXELS` all change results | Folded into `_run_signature`; a mismatch is refused on resume. |
 | **Python env / deps** | sklearn / torch / numpy versions shift numbers | Not auto-checked — build with the same `pyproject.toml` (`uv pip install -e .`) on every machine. |
-| **Output destination** | Where results land | Either a **shared** filesystem (sshfs/NFS) so all shards write into one tree, or **per-machine** trees that you merge afterward (they're disjoint by pair, so a plain copy merges them). |
+| **Output destination** | Where results land | Use **per-machine** `data/output` trees and merge/read them afterward. Cranberry and dewberry share `/local/scratch/a`, so a single shared output tree is not an isolation boundary. |
 
-### Caches are content-keyed → safe to share
+### Current machine layout
+
+The repositories intentionally point `data/` at host-specific run roots:
+
+| Machine | Repo `data/` | `data/input` | `data/cache` + `data/output` |
+|---|---|---|---|
+| cranberry | `/local/scratch/a/agarapat/robustness-run-data/cranberry` | symlink to `/local/scratch/a/agarapat/robustness-data/input` | cranberry-only |
+| dewberry | `/local/scratch/a/agarapat/robustness-run-data/dewberry` | symlink to `/local/scratch/a/agarapat/robustness-data/input` | dewberry-only |
+| digital-ag | `/var/tmp/agarapat/robustness-run-data/digital-ag` | symlink to `/var/tmp/agarapat/robustness-data/input` | digital-ag-only |
+
+The input trees must match; the cache/output trees must not be shared.
+
+### Caches are content-keyed, but still isolate them per machine
 `data/cache/` (benchmark pickles + embeddings) is keyed by code+data+checkpoint hashes and written
 atomically (unique temp path + `os.replace`). Two shards that happen to touch the same model/benchmark cache
-are safe — at worst one embedding is computed twice. So a **shared** `data/` (e.g. the cranberry
-scratch over sshfs) is fine and avoids re-encoding the same pair twice.
+should not corrupt each other, but shared cache contention makes crashes and cleanup harder to reason about.
+Keep `data/cache` per-machine and merge only final outputs.
 
 ## Per-machine pre-flight checklist
 
 Run through this on **each** machine before kicking off its shard:
 
-1. **Code is the same commit** as the others (`git rev-parse HEAD` matches; push via `./sync.sh push`).
+1. **Code is the same commit** as the others (`git rev-parse HEAD` matches).
 2. **Env built**: `uv pip install -e .` from the project conda env; `python -c "import torch, sklearn"`
    works; `ruff check src` and `pytest src/tests -q` pass (catches a broken sync).
 3. **Data staged & identical**: `data/input/benchmarks/<bench>` present for every benchmark this shard
@@ -91,10 +104,10 @@ Run through this on **each** machine before kicking off its shard:
    this one; `RB_NUM_SHARDS` = global GPU total — the **same** total on every machine. Sanity check:
    the union of `[RB_SHARD_BASE .. RB_SHARD_BASE+local_gpus)` across machines must be exactly
    `0..RB_NUM_SHARDS-1` with no gaps or overlaps.
-7. **Output destination decided**: shared FS (preferred) or per-machine dirs to merge later.
+7. **Output destination isolated**: `data/output` must resolve to that machine's run root, not a shared root.
 8. **Disk**: dense embeddings (PASTIS especially) are large; confirm scratch has room.
 
-## Merging per-machine outputs (only if NOT on a shared FS)
+## Merging per-machine outputs
 
 Each machine writes disjoint `data/output/results/<model>/<benchmark>/` trees, so merge by copying:
 

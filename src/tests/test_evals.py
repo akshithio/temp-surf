@@ -110,7 +110,7 @@ def test_random_pastis_split_is_patch_level(tmp_path) -> None:
             np.save(fold_dir / f"{patch}_0_0.labels.npy", np.array([0, 1], dtype=np.int64))
 
     [(regime, cfg)] = list(
-        regime_base.segmentation_fold_configs(_Bench, ["random_id"], seed=0, emb_dir=tmp_path, overwrite_mode=True)
+        regime_base.segmentation_fold_configs(_Bench, ["random_id"], seed=0, emb_dir=tmp_path, strict_mode=True)
     )
     train = cfg.train_patches
     val = cfg.val_patches
@@ -158,7 +158,7 @@ def test_probe_family_modules_build_expected_estimators() -> None:
 
 def test_metric_roles_label_deployment_and_diagnostic_metrics() -> None:
     assert "calibrated_f1" in EV.METRIC_ROLES["binary"]["deployment"]
-    assert "calibrated_f1_target_optimal" in EV.METRIC_ROLES["binary"]["diagnostic"]
+    assert "diagnostic_calibrated_f1_target_optimal" in EV.METRIC_ROLES["binary"]["diagnostic"]
     assert "worst_group_macro_f1" in EV.METRIC_ROLES["multiclass"]["deployment"]
     assert "worst_tile_miou" in EV.METRIC_ROLES["segmentation"]["deployment"]
 

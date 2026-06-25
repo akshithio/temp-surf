@@ -314,9 +314,9 @@ def load_benchmark(
 
     if missing:
         msg = f"PASTIS: {missing}/{len(order)} metadata patches have missing .npy files in {base}"
-        if os.environ.get("OVERWRITE_MODE", "").strip().lower() not in ("", "0", "false", "no"):
-            raise ValueError(msg + " (OVERWRITE_MODE is set)")
-        print(f"   !! {msg} -- those patches are skipped (set OVERWRITE_MODE=1 to fail instead)", flush=True)
+        if os.environ.get("STRICT_MODE", "").strip().lower() not in ("", "0", "false", "no"):
+            raise ValueError(msg + " (STRICT_MODE is set)")
+        print(f"   !! {msg} -- those patches are skipped (set STRICT_MODE=True to fail instead)", flush=True)
     if not patches:
         raise ValueError(f"No PASTIS patches parsed from {base}")
     return PastisBenchmark(

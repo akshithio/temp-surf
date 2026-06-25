@@ -1,21 +1,4 @@
-"""GPU work-splitting + launch helpers for ``src/main.py``.
-
-main.py's unit of work is the list of ``(model, benchmark)`` pairs. To use both GPUs
-on digital-ag (2x RTX 3090), run two **sharded** processes: each is pinned to one
-GPU via ``CUDA_VISIBLE_DEVICES`` and handed a disjoint, round-robin subset of the
-pairs. The fan-out launcher does this for you::
-
-    cd src && python utils/gputils.py        # one process per detected GPU, in parallel
-
-Inside main.py only two hooks are needed (already wired)::
-
-    work = gputils.take_shard(work)   # keep only this process's (model, benchmark) pairs
-    device = gputils.device()         # "cuda" (the one visible GPU) or "cpu"
-
-Because shards are split by (model, benchmark) and the embedding cache is written
-atomically (tmp + os.replace), two shards that happen to touch the same
-benchmark/model cache are safe -- at worst one embedding is computed twice.
-"""
+"""GPU work-splitting helpers used by ``src/main.py``."""
 
 from __future__ import annotations
 
@@ -401,7 +384,12 @@ def device() -> str:
 
 
 def shard_indices() -> tuple[int, int]:
-    return int(os.environ.get(SHARD_ENV, 0)), int(os.environ.get(NUM_SHARDS_ENV, 1))
+    idx, n = int(os.environ.get(SHARD_ENV, 0)), int(os.environ.get(NUM_SHARDS_ENV, 1))
+    if n < 1:
+        raise ValueError(f"{NUM_SHARDS_ENV} must be >= 1, got {n}")
+    if idx < 0 or idx >= n:
+        raise ValueError(f"{SHARD_ENV} must satisfy 0 <= shard < {NUM_SHARDS_ENV}; got {idx}/{n}")
+    return idx, n
 
 
 def take_shard(items: list) -> list:
@@ -430,6 +418,10 @@ def fan_out(num_shards: int | None = None) -> int:
     local_gpus = num_shards or max(1, gpu_count())
     base = int(os.environ.get("RB_SHARD_BASE", "0"))
     total = int(os.environ.get(NUM_SHARDS_ENV, str(base + local_gpus)))  # GLOBAL shard count
+    if local_gpus < 1:
+        raise ValueError(f"local GPU shard count must be >= 1, got {local_gpus}")
+    if base < 0 or total < 1 or base + local_gpus > total:
+        raise ValueError(f"Invalid shard range: base={base}, local_gpus={local_gpus}, total={total}")
     scratch = REPO / "data"
     log_dir = scratch / "output" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -443,6 +435,7 @@ def fan_out(num_shards: int | None = None) -> int:
             SHARD_ENV: str(shard),
             NUM_SHARDS_ENV: str(total),
             "LOKY_MAX_CPU_COUNT": str(per_shard_cores),
+            "RB_PARENT_LOG_CAPTURE": "1",
         }
         log = open(log_dir / f"shard_{shard}.log", "w")
         proc = subprocess.Popen(
@@ -463,4 +456,4 @@ def fan_out(num_shards: int | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(fan_out(FORCED_NUM_SHARDS))
+    raise SystemExit("Run src/main.py. Set LAUNCH_GPU_SHARDS=True in src/main.py for multi-GPU fan-out.")

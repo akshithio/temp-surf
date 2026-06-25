@@ -3,7 +3,6 @@
 Edit the config block below, then run:
 
     cd src && python main.py
-    cd src && python utils/gputils.py
 """
 
 from __future__ import annotations
@@ -34,11 +33,44 @@ BUDGET_REGIMES = {
 MAX_SAMPLES = None
 MAX_DENSE_PIXELS = 50_000  # sampled pixels per PASTIS fold partition
 OVERWRITE_MODE = False
+STRICT_MODE = True
+LAUNCH_GPU_SHARDS = False
+GPU_SHARDS = None
 SEEDS = [0]
 # =============================================================================
 
-# Downstream loaders use this to decide whether partial/corrupt inputs warn or fail.
-os.environ["OVERWRITE_MODE"] = "1" if OVERWRITE_MODE else ""
+os.environ["STRICT_MODE"] = "1" if STRICT_MODE else ""
+
+
+class _Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text):
+        for stream in self.streams:
+            stream.write(text)
+        return len(text)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
+_LOG_HANDLE = None
+
+
+def _tee_stdout_to_log() -> None:
+    global _LOG_HANDLE
+    if os.environ.get("RB_PARENT_LOG_CAPTURE"):
+        return
+    shard, nshards = gputils.shard_indices()
+    name = f"main_shard_{shard}.log" if nshards > 1 else "main.log"
+    log_dir = cacheutils.OUTPUT_DIR / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    _LOG_HANDLE = open(log_dir / name, "w", buffering=1)
+    sys.stdout = _Tee(sys.stdout, _LOG_HANDLE)
+    sys.stderr = sys.stdout
+    print(f"[main] stdout/stderr -> {_LOG_HANDLE.name}", flush=True)
 
 
 def _run_tabular_pair(
@@ -52,6 +84,7 @@ def _run_tabular_pair(
     active_probes,
     budget_regimes,
     overwrite_mode,
+    strict_mode,
     enc_kwargs,
 ) -> None:
     stages = runstate.validate_run_stages(run_stages)
@@ -169,7 +202,7 @@ def _run_tabular_pair(
                 y,
                 holdouts,
                 seed,
-                overwrite_mode=overwrite_mode,
+                strict_mode=strict_mode,
                 val_group=regime_base.val_group_for(bench_mod, split_regime),
             ):
                 split_specs.append(
@@ -335,6 +368,7 @@ def run_pair(
     active_probes,
     budget_regimes,
     overwrite_mode,
+    strict_mode,
     enc_kwargs,
 ) -> None:
     """Run one configured model/benchmark pair."""
@@ -351,6 +385,7 @@ def run_pair(
             active_probes,
             budget_regimes,
             overwrite_mode,
+            strict_mode,
             enc_kwargs,
         )
         return
@@ -365,11 +400,14 @@ def run_pair(
         active_probes,
         budget_regimes,
         overwrite_mode,
+        strict_mode,
         enc_kwargs,
     )
 
 
 def main() -> int:
+    if LAUNCH_GPU_SHARDS and gputils.SHARD_ENV not in os.environ:
+        return gputils.fan_out(GPU_SHARDS)
     regime_base.clear_regime_problems()
     enc_kwargs = {"device": gputils.device()}
 
@@ -394,6 +432,7 @@ def main() -> int:
                 active_probes=ACTIVE_PROBES,
                 budget_regimes=BUDGET_REGIMES,
                 overwrite_mode=OVERWRITE_MODE,
+                strict_mode=STRICT_MODE,
                 enc_kwargs=enc_kwargs,
             )
         except NotImplementedError as exc:
@@ -404,11 +443,14 @@ def main() -> int:
             import traceback
 
             failures.append((mod, bm, f"{type(exc).__name__}: {exc}"))
+            action = "raising" if STRICT_MODE else "continuing; re-run to resume"
             print(
-                f"!! [shard {shard}] {mod}/{bm} FAILED: {type(exc).__name__}: {exc} (continuing; re-run to resume)",
+                f"!! [shard {shard}] {mod}/{bm} FAILED: {type(exc).__name__}: {exc} ({action})",
                 flush=True,
             )
             traceback.print_exc()
+            if STRICT_MODE:
+                raise
 
     regime_base.report_regime_problems()
 
@@ -423,4 +465,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    _tee_stdout_to_log()
     sys.exit(main())

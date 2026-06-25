@@ -155,7 +155,11 @@ def _apply(transform: FeatureTransform | None, x: np.ndarray) -> np.ndarray:
 # ── Binary probe fitting and scoring ─────────────────────────────────────────
 
 
+_F1_THRESHOLD_WARNED = False
+
+
 def best_f1_threshold(y_true: np.ndarray, prob: np.ndarray) -> float:
+    global _F1_THRESHOLD_WARNED
     if len(np.unique(y_true)) < 2:
         return 0.5
     candidates = np.unique(prob)
@@ -169,6 +173,11 @@ def best_f1_threshold(y_true: np.ndarray, prob: np.ndarray) -> float:
         if score > best_score:
             best_score = score
             best_threshold = float(threshold)
+    if best_score <= 0.0:
+        if not _F1_THRESHOLD_WARNED:
+            print("   !! F1 threshold calibration is degenerate; using threshold=0.5", flush=True)
+            _F1_THRESHOLD_WARNED = True
+        return 0.5
     return best_threshold
 
 
@@ -293,8 +302,8 @@ def score_binary(
         "balanced_accuracy": float(balanced_accuracy_score(y_test, pred)),
         "calibrated_f1": float(f1_score(y_test, calibrated_pred, zero_division=0)),
         "calibrated_balanced_accuracy": float(balanced_accuracy_score(y_test, calibrated_pred)),
-        "calibrated_f1_target_optimal": float(f1_score(y_test, calibrated_pred_target_optimal, zero_division=0)),
-        "optimal_threshold_test": float(test_optimal_threshold),
+        "diagnostic_calibrated_f1_target_optimal": float(f1_score(y_test, calibrated_pred_target_optimal, zero_division=0)),
+        "diagnostic_optimal_threshold_test": float(test_optimal_threshold),
         "ece": expected_calibration_error(y_test, prob),
         "brier": float(brier_score_loss(y_test, prob)),
         "nll": float(log_loss(y_test, prob, labels=[0, 1])),
