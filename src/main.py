@@ -9,18 +9,18 @@ Edit the config block below, then run:
 from __future__ import annotations
 
 import os
-import sys
-from typing import Any
+import sys  # noqa: E402
+from typing import Any  # noqa: E402
 
-import numpy as np
-from joblib import Parallel, delayed
+import numpy as np  # noqa: E402
+from joblib import Parallel, delayed  # noqa: E402
 
-from evals import compat
-from evals import evals as EV
-from evals.regimes import base as regime_base
-from utils import cacheutils, gputils, runstate
-from utils import ioutils as IOU
-from utils import perfutils as perf
+from evals import compat  # noqa: E402
+from evals import evals as EV  # noqa: E402
+from evals.regimes import base as regime_base  # noqa: E402
+from utils import cacheutils, gputils, runstate  # noqa: E402
+from utils import ioutils as IOU  # noqa: E402
+from utils import perfutils as perf  # noqa: E402
 
 # === Configuration ===========================================================
 BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis"]
@@ -68,6 +68,9 @@ def _run_tabular_pair(
         "multiclass": (EV.run_probes_multiclass_target, EV.METRICS_MULTICLASS),
     }[bench_mod.LABEL_KIND]
     supported = getattr(bench_mod, "SPLIT_REGIMES", split_regimes)
+    unsupported = [r for r in split_regimes if r not in supported]
+    if unsupported:
+        raise ValueError(f"Unknown/unsupported split regimes for {benchmark_name}: {unsupported}. Supported: {supported}")
     split_regimes = [r for r in split_regimes if r in supported]
 
     bench_kwargs = dict(max_samples=max_samples, shuffle=True, seed=0)
@@ -76,17 +79,16 @@ def _run_tabular_pair(
     bench = cacheutils.cached_bench(bench_mod.BENCHMARK, tag, **bench_kwargs)
     s2_only = os.environ.get("RB_S2_ONLY", "").strip().lower() not in ("", "0", "false", "no")
     suffix = "__s2only" if s2_only else ""
-    if s2_only:
-        bench = bench.s2_only()
     emb_tag = tag + suffix
     y, _native_groups = bench_mod.make_targets(bench)
+    bench_for_emb = bench.s2_only() if s2_only else bench
     if gen_embeddings:
         emb = cacheutils.extract_and_cache(
-            bench, bench_mod.BENCHMARK, model_name, emb_tag, overwrite=overwrite_mode, **enc_kwargs
+            bench_for_emb, bench_mod.BENCHMARK, model_name, emb_tag, overwrite=overwrite_mode, **enc_kwargs
         )
     else:
         emb = cacheutils.load_cached_embeddings(
-            bench, bench_mod.BENCHMARK, model_name, emb_tag, enc_kwargs.get("weights_path")
+            bench_for_emb, bench_mod.BENCHMARK, model_name, emb_tag, enc_kwargs.get("weights_path")
         )
 
     results_dir = cacheutils.OUTPUT_DIR / "results" / model_name / (benchmark_name + suffix)
@@ -143,13 +145,16 @@ def _run_tabular_pair(
     def uses_target_flag(cls):
         return getattr(cls, "USES_TARGET", False)
 
-    def _scopes(budget_type, b):
+    def _scopes(budget_type, b, source_diag=False):
         if budget_type == "target":
             return ("full", "held_out") if b == 0 else ("held_out",)
-        return ("test",)
+        return ("test", "source_validation", "source_test") if source_diag else ("test",)
 
-    def _missing(base, budget_type, expected):
-        return [b for b in expected if not all((*base, budget_type, b, sc) in done for sc in _scopes(budget_type, b))]
+    def _missing(base, budget_type, expected, source_diag=False):
+        return [
+            b for b in expected
+            if not all((*base, budget_type, b, sc) in done for sc in _scopes(budget_type, b, source_diag))
+        ]
 
     rerun_keys: set = set()
     split_specs: list[tuple] = []
@@ -158,7 +163,7 @@ def _run_tabular_pair(
     for seed in seeds:
         for split_regime in split_regimes:
             holdouts = regime_base.holdouts_for(bench_mod, split_regime)
-            for split_label, train, val, test, groups, has_target, domain_basis in regime_base.iter_splits(
+            for split_label, train, val, test, groups, has_target, domain_basis, source_val, source_test in regime_base.iter_splits(
                 split_regime,
                 bench,
                 y,
@@ -168,7 +173,10 @@ def _run_tabular_pair(
                 val_group=regime_base.val_group_for(bench_mod, split_regime),
             ):
                 split_specs.append(
-                    (seed, split_regime, split_label, train, val, test, groups, has_target, domain_basis)
+                    (
+                        seed, split_regime, split_label, train, val, test, groups, has_target,
+                        domain_basis, source_val, source_test,
+                    )
                 )
                 split_manifest.append(
                     EV._split_manifest_entry(
@@ -190,7 +198,8 @@ def _run_tabular_pair(
     for seed in seeds:
         seed_split_specs = [spec for spec in split_specs if spec[0] == seed]
         for mname, (cls, kwargs) in EV.build_methods(bench_mod.LABEL_KIND, seed).items():
-            for _, split_regime, split_label, train, val, test, groups, has_target, domain_basis in seed_split_specs:
+            for spec in seed_split_specs:
+                _, split_regime, split_label, train, val, test, groups, has_target, domain_basis, source_val, source_test = spec
                 for family in active_probes:
                     meta = {
                         "model": model_name,
@@ -202,10 +211,11 @@ def _run_tabular_pair(
                         "probe_family": family,
                     }
                     base = (seed, split_regime, split_label, mname, family)
+                    has_source_diag = len(source_val) > 0 and len(source_test) > 0
                     if has_target:
                         todo = _missing(base, "target", target_budgets)
                         if todo:
-                            rerun_keys.update((*base, "target", b) for b in todo)
+                            rerun_keys.update((*base, "target", b, sc) for b in todo for sc in _scopes("target", b))
                             jobs.append(
                                 delayed(runstate._probe_cell_target)(
                                     probe_fn_tgt,
@@ -224,9 +234,9 @@ def _run_tabular_pair(
                                     todo,
                                 )
                             )
-                    todo_src = _missing(base, "source", source_budgets)
+                    todo_src = _missing(base, "source", source_budgets, has_source_diag)
                     if todo_src:
-                        rerun_keys.update((*base, "source", b) for b in todo_src)
+                        rerun_keys.update((*base, "source", b, sc) for b in todo_src for sc in _scopes("source", b, has_source_diag))
                         jobs.append(
                             delayed(runstate._probe_cell)(
                                 probe_fn_src,
@@ -243,6 +253,8 @@ def _run_tabular_pair(
                                 seed,
                                 family,
                                 todo_src,
+                                source_val,
+                                source_test,
                             )
                         )
 

@@ -39,6 +39,7 @@ def run_signature(
     src = cacheutils.REPO / "src"
     code = cacheutils._hash_files(
         src / "main.py",
+        *(p for p in [src / "evals" / "probes.py"] if p.exists()),
         *sorted((src / "evals" / "probes").glob("*.py")),
         src / "evals" / "evals.py",
         src / "evals" / "confounds.py",
@@ -110,6 +111,7 @@ def budget_row_key(row):
         row.get("probe_family"),
         row.get("budget_type"),
         row.get("label_budget"),
+        row.get("evaluation_split"),
     )
 
 
@@ -119,37 +121,35 @@ def prune_partial_budgets(rows, rows_path, preds_path, rerun_keys):
         return rows
     kept = [r for r in rows if budget_row_key(r) not in rerun_keys]
     if len(kept) != len(rows):
-        rows_path.unlink(missing_ok=True)
-        IOU.append_jsonl(rows_path, kept)
+        tmp_rows = rows_path.with_name(f".{rows_path.name}.tmp")
+        tmp_rows.unlink(missing_ok=True)
+        if kept:
+            IOU.append_jsonl(tmp_rows, kept)
+        else:
+            tmp_rows.touch()
+        os.replace(tmp_rows, rows_path)
     preds = IOU.read_jsonl(preds_path)
     kept_preds = [p for p in preds if budget_row_key(p) not in rerun_keys]
     if len(kept_preds) != len(preds):
-        preds_path.unlink(missing_ok=True)
-        IOU.append_jsonl(preds_path, kept_preds)
+        tmp_preds = preds_path.with_name(f".{preds_path.name}.tmp")
+        tmp_preds.unlink(missing_ok=True)
+        if kept_preds:
+            IOU.append_jsonl(tmp_preds, kept_preds)
+        else:
+            tmp_preds.touch()
+        os.replace(tmp_preds, preds_path)
     return kept
 
 
-def _probe_cell(
-    probe_fn,
-    emb,
-    train,
-    val,
-    test,
-    y,
-    groups,
-    cls,
-    kwargs,
-    uses_target,
-    meta,
-    seed,
-    family="logistic",
-    budgets=None,
-) -> tuple[list[dict], list[dict]]:
-    """Fit the optional method transform and run the source-budget probe."""
+def _probe_cell(probe_fn, emb, train, val, test, y, groups, cls, kwargs, uses_target, meta, seed, family="logistic", budgets=None, source_val=None, source_test=None) -> tuple[list[dict], list[dict]]:
     x_tr, x_cond_te = emb[train], emb[test]
     y_tr, y_te, g_tr = y[train], y[test], groups[train]
     x_val = emb[val] if len(val) else None
     y_val = y[val] if len(val) else None
+    extra_evals = {}
+    for label, idx in (("source_validation", source_val), ("source_test", source_test)):
+        if idx is not None and len(idx):
+            extra_evals[label] = (emb[idx], y[idx], np.asarray(idx), np.asarray(groups)[idx])
     mname = meta.get("method", "?")
     identity = {k: meta[k] for k in ("seed", "holdout", "method") if k in meta}
     transform = None
@@ -182,6 +182,7 @@ def _probe_cell(
             groups_test=np.asarray(groups)[test],
             x_val=x_val,
             y_val=y_val,
+            extra_evals=extra_evals or None,
             family=family,
             **({} if budgets is None else {"budgets": budgets}),
         )
@@ -189,23 +190,7 @@ def _probe_cell(
     return rows, preds
 
 
-def _probe_cell_target(
-    probe_fn,
-    emb,
-    train,
-    val,
-    test,
-    y,
-    groups,
-    cls,
-    kwargs,
-    uses_target,
-    meta,
-    seed,
-    family="logistic",
-    budgets=None,
-) -> tuple[list[dict], list[dict]]:
-    """Target-budget variant using the full target pool."""
+def _probe_cell_target(probe_fn, emb, train, val, test, y, groups, cls, kwargs, uses_target, meta, seed, family="logistic", budgets=None) -> tuple[list[dict], list[dict]]:
     x_source_tr, x_target_full = emb[train], emb[test]
     y_source_tr, y_target_full = y[train], y[test]
     g_source_tr = groups[train]
@@ -334,28 +319,10 @@ def _run_segmentation_pair(
         present_by_family.setdefault(_fam_key(r), set()).add(
             (r.get("budget_type"), r.get("label_budget"), r.get("evaluation_split"))
         )
-    expected_source = {("source", b, s) for b in source_budgets for s in ("validation", "test")}
-    expected_target = {("target", b, "held_out") for b in target_budgets}
-    if any(float(b) == 0.0 for b in target_budgets):
-        expected_target.add(("target", 0, "full"))
-
-    def _expected(regime):
-        exp = set(expected_source)
-        if regime != "random_id":
-            exp |= expected_target
-        return exp
-
-    regime_idx = fam_fields.index("split_regime")
-    done_families = {
-        k for k, seen in present_by_family.items() if _expected(k[regime_idx]).issubset(seen)
-    }
-    incomplete = set(present_by_family) - done_families
-    if incomplete:
-        rows = [r for r in rows if _fam_key(r) not in incomplete]
-        rows_path.unlink(missing_ok=True)
-        IOU.append_jsonl(rows_path, rows)
-
     supported = getattr(bench_mod, "SPLIT_REGIMES", ["random_id"])
+    unsupported = [r for r in split_regimes if r not in supported]
+    if unsupported:
+        raise ValueError(f"Unknown/unsupported split regimes for {benchmark_name}: {unsupported}. Supported: {supported}")
     regimes = [r for r in supported if r in split_regimes]
     fold_configs_by_seed = {
         seed: list(
@@ -365,6 +332,38 @@ def _run_segmentation_pair(
         )
         for seed in seeds
     }
+    has_source_diag = {
+        (seed, regime, cfg.label): bool(cfg.source_val_patches and cfg.source_test_patches)
+        for seed in seeds for regime, cfg in fold_configs_by_seed[seed]
+    }
+    expected_target = {("target", b, "held_out") for b in target_budgets}
+    if any(float(b) == 0.0 for b in target_budgets):
+        expected_target.add(("target", 0, "full"))
+
+    def _expected(key):
+        splits = ("validation", "test")
+        if has_source_diag.get((key[0], key[2], key[3]), False):
+            splits = (*splits, "source_validation", "source_test")
+        exp = {("source", b, s) for b in source_budgets for s in splits}
+        if key[regime_idx] != "random_id":
+            exp |= expected_target
+        return exp
+
+    regime_idx = fam_fields.index("split_regime")
+    done_families = {
+        k for k, seen in present_by_family.items() if _expected(k).issubset(seen)
+    }
+    incomplete = set(present_by_family) - done_families
+    if incomplete:
+        rows = [r for r in rows if _fam_key(r) not in incomplete]
+        tmp_rows = rows_path.with_name(f".{rows_path.name}.tmp")
+        tmp_rows.unlink(missing_ok=True)
+        if rows:
+            IOU.append_jsonl(tmp_rows, rows)
+        else:
+            tmp_rows.touch()
+        os.replace(tmp_rows, rows_path)
+
     EV._write_split_manifest(
         results_dir,
         [
@@ -417,6 +416,21 @@ def _run_segmentation_pair(
                         "holdout": holdout,
                         "probe_family": family,
                     }
+                    eval_streams = {
+                        "validation": lambda vf=cfg.val_folds, vp=cfg.val_patches: cacheutils.iter_dense_tiles(
+                            emb_dir, vf, patch_ids=vp
+                        ),
+                        "test": lambda tf=cfg.test_folds, tp=cfg.test_patches: cacheutils.iter_dense_tiles(
+                            emb_dir, tf, patch_ids=tp
+                        ),
+                    }
+                    if cfg.source_val_patches and cfg.source_test_patches:
+                        eval_streams["source_validation"] = lambda tf=cfg.train_folds, p=cfg.source_val_patches: cacheutils.iter_dense_tiles(
+                            emb_dir, tf, patch_ids=p
+                        )
+                        eval_streams["source_test"] = lambda tf=cfg.train_folds, p=cfg.source_test_patches: cacheutils.iter_dense_tiles(
+                            emb_dir, tf, patch_ids=p
+                        )
                     EV.run_probes_segmentation(
                         cell_rows,
                         x_train,
@@ -424,14 +438,7 @@ def _run_segmentation_pair(
                         y_train,
                         y_val,
                         seed,
-                        eval_streams={
-                            "validation": lambda vf=cfg.val_folds, vp=cfg.val_patches: cacheutils.iter_dense_tiles(
-                                emb_dir, vf, patch_ids=vp
-                            ),
-                            "test": lambda tf=cfg.test_folds, tp=cfg.test_patches: cacheutils.iter_dense_tiles(
-                                emb_dir, tf, patch_ids=tp
-                            ),
-                        },
+                        eval_streams=eval_streams,
                         transform=transform,
                         budgets=source_budgets,
                         meta=seg_meta,

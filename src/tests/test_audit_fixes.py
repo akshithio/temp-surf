@@ -424,7 +424,7 @@ def test_prune_partial_budgets_removes_surviving_scope(tmp_path):
     IOU.append_jsonl(rows_path, rows)
     IOU.append_jsonl(preds_path, [{**row(0, "held_out"), "sample_id": 1}])
     base = (0, "geographic_ood", "t", "erm", "logistic")
-    rerun = {(*base, "target", 0)}                       # budget 0 will be regenerated (both scopes)
+    rerun = {(*base, "target", 0, "held_out"), (*base, "target", 0, "full")}                       # budget 0 will be regenerated (both scopes)
     kept = runstate.prune_partial_budgets(rows, rows_path, preds_path, rerun)
     assert [r["label_budget"] for r in kept] == [5]      # the partial budget-0 row was pruned
     assert [r["label_budget"] for r in IOU.read_jsonl(rows_path)] == [5]   # jsonl rewritten

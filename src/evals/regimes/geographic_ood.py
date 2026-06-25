@@ -10,7 +10,8 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import BallTree
 
-from evals.regimes.base import Split, geography_domains
+from evals.regimes.base import DenseSplit, Split, geography_domains
+from utils import cacheutils
 
 NAME = "geographic_ood"
 GROUP_KIND = "geography"
@@ -61,6 +62,35 @@ def _domain_size(groups: np.ndarray, domains: set[str]) -> int:
 def _domain_classes(y: np.ndarray, groups: np.ndarray, domains: set[str]) -> int:
     idx = _idx_for(groups, domains)
     return int(len(np.unique(y[idx]))) if len(idx) else 0
+
+
+def _source_diag_indices(y: np.ndarray, train: np.ndarray, seed: int):
+    train = np.asarray(train, dtype=np.int64)
+    if len(train) < 10 or len(np.unique(y[train])) < 2:
+        return np.sort(train), np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    try:
+        train_val, source_test = train_test_split(train, test_size=0.10, random_state=seed + 101, stratify=y[train])
+        source_train, source_val = train_test_split(
+            train_val, test_size=0.1111111111, random_state=seed + 102, stratify=y[train_val]
+        )
+    except ValueError:
+        train_val, source_test = train_test_split(train, test_size=0.10, random_state=seed + 101)
+        source_train, source_val = train_test_split(train_val, test_size=0.1111111111, random_state=seed + 102)
+    if len(source_train) == 0 or len(np.unique(y[source_train])) < 2:
+        return np.sort(train), np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    return np.sort(source_train), np.sort(source_val), np.sort(source_test)
+
+
+def _source_diag_patches(patches: list[int] | np.ndarray, seed: int, patch_classes: dict | None = None):
+    patches = np.asarray(sorted(map(int, patches)), dtype=np.int64)
+    if len(patches) < 10:
+        return set(map(int, patches)), None, None
+    train_val, source_test = train_test_split(patches, test_size=0.10, random_state=seed + 101)
+    source_train, source_val = train_test_split(train_val, test_size=0.1111111111, random_state=seed + 102)
+    if patch_classes is not None:
+        if not len(source_train) or len(set().union(*(patch_classes.get(p, set()) for p in source_train))) < 2:
+            return set(map(int, patches)), None, None
+    return set(map(int, source_train)), set(map(int, source_val)), set(map(int, source_test))
 
 
 def _spatial_partitions(y: np.ndarray, groups: np.ndarray, *, val_frac: float, test_frac: float):
@@ -123,13 +153,14 @@ def _purge_train_near_ood(train: np.ndarray, val: np.ndarray, test: np.ndarray, 
     return np.sort(train[keep])
 
 
-def _split_from_domain_sets(y, groups, train_domains, val_domains, test_domains, *, label, bench, purge_km):
+def _split_from_domain_sets(y, groups, train_domains, val_domains, test_domains, *, label, bench, purge_km, seed):
     train = _idx_for(groups, train_domains)
     val = _idx_for(groups, val_domains)
     test = _idx_for(groups, test_domains)
     train = _purge_train_near_ood(train, val, test, bench, purge_km)
     _check_split(y, train, val, test, label)
-    return Split(label, np.sort(train), np.sort(test), np.sort(val))
+    train, source_val, source_test = _source_diag_indices(y, train, seed)
+    return Split(label, train, np.sort(test), np.sort(val), source_val, source_test)
 
 
 def make_strict_holdout_splits(
@@ -201,6 +232,7 @@ def iter_splits(y, groups, *, seed, holdouts, n_folds=None, val_group=None, benc
                 label=str(holdouts.get("label", "spatial_blocks")),
                 bench=bench,
                 purge_km=purge_km,
+                seed=seed,
             )
             return
         if isinstance(holdouts, dict):
@@ -215,6 +247,7 @@ def iter_splits(y, groups, *, seed, holdouts, n_folds=None, val_group=None, benc
                 label=str(holdouts.get("label", "fixed_geography")),
                 bench=bench,
                 purge_km=purge_km,
+                seed=seed,
             )
             return
     except ValueError as exc:
@@ -227,10 +260,11 @@ def iter_splits(y, groups, *, seed, holdouts, n_folds=None, val_group=None, benc
             )
             train = _purge_train_near_ood(train, val, test, bench, purge_km)
             _check_split(y, train, val, test, str(holdout))
+            train, source_val, source_test = _source_diag_indices(y, train, seed)
         except ValueError as exc:
             print(f"   !! geographic_ood: holdout {holdout!r} dropped ({exc})", flush=True)
             continue
-        yield Split(str(holdout), train, test, val)
+        yield Split(str(holdout), train, test, val, source_val, source_test)
 
 
 def iter_fold_splits(bench_mod):
@@ -248,3 +282,24 @@ def iter_fold_splits(bench_mod):
         val_fold = all_folds[(i + 1) % len(all_folds)]
         train_folds = {f for f in all_folds if f not in (test_fold, val_fold)}
         yield (f"fold_{test_fold}", train_folds, {val_fold}, {test_fold})
+
+
+def iter_dense_splits(bench_mod, *, emb_dir, seed, bench=None):
+    for label, train_folds, val_folds, test_folds in iter_fold_splits(bench_mod):
+        patch_classes = getattr(bench, "patch_classes", None) if bench is not None else None
+        train_patches, source_val, source_test = _source_diag_patches(
+            cacheutils.dense_fold_patches(emb_dir, set(train_folds)),
+            seed,
+            patch_classes=patch_classes,
+        )
+        yield DenseSplit(
+            str(label),
+            set(train_folds),
+            set(val_folds),
+            set(test_folds),
+            train_patches=train_patches,
+            source_val_patches=source_val,
+            source_test_patches=source_test,
+            has_target=HAS_TARGET,
+            group_kind=GROUP_KIND,
+        )

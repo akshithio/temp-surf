@@ -2,21 +2,7 @@
 
 from __future__ import annotations
 
-import importlib
 import os
-from typing import Any
-
-import numpy as np
-
-from evals.probes import (
-    FeatureTransform,
-    fit_probe_multiclass,
-    fit_probe_with_calibration,
-    score_binary,
-    score_multiclass,
-)
-from evals.regimes import base as regime_base
-from utils import perfutils as perf
 
 for _thread_var in [
     "OMP_NUM_THREADS",
@@ -27,6 +13,20 @@ for _thread_var in [
 ]:
     os.environ.setdefault(_thread_var, "1")
 
+import importlib  # noqa: E402
+from typing import Any  # noqa: E402
+
+import numpy as np  # noqa: E402
+
+from evals.probes import (  # noqa: E402
+    FeatureTransform,
+    fit_probe_multiclass,
+    fit_probe_with_calibration,
+    score_binary,
+    score_multiclass,
+)
+from evals.regimes import base as regime_base  # noqa: E402
+from utils import perfutils as perf  # noqa: E402
 
 subset_indices = perf.subset_indices
 _target_budget_count = perf._target_budget_count
@@ -166,6 +166,7 @@ def run_probes(
     x_val: np.ndarray | None = None,
     y_val: np.ndarray | None = None,
     family: str = "logistic",
+    extra_evals: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]] | None = None,
 ) -> None:
     """Run binary source-budget probes."""
     _validate_source_budgets(budgets)
@@ -181,16 +182,19 @@ def run_probes(
             "threshold": threshold,
             **probe_meta,
         }
-        if transform is not None and hasattr(transform, "adapt_test_features"):
-            x_te = transform.adapt_test_features(clf, x_te)
-        scores, per_sample = score_binary(clf, threshold, x_te, y_te, return_per_sample=True)
-        return scores, extra, per_sample
+        def score_fitted(x_eval, y_eval):
+            if transform is not None and hasattr(transform, "adapt_test_features"):
+                x_eval = transform.adapt_test_features(clf, x_eval)
+            return score_binary(clf, threshold, x_eval, y_eval, return_per_sample=True)
+
+        scores, per_sample = score_fitted(x_te, y_te)
+        return scores, extra, per_sample, score_fitted
 
     _sweep_budgets(
         rows, x_train, x_test, y_train, y_test, seed, fit_score,
         transform=transform, budgets=budgets, meta=meta, stratify=True, groups_train=groups_train,
         predictions=predictions, sample_ids_test=sample_ids_test, groups_test=groups_test,
-        x_val=x_val, y_val=y_val,
+        x_val=x_val, y_val=y_val, extra_evals=extra_evals,
     )
 
 
@@ -261,6 +265,7 @@ def run_probes_multiclass(
     x_val: np.ndarray | None = None,
     y_val: np.ndarray | None = None,
     family: str = "logistic",
+    extra_evals: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]] | None = None,
 ) -> None:
     """Run multiclass source-budget probes."""
     _validate_source_budgets(budgets)
@@ -269,16 +274,19 @@ def run_probes_multiclass(
         clf, probe_meta = fit_probe_multiclass(
             x_tr, y_tr, probe_seed, x_val=x_cal, y_val=y_cal, family=family, tune_internal=tune_internal
         )
-        if transform is not None and hasattr(transform, "adapt_test_features"):
-            x_te = transform.adapt_test_features(clf, x_te)
-        scores, per_sample = score_multiclass(clf, x_te, y_te, return_per_sample=True)
-        return scores, probe_meta, per_sample
+        def score_fitted(x_eval, y_eval):
+            if transform is not None and hasattr(transform, "adapt_test_features"):
+                x_eval = transform.adapt_test_features(clf, x_eval)
+            return score_multiclass(clf, x_eval, y_eval, return_per_sample=True)
+
+        scores, per_sample = score_fitted(x_te, y_te)
+        return scores, probe_meta, per_sample, score_fitted
 
     _sweep_budgets(
         rows, x_train, x_test, y_train, y_test, seed, fit_score,
         transform=transform, budgets=budgets, meta=meta, stratify=True, groups_train=groups_train,
         predictions=predictions, sample_ids_test=sample_ids_test, groups_test=groups_test,
-        x_val=x_val, y_val=y_val,
+        x_val=x_val, y_val=y_val, extra_evals=extra_evals,
     )
 
 

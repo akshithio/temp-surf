@@ -109,6 +109,11 @@ clusters PASTIS-R patch centroids and evaluates whole held-out patches.
 | Source budgets | `[0.05, 0.10, 0.25, 1.00]` | Fraction of source training data used. |
 
 Each budget level fits a calibrated probe and scores the metrics on the test set.
+For `geographic_ood` and `spatial_cluster_ood`, the source-domain training pool
+also withholds source-side diagnostics when there is enough data:
+`source_validation` and `source_test`. These rows are scored by the same fitted
+probe as the OOD rows; they are diagnostic ID-within-source checks, not delta
+anchors.
 
 **Target evaluation scope (`evaluation_split`).** The target sweep draws ONE fixed 80/20
 target split (a nested ordering of the 80% pool, a fixed 20% test). Every target-budget row

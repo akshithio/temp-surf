@@ -10,7 +10,13 @@ import numpy as np
 from sklearn.cluster import KMeans
 
 from evals.regimes.base import DenseSplit, Split
-from evals.regimes.geographic_ood import _check_split, _idx_for, _purge_train_near_ood
+from evals.regimes.geographic_ood import (
+    _check_split,
+    _idx_for,
+    _purge_train_near_ood,
+    _source_diag_indices,
+    _source_diag_patches,
+)
 from utils import cacheutils
 
 NAME = "spatial_cluster_ood"
@@ -138,7 +144,7 @@ def _pick_extreme_patches(
 
 
 def iter_splits(y, groups, *, seed, holdouts=None, n_folds=None, val_group=None, bench=None, **_):
-    del seed, holdouts, n_folds, val_group
+    del holdouts, n_folds, val_group
     try:
         if bench is None:
             raise ValueError("spatial_cluster_ood needs the benchmark object")
@@ -165,10 +171,11 @@ def iter_splits(y, groups, *, seed, holdouts=None, n_folds=None, val_group=None,
         train = _purge_train_near_ood(train, val, test, bench, float(spec.get("purge_km", 25.0)))
         label = str(spec.get("label", "spatial_clusters"))
         _check_split(y, train, val, test, label)
+        train, source_val, source_test = _source_diag_indices(y, train, seed)
     except ValueError as exc:
         print(f"   !! spatial_cluster_ood: split dropped ({exc})", flush=True)
         return
-    yield Split(label, np.sort(train), np.sort(test), np.sort(val))
+    yield Split(label, np.sort(train), np.sort(test), np.sort(val), source_val, source_test)
 
 
 def _patch_class_sets(emb_dir, folds: set[int], patch_ids: np.ndarray) -> dict[int, set[int]]:
@@ -180,7 +187,6 @@ def _patch_class_sets(emb_dir, folds: set[int], patch_ids: np.ndarray) -> dict[i
 
 
 def iter_dense_splits(bench_mod, *, emb_dir, seed, bench=None):
-    del seed
     try:
         all_folds = sorted(set(bench_mod.TRAIN_FOLDS) | set(bench_mod.VAL_FOLDS) | set(bench_mod.TEST_FOLDS))
         available = set(cacheutils.dense_fold_patches(emb_dir, set(all_folds)))
@@ -228,6 +234,7 @@ def iter_dense_splits(bench_mod, *, emb_dir, seed, bench=None):
             float(spec.get("purge_km", 25.0)),
         )
         train_patches = {int(pid) for pid in patch_ids[train]}
+        train_patches, source_val_patches, source_test_patches = _source_diag_patches(train_patches, seed)
         val_patches = {int(pid) for pid in patch_ids[_idx_for(groups, val_domains)]}
         test_patches = {int(pid) for pid in patch_ids[_idx_for(groups, test_domains)]}
         for name, pids in {"train": train_patches, "val": val_patches, "test": test_patches}.items():
@@ -244,6 +251,8 @@ def iter_dense_splits(bench_mod, *, emb_dir, seed, bench=None):
         train_patches=train_patches,
         val_patches=val_patches,
         test_patches=test_patches,
+        source_val_patches=source_val_patches,
+        source_test_patches=source_test_patches,
         has_target=HAS_TARGET,
         group_kind=GROUP_KIND,
     )
