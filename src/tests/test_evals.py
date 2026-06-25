@@ -145,7 +145,7 @@ def test_expected_calibration_error() -> None:
 
 
 def test_probe_family_modules_build_expected_estimators() -> None:
-    from evals.probes import _build_logistic, _build_mlp, _build_knn
+    from evals.probes import _build_knn, _build_logistic, _build_mlp
 
     linear_probe = _build_logistic(1.0, solver="liblinear", seed=0, n_fit=8)
     mlp_probe = _build_mlp(1e-3, solver="unused", seed=0, n_fit=8)

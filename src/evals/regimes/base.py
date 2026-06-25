@@ -1,10 +1,4 @@
-"""Shared types for split regimes.
-
-A *regime* owns two things:
-
-    (1) the domain basis: how each sample is assigned a domain label
-    (2) the split strategy — how those domains become train/val/test
-"""
+"""Shared types for split regimes."""
 
 from __future__ import annotations
 
@@ -25,19 +19,14 @@ def _empty() -> np.ndarray:
 
 @dataclass(frozen=True)
 class Split:
-    """One train/val/test partition produced by a regime.
-
-    ``label`` identifies the held-out domain (or fold). ``val`` may be empty when a
-    regime trains on the full non-target pool and leaves threshold calibration to
-    the probe's own internal split. ``domain`` is the raw domain value held out (e.g. the
-    region ``"Estonia"`` behind label ``"Estonia"``); the runner uses it to detect a
-    leave-one-domain-out regime that silently dropped a domain. Defaults to ``label``.
-    """
+    """One regime partition."""
 
     label: str
     train: np.ndarray
     test: np.ndarray
     val: np.ndarray = field(default_factory=_empty)
+    source_val: np.ndarray = field(default_factory=_empty)
+    source_test: np.ndarray = field(default_factory=_empty)
     domain: str | None = None
 
 
@@ -50,6 +39,8 @@ class DenseSplit:
     train_patches: set[int] | None = None
     val_patches: set[int] | None = None
     test_patches: set[int] | None = None
+    source_val_patches: set[int] | None = None
+    source_test_patches: set[int] | None = None
     has_target: bool = False
     group_kind: str = "geography"
 
@@ -149,7 +140,10 @@ def iter_splits(split_regime, bench, y, holdouts, seed, *, overwrite_mode: bool,
         n_splits += 1
         yielded_labels.add(str(split.label))
         yielded_domains.add(str(getattr(split, "domain", None) or split.label))
-        yield split.label, split.train, split.val, split.test, domains, regime.HAS_TARGET, regime.GROUP_KIND
+        yield (
+            split.label, split.train, split.val, split.test, domains, regime.HAS_TARGET,
+            regime.GROUP_KIND, split.source_val, split.source_test,
+        )
     if n_splits == 0:
         labels = sorted({str(d) for d in domains})
         shown = labels[:8] + (["..."] if len(labels) > 8 else [])

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from evals import evals as EV
 from evals.benchmarks import breizhcrops, cropharvest, eurocropsml, pastis
 from evals.regimes import base as regime_base
 from evals.regimes import spatial_cluster_ood
@@ -56,6 +57,37 @@ def test_spatial_cluster_ood_uses_coordinate_clusters() -> None:
 def test_spatial_cluster_regime_is_available_for_located_benchmarks() -> None:
     for mod in (cropharvest, eurocropsml, breizhcrops, pastis):
         assert "spatial_cluster_ood" in mod.SPLIT_REGIMES
+
+
+def test_source_budget_probe_scores_source_diagnostics() -> None:
+    rng = np.random.default_rng(3)
+    x_train = rng.normal(size=(40, 4))
+    y_train = np.array([0, 1] * 20)
+    x_test = rng.normal(size=(6, 4))
+    y_test = np.array([0, 1, 0, 1, 0, 1])
+    x_diag = rng.normal(size=(8, 4))
+    y_diag = np.array([0, 1] * 4)
+    rows: list[dict] = []
+    preds: list[dict] = []
+
+    EV.run_probes(
+        rows,
+        x_train,
+        x_test,
+        y_train,
+        y_test,
+        seed=0,
+        budgets=[1.0],
+        meta={"model": "m", "benchmark": "b", "method": "erm", "split_regime": "geographic_ood"},
+        predictions=preds,
+        extra_evals={
+            "source_validation": (x_diag[:4], y_diag[:4], np.arange(10, 14), np.array(["src"] * 4)),
+            "source_test": (x_diag[4:], y_diag[4:], np.arange(20, 24), np.array(["src"] * 4)),
+        },
+    )
+
+    assert {r["evaluation_split"] for r in rows} == {"test", "source_validation", "source_test"}
+    assert {p["evaluation_split"] for p in preds} == {"test", "source_validation", "source_test"}
 
 
 def test_spatial_cluster_pastis_split_is_patch_level(tmp_path) -> None:

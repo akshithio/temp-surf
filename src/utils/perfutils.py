@@ -1,23 +1,4 @@
-"""Performance tracking instrument for the robustness pipeline.
-
-Records wall-clock, user-CPU, system-CPU time, MAC estimates, data
-dimensions, and GPU utilization at every stage.  Use as a context manager::
-
-    with measure("encode/baseline", n_samples=128, n_features=128):
-        ...
-
-Every event is tagged with a thread-local **identity** (seed, holdout,
-method, budget, budget_type) so nested ``perf.measure`` calls
-inside fit/score/sweep functions automatically know which cell they belong
-to.  Callers set identity at the sweep boundary::
-
-    perf.set_identity({"seed": 42, "holdout": "togo", ...})
-    # all nested measure() calls inherit this identity
-
-The logger is thread-safe so parallel probe workers can each record their
-own timings.  All events are accumulated per-(model, benchmark) and flushed
-to a JSONL file at the end of each run.
-"""
+"""Performance tracking and budget-sweep helpers."""
 
 from __future__ import annotations
 
@@ -226,6 +207,7 @@ def _sweep_budgets(
     x_val: np.ndarray | None = None,
     y_val: np.ndarray | None = None,
     family: str = "logistic",
+    extra_evals: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]] | None = None,
 ) -> None:
     """Apply the fitted transform, then sweep source-fraction budgets, appending one
     row each.
@@ -240,6 +222,11 @@ def _sweep_budgets(
     x_train = _apply_transform(transform, x_train)
     x_test = _apply_transform(transform, x_test)
     x_val = _apply_transform(transform, x_val) if x_val is not None and len(x_val) else None
+    eval_sets = {
+        name: (_apply_transform(transform, x), y, sample_ids, groups)
+        for name, (x, y, sample_ids, groups) in (extra_evals or {}).items()
+        if len(y)
+    }
     for budget in budgets:
         sub_seed = _budget_seed(seed, budget)
         fit_budget = float(budget)
@@ -263,10 +250,13 @@ def _sweep_budgets(
                 x_train[sub], y_train[sub], x_test, y_test, seed + int(round(budget * 1000)) + 17,
                 x_val, y_val,
             )
-            if len(result) == 3:
-                scores, extra, per_sample = result
+            score_fitted = None
+            if len(result) == 4:
+                scores, extra_meta, per_sample, score_fitted = result
+            elif len(result) == 3:
+                scores, extra_meta, per_sample = result
             else:
-                scores, extra = result
+                scores, extra_meta = result
                 per_sample = None
         set_identity(None)
         scores = {**scores, **regime_base._worst_group_scores(per_sample, groups_test)}
@@ -280,7 +270,7 @@ def _sweep_budgets(
                 "seed": seed,
                 "n_train_sub": int(len(sub)),
                 "n_test": int(len(y_test)),
-                **extra,
+                **extra_meta,
                 **scores,
             }
         )
@@ -295,6 +285,34 @@ def _sweep_budgets(
             groups_test=groups_test,
             per_sample=per_sample,
         )
+        if score_fitted is None:
+            continue
+        for split_name, (x_eval, y_eval, sample_ids_eval, groups_eval) in eval_sets.items():
+            scores_e, per_sample_e = score_fitted(x_eval, y_eval)
+            scores_e = {**scores_e, **regime_base._worst_group_scores(per_sample_e, groups_eval)}
+            rows.append({
+                **meta,
+                "budget_type": "source",
+                "label_budget": budget,
+                "evaluation_split": split_name,
+                "seed": seed,
+                "n_train_sub": int(len(sub)),
+                "n_test": int(len(y_eval)),
+                **extra_meta,
+                **scores_e,
+            })
+            regime_base._append_prediction_rows(
+                predictions,
+                meta=meta,
+                seed=seed,
+                budget_type="source",
+                label_budget=budget,
+                n_train_sub=len(sub),
+                sample_ids=np.asarray(sample_ids_eval if sample_ids_eval is not None else np.arange(len(y_eval))),
+                groups_test=groups_eval,
+                per_sample=per_sample_e,
+                evaluation_split=split_name,
+            )
 
 
 def _sweep_target_budgets(

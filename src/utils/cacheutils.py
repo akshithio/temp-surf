@@ -127,7 +127,8 @@ def cached_bench(benchmark: str, tag: str, **kwargs):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = _atomic_tmp(path)
     try:
-        tmp.write_bytes(pickle.dumps(bench))
+        with open(tmp, "wb") as f:
+            pickle.dump(bench, f)
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
@@ -138,7 +139,10 @@ def build_model(name: str, **kwargs) -> Any:
     """Instantiate a model, passing only accepted kwargs."""
     mod_path, cls_name = MODELS[name]
     cls = getattr(importlib.import_module(mod_path), cls_name)
-    accepted = set(inspect.signature(cls).parameters)
+    sig = inspect.signature(cls)
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return cls(**kwargs)
+    accepted = set(sig.parameters)
     return cls(**{k: v for k, v in kwargs.items() if k in accepted})
 
 

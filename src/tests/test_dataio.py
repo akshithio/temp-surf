@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import h5py
 import numpy as np
 import pytest
 
 from dataio.get_input import get_input
+from evals.benchmarks import cropharvest
 from evals.benchmarks.pastis import PastisBenchmark
 from utils import cacheutils, ioutils
 
@@ -90,6 +92,37 @@ def test_load_cached_embeddings_reads_existing_matrix(tmp_path, monkeypatch) -> 
     actual = cacheutils.load_cached_embeddings(bench, "cropharvest", "presto", "tag")
 
     np.testing.assert_array_equal(actual, expected.astype(np.float32))
+
+
+def test_cropharvest_geo_group_collapses_rwanda_aliases() -> None:
+    assert cropharvest._ch_geo_group("rwanda-ceo") == "rwanda"
+    assert cropharvest._ch_geo_group("rwanda") == "rwanda"
+
+
+def test_cropharvest_max_samples_counts_loaded_samples_not_raw_files(tmp_path, monkeypatch) -> None:
+    base = tmp_path / "cropharvest"
+    arrays_dir = base / "features" / "arrays"
+    arrays_dir.mkdir(parents=True)
+    (base / "labels.geojson").write_text("{}")
+
+    for name in ("000_unlabeled.h5", "001_unlabeled.h5", "002_known.h5", "003_known.h5"):
+        with h5py.File(arrays_dir / name, "w") as handle:
+            handle.create_dataset("array", data=np.ones((12, 18), dtype=np.float32))
+
+    monkeypatch.setattr(
+        cropharvest,
+        "_load_ch_labels",
+        lambda _path: {
+            (2, "known"): (1, 10.0, 20.0, 2020),
+            (3, "known"): (0, 11.0, 21.0, 2020),
+        },
+    )
+
+    bench = cropharvest.load_benchmark(root=tmp_path, max_samples=2, shuffle=False)
+
+    assert bench.n_samples == 2
+    np.testing.assert_array_equal(bench.labels, np.array([1, 0], dtype=np.int64))
+    assert list(bench.groups) == ["known", "known"]
 
 
 def test_pastis_tile_is_native_cadence_and_models_aggregate_their_own_way() -> None:

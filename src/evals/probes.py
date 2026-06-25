@@ -30,7 +30,6 @@ from sklearn.preprocessing import StandardScaler
 
 from utils import perfutils as perf
 
-
 # ── Logistic regression probe ────────────────────────────────────────────────
 
 LINEAR_SOLVER = "liblinear"

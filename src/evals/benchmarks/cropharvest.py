@@ -103,6 +103,8 @@ def _ch_geo_group(dataset: str) -> str:
         return "lem-brazil"
     if "kenya" in name:
         return "kenya"
+    if "rwanda" in name:
+        return "rwanda"
     return name
 
 
@@ -135,12 +137,15 @@ def load_benchmark(
         raise FileNotFoundError(f"CropHarvest labels not found: {labels_geojson}")
 
     label_map = _load_ch_labels(labels_geojson)
-    files = _select_files([p for p in arrays_dir.glob("*.h5") if p.is_file()], shuffle, seed, max_samples)
+    files = _select_files([p for p in arrays_dir.glob("*.h5") if p.is_file()], shuffle, seed, None)
 
     s2_series, s1_series, clim_series = [], [], []
     labels, groups, latlons, years = [], [], [], []
     skipped = 0
+    valid_count = 0
     for path in files:
+        if max_samples is not None and valid_count >= max_samples:
+            break
         idx_str, dataset = path.stem.split("_", 1)
         key = (int(idx_str), dataset)
         if key not in label_map:
@@ -166,6 +171,7 @@ def load_benchmark(
         groups.append(_ch_geo_group(dataset))
         latlons.append((lat, lon))
         years.append(year)
+        valid_count += 1
 
     if skipped:
         # Corrupt/malformed arrays must not silently shrink the dataset.
