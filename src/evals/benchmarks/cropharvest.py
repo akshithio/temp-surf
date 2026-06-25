@@ -29,9 +29,25 @@ from dataio.get_input import (
 
 BENCHMARK = "cropharvest"
 LABEL_KIND = "binary"
-HOLDOUTS = ["togo", "ethiopia", "lem-brazil", "rwanda", "togo-eval"]
-# Binary task with global coordinates and multi-year windows.
-SPLIT_REGIMES = ["random_id", "geographic_ood"]
+HOLDOUTS = ["kenya", "togo", "ethiopia", "lem-brazil", "rwanda"]
+OFFICIAL_HOLDOUTS = ["kenya", "lem-brazil", "togo"]
+GEOGRAPHIC_HOLDOUTS = HOLDOUTS
+GEOGRAPHIC_BLOCK_DEGREES = 2.0
+GEOGRAPHIC_SPLIT = {
+    "strategy": "spatial_blocks",
+    "label": "spatial_block_2deg_purge50km",
+    "val_fraction": 0.10,
+    "test_fraction": 0.20,
+    "purge_km": 50.0,
+}
+SPATIAL_CLUSTER_SPLIT = {
+    "label": "spatial_cluster_purge50km",
+    "n_clusters": 12,
+    "val_fraction": 0.10,
+    "test_fraction": 0.20,
+    "purge_km": 50.0,
+}
+SPLIT_REGIMES = ["random_id", "official", "geographic_ood", "spatial_cluster_ood"]
 
 # --- Raw array band layout --------------------------------------------------
 # Raw 18-col array: [S1 VV,VH] + [S2: B2..B8A, B9, B11, B12] + [ERA5 temp,precip]
@@ -79,6 +95,30 @@ def _load_ch_labels(labels_geojson: Path) -> dict[tuple[int, str], tuple[int, fl
     return out
 
 
+def _ch_geo_group(dataset: str) -> str:
+    name = str(dataset).lower()
+    if "togo" in name:
+        return "togo"
+    if "brazil" in name:
+        return "lem-brazil"
+    if "kenya" in name:
+        return "kenya"
+    return name
+
+
+def geographic_domains(bench) -> np.ndarray:
+    latlon = np.asarray(bench.latlon, dtype=float)
+    out = np.full(len(latlon), "unknown", dtype=object)
+    if latlon.ndim != 2 or latlon.shape[1] != 2:
+        return out
+    valid = np.isfinite(latlon).all(axis=1)
+    block = GEOGRAPHIC_BLOCK_DEGREES
+    lat_bin = np.floor((latlon[valid, 0] + 90.0) / block).astype(int)
+    lon_bin = np.floor((latlon[valid, 1] + 180.0) / block).astype(int)
+    out[valid] = [f"block_{lat}_{lon}" for lat, lon in zip(lat_bin, lon_bin, strict=True)]
+    return out
+
+
 def load_benchmark(
     root: Path = Path("data/input/benchmarks"),
     max_samples: int | None = None,
@@ -123,7 +163,7 @@ def load_benchmark(
         s1_series.append(arr[:, CH_S1_IDXS].astype(np.float32))
         clim_series.append(arr[:, CH_CLIMATE_IDXS].astype(np.float32))
         labels.append(is_crop)
-        groups.append(dataset)
+        groups.append(_ch_geo_group(dataset))
         latlons.append((lat, lon))
         years.append(year)
 

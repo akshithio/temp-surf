@@ -26,8 +26,15 @@ def test_pastis_is_lazy_and_yields_64_pixel_tiles(tmp_path) -> None:
         "dates-S2": {"0": 20190115, "1": 20190215},
         "dates-S1A": {"0": 20190110, "1": 20190210},
     }
+    geometry = {
+        "type": "Polygon",
+        "coordinates": [[[-1.0, 46.0], [-0.99, 46.0], [-0.99, 46.01], [-1.0, 46.01], [-1.0, 46.0]]],
+    }
     (base / "metadata.geojson").write_text(
-        json.dumps({"type": "FeatureCollection", "features": [{"type": "Feature", "properties": properties}]})
+        json.dumps({
+            "type": "FeatureCollection",
+            "features": [{"type": "Feature", "properties": properties, "geometry": geometry}],
+        })
     )
     np.save(base / "DATA_S2" / "S2_10000.npy", np.ones((2, 10, 128, 128), dtype=np.int16))
     np.save(base / "DATA_S1A" / "S1A_10000.npy", np.ones((2, 3, 128, 128), dtype=np.float16))
@@ -45,6 +52,8 @@ def test_pastis_is_lazy_and_yields_64_pixel_tiles(tmp_path) -> None:
     assert pixels.n_samples == 64 * 64 - 1
     assert pixels.monthly("s2")[0].shape == (64 * 64 - 1, 12, 11)
     assert pixels.monthly("s1")[0].shape == (64 * 64 - 1, 12, 3)
+    assert np.isfinite(bench.latlon).all()
+    assert np.isclose(pixels.latlon[:, 0].mean(), 46.005)
     assert 19 not in tiles[0][3]
 
 
@@ -84,8 +93,6 @@ def test_load_cached_embeddings_reads_existing_matrix(tmp_path, monkeypatch) -> 
 
 
 def test_pastis_tile_is_native_cadence_and_models_aggregate_their_own_way() -> None:
-    """The PASTIS tile carries the native acquisition cadence; per-pixel models then aggregate it:
-    TESSERA uses the full series, Presto/Galileo/OlmoEarth composite to a 12-month grid."""
     from evals.benchmarks.pastis import PastisTile, _monthly_patch
 
     rng = np.random.default_rng(0)
@@ -96,20 +103,18 @@ def test_pastis_tile_is_native_cadence_and_models_aggregate_their_own_way() -> N
     tile = PastisTile(
         s2=s2, s1=s1, s2_months=months, s1_months=months,
         s2_mask=np.ones(t_native, np.float32), s1_mask=np.ones(t_native, np.float32),
-        labels=np.zeros((4, 4), np.int64), valid=np.ones((4, 4), bool), fold=1,
+        labels=np.zeros((4, 4), np.int64), valid=np.ones((4, 4), bool), fold=1, latlon=(46.0, -1.0),
     )
     bench = tile.pixel_benchmark()
     assert bench.n_samples == 16
+    assert np.isclose(bench.latlon[:, 0].mean(), 46.0)
 
-    # TESSERA-style native view: the FULL 24-acquisition cadence per pixel (10 bands + NDVI).
     s2_native, _doy, _m, _bands = bench.native_series("s2")
     assert s2_native[0].shape == (t_native, 11)
 
-    # Presto-style monthly view: collapsed onto a 12-calendar-month grid (every month observed here).
     mv, mask, _doy, _b = bench.monthly("s2")
     assert mv.shape == (16, 12, 11) and mask.min() == 1.0
 
-    # Galileo / OlmoEarth composite the native tile to the same 12-month grid in their encode path.
     s2_m, s2_mask = _monthly_patch(s2, months)
     assert s2_m.shape == (12, 10, 4, 4) and s2_mask.min() == 1.0
 

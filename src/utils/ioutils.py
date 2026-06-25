@@ -361,6 +361,7 @@ def compute_deltas(
     metrics: list[str],
     *,
     predictions: list[dict[str, Any]] | None = None,
+    ood_regimes: tuple[str, ...] | None = None,
     id_source_budget: float | int = 1.0,
     ood_target_budget: float | int = 0.0,
     target_id_budget: float | int | None = -1.0,
@@ -370,14 +371,41 @@ def compute_deltas(
 ) -> list[dict[str, Any]]:
     from evals import confounds
 
-    return confounds.compute_deltas(
-        rows,
-        metrics,
-        predictions=predictions,
-        id_source_budget=id_source_budget,
-        ood_target_budget=ood_target_budget,
-        target_id_budget=target_id_budget,
-        n_boot=n_boot,
-        n_boot_sample=n_boot_sample,
-        seed=seed,
-    )
+    if ood_regimes is None:
+        found = sorted({
+            str(r.get("split_regime"))
+            for r in rows
+            if r.get("budget_type") == "target" and r.get("split_regime") not in (None, "random_id")
+        })
+        ood_regimes = tuple(found or ["geographic_ood"])
+
+    def scoped(items, regime):
+        out = []
+        for item in items or []:
+            split_regime = item.get("split_regime")
+            if split_regime == "random_id":
+                out.append(item)
+            elif split_regime == regime:
+                out.append({**item, "split_regime": "geographic_ood"})
+        return out
+
+    out: list[dict[str, Any]] = []
+    for regime in ood_regimes:
+        regime_rows = scoped(rows, regime)
+        if not regime_rows:
+            continue
+        deltas = confounds.compute_deltas(
+            regime_rows,
+            metrics,
+            predictions=scoped(predictions or [], regime),
+            id_source_budget=id_source_budget,
+            ood_target_budget=ood_target_budget,
+            target_id_budget=target_id_budget,
+            n_boot=n_boot,
+            n_boot_sample=n_boot_sample,
+            seed=seed,
+        )
+        for row in deltas:
+            row["ood_regime"] = regime
+        out.extend(deltas)
+    return out

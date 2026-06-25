@@ -25,7 +25,7 @@ from utils import perfutils as perf
 # === Configuration ===========================================================
 BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis"]
 RUN_STAGES = ["gen_embeddings", "probing"]
-SPLIT_REGIMES = ["random_id", "geographic_ood"]
+SPLIT_REGIMES = ["random_id", "official", "geographic_ood", "spatial_cluster_ood"]
 ACTIVE_PROBES = ["logistic"]
 BUDGET_REGIMES = {
     "source": [0.05, 0.10, 0.25, 1.0],
@@ -67,7 +67,6 @@ def _run_tabular_pair(
         "binary": (EV.run_probes_target, EV.METRICS_BINARY),
         "multiclass": (EV.run_probes_multiclass_target, EV.METRICS_MULTICLASS),
     }[bench_mod.LABEL_KIND]
-    holdouts = bench_mod.HOLDOUTS
     supported = getattr(bench_mod, "SPLIT_REGIMES", split_regimes)
     split_regimes = [r for r in split_regimes if r in supported]
 
@@ -150,10 +149,7 @@ def _run_tabular_pair(
         return ("test",)
 
     def _missing(base, budget_type, expected):
-        return [
-            b for b in expected
-            if not all((*base, budget_type, b, sc) in done for sc in _scopes(budget_type, b))
-        ]
+        return [b for b in expected if not all((*base, budget_type, b, sc) in done for sc in _scopes(budget_type, b))]
 
     rerun_keys: set = set()
     split_specs: list[tuple] = []
@@ -161,6 +157,7 @@ def _run_tabular_pair(
 
     for seed in seeds:
         for split_regime in split_regimes:
+            holdouts = regime_base.holdouts_for(bench_mod, split_regime)
             for split_label, train, val, test, groups, has_target, domain_basis in regime_base.iter_splits(
                 split_regime,
                 bench,
@@ -168,9 +165,11 @@ def _run_tabular_pair(
                 holdouts,
                 seed,
                 overwrite_mode=overwrite_mode,
-                val_group=getattr(bench_mod, "VAL_HOLDOUT", None),
+                val_group=regime_base.val_group_for(bench_mod, split_regime),
             ):
-                split_specs.append((seed, split_regime, split_label, train, val, test, groups, has_target, domain_basis))
+                split_specs.append(
+                    (seed, split_regime, split_label, train, val, test, groups, has_target, domain_basis)
+                )
                 split_manifest.append(
                     EV._split_manifest_entry(
                         model_name=model_name,
@@ -261,8 +260,16 @@ def _run_tabular_pair(
     IOU.write_csv(results_dir / "probe_results.csv", rows)
     summary = IOU.summarize_rows(
         rows,
-        keys=["model", "method", "probe_family", "split_regime", "domain_basis", "budget_type",
-              "label_budget", "evaluation_split"],
+        keys=[
+            "model",
+            "method",
+            "probe_family",
+            "split_regime",
+            "domain_basis",
+            "budget_type",
+            "label_budget",
+            "evaluation_split",
+        ],
         metrics=metrics,
     )
     IOU.write_csv(results_dir / "summary.csv", summary)
@@ -279,6 +286,7 @@ def _run_tabular_pair(
     IOU.write_csv(results_dir / "deltas.csv", deltas)
 
     from evals import confounds
+
     axes = {"geography": np.asarray(bench.groups), "class": np.asarray(y)}
     if getattr(bench, "years", None) is not None:
         axes["year"] = np.asarray(bench.years)
@@ -286,12 +294,17 @@ def _run_tabular_pair(
 
     declared = set(compat.input_modalities(model_name))
     available = bench.available_modalities()
-    IOU.write_json(results_dir / "model_inputs.json", {
-        "model": model_name, "benchmark": benchmark_name, "s2_only_mode": s2_only,
-        "declared_modalities": sorted(declared),
-        "available_modalities": sorted(available),
-        "effective_modalities": sorted(declared & available),
-    })
+    IOU.write_json(
+        results_dir / "model_inputs.json",
+        {
+            "model": model_name,
+            "benchmark": benchmark_name,
+            "s2_only_mode": s2_only,
+            "declared_modalities": sorted(declared),
+            "available_modalities": sorted(available),
+            "effective_modalities": sorted(declared & available),
+        },
+    )
 
     perf_path = results_dir / "perf.jsonl"
     n_events = perf.write_log(perf_path)

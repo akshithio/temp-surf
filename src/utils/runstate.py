@@ -39,7 +39,7 @@ def run_signature(
     src = cacheutils.REPO / "src"
     code = cacheutils._hash_files(
         src / "main.py",
-        src / "evals" / "probes.py",
+        *sorted((src / "evals" / "probes").glob("*.py")),
         src / "evals" / "evals.py",
         src / "evals" / "confounds.py",
         src / "evals" / "regimes" / "base.py",
@@ -341,7 +341,7 @@ def _run_segmentation_pair(
 
     def _expected(regime):
         exp = set(expected_source)
-        if regime == "geographic_ood":
+        if regime != "random_id":
             exp |= expected_target
         return exp
 
@@ -357,7 +357,14 @@ def _run_segmentation_pair(
 
     supported = getattr(bench_mod, "SPLIT_REGIMES", ["random_id"])
     regimes = [r for r in supported if r in split_regimes]
-    fold_configs = list(regime_base.segmentation_fold_configs(bench_mod, regimes, overwrite_mode=overwrite_mode))
+    fold_configs_by_seed = {
+        seed: list(
+            regime_base.segmentation_fold_configs(
+                bench_mod, regimes, seed=seed, emb_dir=emb_dir, overwrite_mode=overwrite_mode, bench=bench
+            )
+        )
+        for seed in seeds
+    }
     EV._write_split_manifest(
         results_dir,
         [
@@ -365,20 +372,24 @@ def _run_segmentation_pair(
                 model_name=model_name,
                 benchmark_name=benchmark_name,
                 seed=seed,
-                split_regime=split_regime,
-                holdout=holdout,
-                train_folds=set(train_folds),
-                val_folds=set(val_folds),
-                test_folds=set(test_folds),
+                split_regime=regime,
+                holdout=cfg.label,
+                train_folds=cfg.train_folds,
+                val_folds=cfg.val_folds,
+                test_folds=cfg.test_folds,
+                train_patches=cfg.train_patches,
+                val_patches=cfg.val_patches,
+                test_patches=cfg.test_patches,
                 emb_dir=emb_dir,
             )
             for seed in seeds
-            for split_regime, holdout, train_folds, val_folds, test_folds in fold_configs
+            for regime, cfg in fold_configs_by_seed[seed]
         ],
     )
     for seed in seeds:
         for method_name, (cls, kwargs) in EV.build_methods(bench_mod.LABEL_KIND, seed).items():
-            for split_regime, holdout, train_folds, val_folds, test_folds in fold_configs:
+            for split_regime, cfg in fold_configs_by_seed[seed]:
+                holdout = cfg.label
                 families_to_run = [
                     f for f in active_probes
                     if (seed, method_name, split_regime, holdout, f) not in done_families
@@ -386,10 +397,10 @@ def _run_segmentation_pair(
                 if not families_to_run:
                     continue
                 x_train, y_train, groups_train, _, _ = cacheutils.load_dense_samples(
-                    emb_dir, train_folds, max_dense_pixels, seed
+                    emb_dir, cfg.train_folds, max_dense_pixels, seed, patch_ids=cfg.train_patches
                 )
                 x_val, y_val, _, _, _ = cacheutils.load_dense_samples(
-                    emb_dir, val_folds, max_dense_pixels, seed + 10_000
+                    emb_dir, cfg.val_folds, max_dense_pixels, seed + 10_000, patch_ids=cfg.val_patches
                 )
                 transform = None
                 if cls is not None:
@@ -402,7 +413,7 @@ def _run_segmentation_pair(
                         "benchmark": bench_mod.BENCHMARK,
                         "method": method_name,
                         "split_regime": split_regime,
-                        "domain_basis": "geography",
+                        "domain_basis": cfg.group_kind,
                         "holdout": holdout,
                         "probe_family": family,
                     }
@@ -414,25 +425,32 @@ def _run_segmentation_pair(
                         y_val,
                         seed,
                         eval_streams={
-                            "validation": lambda vf=val_folds: cacheutils.iter_dense_tiles(emb_dir, vf),
-                            "test": lambda tf=test_folds: cacheutils.iter_dense_tiles(emb_dir, tf),
+                            "validation": lambda vf=cfg.val_folds, vp=cfg.val_patches: cacheutils.iter_dense_tiles(
+                                emb_dir, vf, patch_ids=vp
+                            ),
+                            "test": lambda tf=cfg.test_folds, tp=cfg.test_patches: cacheutils.iter_dense_tiles(
+                                emb_dir, tf, patch_ids=tp
+                            ),
                         },
                         transform=transform,
                         budgets=source_budgets,
                         meta=seg_meta,
                         family=family,
                     )
-                    if split_regime == "geographic_ood":
+                    if cfg.has_target:
+                        target_patch_ids = cfg.test_patches or set(
+                            cacheutils.dense_fold_patches(emb_dir, cfg.test_folds)
+                        )
                         EV.run_probes_segmentation_target(
                             cell_rows,
                             x_train,
                             y_train,
                             seed,
-                            target_patches=cacheutils.dense_fold_patches(emb_dir, test_folds),
-                            sample_target=lambda pids, sd, tf=test_folds: cacheutils.load_dense_samples(
+                            target_patches=target_patch_ids,
+                            sample_target=lambda pids, sd, tf=cfg.test_folds: cacheutils.load_dense_samples(
                                 emb_dir, tf, max_dense_pixels, sd, patch_ids=pids
                             ),
-                            stream_target=lambda pids, tf=test_folds: cacheutils.iter_dense_tiles(
+                            stream_target=lambda pids, tf=cfg.test_folds: cacheutils.iter_dense_tiles(
                                 emb_dir, tf, patch_ids=pids
                             ),
                             x_val=x_val,

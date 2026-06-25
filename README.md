@@ -49,7 +49,7 @@ and label budget. Each split produces one probe fit per budget level.
 
 | Benchmark | Name | Kind | Holdouts | Metric family | Label source |
 |---|---|---|---|---|---|
-| `cropharvest` | CropHarvest | binary crop/non-crop | togo, ethiopia, lem-brazil, rwanda, togo-eval | F1, AUROC, calibrated F1, ECE, Brier, NLL, balanced accuracy | real `is_crop` |
+| `cropharvest` | CropHarvest | binary crop/non-crop | kenya, togo, ethiopia, lem-brazil, rwanda | F1, AUROC, calibrated F1, ECE, Brier, NLL, balanced accuracy | real `is_crop` |
 | `eurocropsml` | EuroCropsML | multiclass crop type | Estonia | macro/weighted F1, balanced accuracy, accuracy, macro AUC | real crop type |
 | `breizhcrops` | BreizhCrops | multiclass crop type | frh04 | macro/weighted F1, balanced accuracy, accuracy, macro AUC | real crop type |
 | `pastis` | PASTIS-R | semantic segmentation | official folds 1-3/4/5 | mIoU, pixel accuracy, macro/weighted F1 | per-pixel crop type |
@@ -87,17 +87,19 @@ those domains become train/test splits:
 | Regime | Domain basis | Splits per benchmark | Description |
 |---|---|---:|---|
 | `random_id` | geography | 1 | Random stratified 80/10/10 split. Train and test share regions/domains (in-distribution upper bound). |
-| `geographic_ood` | geography | 1 / ≤5 holdouts | Strict leave-region/source-out. CropHarvest: curated holdouts (togo, ethiopia, lem-brazil, rwanda, togo-eval). EuroCropsML: Estonia. BreizhCrops: frh04. |
+| `official` | geography | benchmark-defined | Benchmark-recommended split. CropHarvest: Kenya/Brazil/Togo targets. EuroCropsML: Estonia. BreizhCrops: frh04 test with frh03 validation. PASTIS-R: folds 1-3/4/5. |
+| `geographic_ood` | geography | strict stress splits | Stricter-than-official geographic stress. CropHarvest uses lat/lon spatial blocks plus a distance purge. EuroCropsML, BreizhCrops, and PASTIS-R use leave-one-geographic-unit-out over all countries/regions/folds with disjoint OOD validation. |
+| `spatial_cluster_ood` | spatial clusters | 1 | Coordinate-only spatial stress split. K-means clusters lat/lon, test uses one spatial extreme, val uses the opposite extreme, train uses the remaining clusters after distance purging. Runs on all four benchmarks. |
 
 Each regime yields a train/val/test split; the binary probe calibrates its
-decision threshold on that held-out `val` (a source-side validation set for the
-OOD regimes), falling back to an internal split of the training pool only when a
-regime supplies no val. These regimes drive the classification benchmarks.
-**PASTIS-R (segmentation)** runs the same `random_id` and `geographic_ood` regimes,
-realized for the dense per-pixel path by each regime's `iter_fold_splits` (in
-`evals/regimes/`): `random_id` is the published spatial-fold assignment (1-3 train /
-4 val / 5 test) used as the in-distribution baseline, and `geographic_ood` is
-leave-one-spatial-fold-out. Both log `domain_basis=geography`.
+decision threshold on that held-out `val`, falling back to an internal split only
+when a regime supplies no val. These regimes drive the classification benchmarks.
+
+**PASTIS-R (segmentation)** uses dense split configs from the same regime modules:
+`random_id` is an 80/10/10 split over whole patches, `official` uses the
+published fold assignment (1-3 train / 4 val / 5 test), and `geographic_ood`
+iterates leave-one-fold-out across all five spatial folds. `spatial_cluster_ood`
+clusters PASTIS-R patch centroids and evaluates whole held-out patches.
 
 **Budget types**
 
@@ -173,7 +175,8 @@ adding decorative comparisons.
 │   ├── dataio/get_input.py  # Benchmark loader + shared degradation protocol
 │   ├── models/              # active frozen model wrappers
 │   ├── evals/
-│   │   ├── evals.py         # probes, budget sweeps, shared protocol constants
+│   │   ├── evals.py         # budget sweeps and shared protocol constants
+│   │   ├── probes/          # probe implementations and scoring
 │   │   ├── compat.py        # model × benchmark matrix -> which models run per benchmark
 │   │   ├── regimes/         # one file per regime; each owns domain assignment + splitting
 │   │   └── benchmarks/      # per-benchmark label + metric specs
@@ -305,7 +308,7 @@ compatibility matrix decides which models run on each):
 ```python
 BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis"]
 RUN_STAGES = ["gen_embeddings", "probing"]
-SPLIT_REGIMES = ["random_id", "geographic_ood"]
+SPLIT_REGIMES = ["random_id", "official", "geographic_ood", "spatial_cluster_ood"]
 ACTIVE_PROBES = ["logistic"]
 BUDGET_REGIMES = {
     "source": [0.05, 0.10, 0.25, 1.0],
@@ -319,7 +322,7 @@ Configuration reference:
 ```python
 BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis"]
 RUN_STAGES = ["gen_embeddings", "probing"]
-SPLIT_REGIMES = ["random_id", "geographic_ood"]
+SPLIT_REGIMES = ["random_id", "official", "geographic_ood", "spatial_cluster_ood"]
 ACTIVE_PROBES = ["logistic"]  # add "mlp" later if linear-probe gaps are ambiguous
 BUDGET_REGIMES = {
     "source": [0.05, 0.10, 0.25, 1.0],
@@ -362,7 +365,7 @@ match the official v1.1 inference code.
 
 | Benchmark | Available holdouts |
 |---|---|
-| `cropharvest` | `togo`, `ethiopia`, `lem-brazil`, `rwanda`, `togo-eval` |
+| `cropharvest` | `kenya`, `togo`, `ethiopia`, `lem-brazil`, `rwanda` |
 | `eurocropsml` | `Estonia` |
 | `breizhcrops` | `frh04` |
 

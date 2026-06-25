@@ -34,9 +34,18 @@ from dataio.get_input import (
 
 BENCHMARK = "eurocropsml"
 LABEL_KIND = "multiclass"
-HOLDOUTS = ["Estonia"]  # train Latvia+Portugal -> test Estonia (official transnational split)
-# Crop-type task with parcel-center coordinates present for every parcel.
-SPLIT_REGIMES = ["random_id", "geographic_ood"]
+HOLDOUTS = ["Estonia"]
+OFFICIAL_HOLDOUTS = ["Estonia"]
+GEOGRAPHIC_HOLDOUTS = ["Estonia", "Latvia", "Portugal"]
+GEOGRAPHIC_PURGE_KM = 25.0
+SPATIAL_CLUSTER_SPLIT = {
+    "label": "spatial_cluster_purge25km",
+    "n_clusters": 9,
+    "val_fraction": 0.10,
+    "test_fraction": 0.20,
+    "purge_km": 25.0,
+}
+SPLIT_REGIMES = ["random_id", "official", "geographic_ood", "spatial_cluster_ood"]
 HCAT_PREFIX = 6  # truncate the 10-digit HCAT code to this many leading digits (crop-type level)
 
 # --- Raw npz band layout ----------------------------------------------------
