@@ -1,5 +1,5 @@
-"""Vendored AgriFM video_swin_transformer.py — SwinTransformer3D for the S2 model.
-
+"""
+Vendored AgriFM video_swin_transformer.py — SwinTransformer3D for the S2 model.
 Stubs out mmseg registries so no compiled mmcv is needed.
 """
 

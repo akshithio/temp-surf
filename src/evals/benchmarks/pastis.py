@@ -1,8 +1,4 @@
-"""Benchmark: PASTIS-R crop-type semantic segmentation.
-
-The published split is fixed: folds 1-3 train, fold 4 validates, and fold 5
-tests. Class 19 is void and is removed; background class 0 remains evaluated.
-"""
+"""PASTIS-R crop-type semantic segmentation."""
 
 from __future__ import annotations
 
@@ -20,7 +16,8 @@ from dataio.get_input import (
     NativeSeries,
     _synthetic_month_doy,
 )
-from evals.probes import FeatureTransform, _apply, fit_probe_multiclass, score_segmentation_streamed
+from evals.confounds import score_segmentation_streamed
+from evals.probes import FeatureTransform, _apply, fit_probe_multiclass
 from utils import perfutils as perf
 
 BENCHMARK = "pastis"
@@ -29,15 +26,18 @@ TRAIN_FOLDS = {1, 2, 3}
 VAL_FOLDS = {4}
 TEST_FOLDS = {5}
 HOLDOUTS = [5]
-# Fold-based regimes (run via the dense path, not the classification sweep). Each regime
-# owns its fold logic in evals/regimes/<regime>.py (iter_fold_splits):
-#   random_id      = published 1-3/4/5 fold assignment -> PASTIS's in-distribution baseline.
-#   geographic_ood = leave-one-spatial-fold-out (the deployment regime, supports worst-region).
-SPLIT_REGIMES = ["random_id", "geographic_ood"]
+OFFICIAL_HOLDOUTS = [5]
+GEOGRAPHIC_HOLDOUTS = [1, 2, 3, 4, 5]
+SPLIT_REGIMES = ["random_id", "official", "geographic_ood", "spatial_cluster_ood"]
+SPATIAL_CLUSTER_SPLIT = {
+    "label": "spatial_cluster_purge2km",
+    "n_clusters": 12,
+    "val_fraction": 0.10,
+    "test_fraction": 0.20,
+    "purge_km": 2.0,
+}
 IGNORE_INDEX = 19
 
-# PASTIS DATA_S2 is (T, 10, 128, 128) in this 10-band order. DATA_S1A is
-# (T, 3, 128, 128) as VV, VH, VV/VH. The semantic target is channel 0 of
 # ANNOTATIONS/TARGET_<id>.npy (20 classes: 0=background, 1-18 crops, 19=void).
 PASTIS_S2_BANDS = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12"]
 PASTIS_S1_BANDS = ["VV", "VH", "VV/VH"]
@@ -48,7 +48,7 @@ PASTIS_TILE_SIZE = 64
 
 @dataclass(frozen=True)
 class PastisPatch:
-    """Paths and temporal metadata for one lazily loaded PASTIS-R patch."""
+    """One PASTIS-R patch."""
 
     patch_id: int
     fold: int
@@ -57,20 +57,12 @@ class PastisPatch:
     target_path: Path
     s2_months: np.ndarray
     s1_months: np.ndarray
+    latlon: tuple[float, float]
 
 
 @dataclass(frozen=True)
 class PastisTile:
-    """One NATIVE-cadence 64x64 PASTIS-R tile passed to dense models.
-
-    ``s2`` / ``s1`` are ``(T, C, H, W)`` at the patch's native acquisition cadence (NO temporal
-    aggregation here); ``s2_months`` / ``s1_months`` are each acquisition's calendar month (0-11).
-    Each model does its OWN temporal handling in its encode path -- Galileo/OlmoEarth/raw/Presto
-    monthly-composite (Galileo/OlmoEarth fuse modalities on a common monthly grid; Presto/raw are
-    month-cadence models), TESSERA consumes the full per-modality cadence, AgriFM resamples to its
-    frame count. ``s2_mask`` / ``s1_mask`` are all-ones (every native acquisition is a real
-    observation), kept for the dense models that read a per-timestep availability mask.
-    """
+    """One native-cadence 64x64 PASTIS-R tile."""
 
     s2: np.ndarray
     s1: np.ndarray
@@ -81,6 +73,7 @@ class PastisTile:
     labels: np.ndarray
     valid: np.ndarray
     fold: int
+    latlon: tuple[float, float]
 
     @property
     def height(self) -> int:
@@ -99,17 +92,13 @@ class PastisTile:
             self.labels.reshape(-1),
             self.valid.reshape(-1),
             self.fold,
+            self.latlon,
         )
 
 
 @dataclass(frozen=True)
 class PastisBenchmark:
-    """Lazy PASTIS-R release descriptor.
-
-    The release is roughly 69 GB and its monthly S2 tensor alone would occupy
-    about 19 GB in memory.  This object therefore stores only file records.
-    ``iter_tiles`` materializes one 64x64 tile at a time.
-    """
+    """Lazy PASTIS-R release descriptor."""
 
     name: str
     label_kind: str
@@ -127,13 +116,17 @@ class PastisBenchmark:
         tiles_per_patch = (128 // self.tile_size) ** 2
         return np.repeat([patch.fold for patch in self.patches], tiles_per_patch).astype(np.int64)
 
-    def iter_tiles(self, folds: set[int] | None = None):
-        """Yield ``(tile_id, fold, native_tile, labels)`` lazily, at the patch's NATIVE cadence.
+    @property
+    def patch_latlon(self) -> dict[int, tuple[float, float]]:
+        return {patch.patch_id: patch.latlon for patch in self.patches}
 
-        Pixels with the PASTIS void label (19) are removed. Background (0) is retained because it is
-        an evaluated class in the published protocol. No temporal aggregation happens here -- each
-        model aggregates the native cadence in its own encode path (see ``PastisTile``).
-        """
+    @property
+    def latlon(self) -> np.ndarray:
+        tiles_per_patch = (128 // self.tile_size) ** 2
+        return np.repeat([patch.latlon for patch in self.patches], tiles_per_patch, axis=0).astype(np.float32)
+
+    def iter_tiles(self, folds: set[int] | None = None):
+        """Yield native-cadence tiles."""
         for patch in self.patches:
             if folds is not None and patch.fold not in folds:
                 continue
@@ -151,7 +144,7 @@ class PastisBenchmark:
                     valid = labels != self.ignore_index
                     tile_id = f"{patch.patch_id}_{row // self.tile_size}_{col // self.tile_size}"
                     tile = PastisTile(
-                        s2=np.asarray(s2[:, :, ys, xs], dtype=np.float32),  # one tile materialized from mmap
+                        s2=np.asarray(s2[:, :, ys, xs], dtype=np.float32),
                         s1=np.asarray(s1[:, :, ys, xs], dtype=np.float32),
                         s2_months=patch.s2_months,
                         s1_months=patch.s1_months,
@@ -160,6 +153,7 @@ class PastisBenchmark:
                         labels=labels,
                         valid=valid,
                         fold=patch.fold,
+                        latlon=patch.latlon,
                     )
                     yield tile_id, patch.fold, tile, labels[valid]
 
@@ -174,6 +168,42 @@ def _pastis_months(dates_field) -> np.ndarray:
     d = dates_field if isinstance(dates_field, dict) else json.loads(dates_field)
     items = sorted(d.items(), key=lambda kv: int(kv[0]))
     return np.array([((int(v) // 100) % 100) - 1 for _, v in items], dtype=np.int64)
+
+
+def _geometry_latlon(geometry: dict[str, Any] | None) -> tuple[float, float]:
+    def valid(lat: float, lon: float) -> bool:
+        return -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0
+
+    if geometry:
+        try:
+            from shapely.geometry import shape
+
+            point = shape(geometry).centroid
+            lat, lon = float(point.y), float(point.x)
+            if valid(lat, lon):
+                return (lat, lon)
+        except Exception:
+            pass
+
+    coords: list[tuple[float, float]] = []
+
+    def walk(value) -> None:
+        if not isinstance(value, list | tuple) or not value:
+            return
+        if len(value) >= 2 and all(isinstance(v, int | float) for v in value[:2]):
+            coords.append((float(value[0]), float(value[1])))
+            return
+        for child in value:
+            walk(child)
+
+    walk((geometry or {}).get("coordinates", []))
+    if not coords:
+        return (np.nan, np.nan)
+    lon = float(np.mean([c[0] for c in coords]))
+    lat = float(np.mean([c[1] for c in coords]))
+    if valid(lat, lon):
+        return (lat, lon)
+    return (np.nan, np.nan)
 
 
 def _monthly_patch(values: np.ndarray, months: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -198,14 +228,8 @@ def _pastis_pixel_benchmark(
     labels: np.ndarray,
     valid: np.ndarray,
     fold: int,
+    latlon: tuple[float, float],
 ) -> Benchmark:
-    """Convert one NATIVE-cadence spatial tile to a bounded batch of valid pixel time series.
-
-    ``s2`` / ``s1`` are ``(T, C, H, W)`` at the native acquisition cadence; ``s2_months`` /
-    ``s1_months`` give each acquisition's calendar month. Every native acquisition is a real
-    observation, so a pixel's per-modality series is the full cadence -- Presto then composites it to
-    monthly, TESSERA uses it whole.
-    """
     _, _, height, width = s2.shape
     t_s2, t_s1 = s2.shape[0], s1.shape[0]
     s2_pixels = s2.transpose(2, 3, 0, 1).reshape(height * width, t_s2, -1)[valid]
@@ -234,7 +258,7 @@ def _pastis_pixel_benchmark(
         native=native,
         labels=labels[valid].astype(np.int64),
         groups=np.full(n, fold, dtype=np.int64),
-        latlon=np.zeros((n, 2), dtype=np.float32),
+        latlon=np.repeat(np.asarray([latlon], dtype=np.float32), n, axis=0),
         years=np.full(n, 2019, dtype=np.int64),
     )
 
@@ -255,7 +279,7 @@ def load_benchmark(
     if not (base / "metadata.geojson").exists():
         raise FileNotFoundError(f"PASTIS metadata not found: {base / 'metadata.geojson'}")
     geo = json.loads((base / "metadata.geojson").read_text())
-    rows = [feature["properties"] for feature in geo["features"]]
+    rows = [{**feature["properties"], "_latlon": _geometry_latlon(feature.get("geometry"))} for feature in geo["features"]]
     if folds:
         rows = [row for row in rows if int(row["Fold"]) in folds]
     order = np.arange(len(rows))
@@ -284,12 +308,11 @@ def load_benchmark(
                 target_path=target_path,
                 s2_months=_pastis_months(r["dates-S2"]),
                 s1_months=_pastis_months(r["dates-S1A"]),
+                latlon=r["_latlon"],
             )
         )
 
     if missing:
-        # A partial release must be visible: don't silently evaluate over the patches that happen
-        # to be present. Loud warning; raise under OVERWRITE_MODE so a partial release fails outright.
         msg = f"PASTIS: {missing}/{len(order)} metadata patches have missing .npy files in {base}"
         if os.environ.get("OVERWRITE_MODE", "").strip().lower() not in ("", "0", "false", "no"):
             raise ValueError(msg + " (OVERWRITE_MODE is set)")

@@ -1,4 +1,10 @@
-"""Probe fitting, scoring, and calibration primitives."""
+"""Probe families, fitting, scoring, and calibration.
+
+Three probe families are provided: logistic regression, MLP, and kNN.
+Each has its own hyper-parameter grid and build function. The module
+also exposes binary scoring (with F1-threshold calibration) and
+multiclass scoring (with shared-vs-unseen-class decomposition).
+"""
 
 from __future__ import annotations
 
@@ -24,72 +30,91 @@ from sklearn.preprocessing import StandardScaler
 
 from utils import perfutils as perf
 
-# --------------------------------------------------------------------------- #
-# Probe hyper-parameters
-# --------------------------------------------------------------------------- #
 
-PROBE_SOLVER = "liblinear"
-PROBE_MULTICLASS_SOLVER = "lbfgs"
-PROBE_MAX_ITER = 20000
-PROBE_TOL = 1e-5
+# ── Logistic regression probe ────────────────────────────────────────────────
 
-# --------------------------------------------------------------------------- #
-# Probe families (the probe-capacity ablation axis)
-# --------------------------------------------------------------------------- #
-# The primary protocol is `logistic` (the canonical frozen-feature linear probe).
-# `mlp` (higher-capacity head) and `knn` (probe-free; a generic standardized inverse-distance
-# kNN -- a capacity ablation, NOT a replication of OlmoEarth's normalized/temperature-weighted
-# kNN eval) exist to test
-# whether an observed geographic gap is caused by the *linear probe* or by the
-# *encoder*: if the gap persists under mlp/knn it is an encoder property; if it
-# vanishes under mlp it is a "linearly inaccessible from source-only" finding.
-PROBE_FAMILIES: list[str] = ["logistic", "mlp", "knn"]
-
-# Per-family hyperparameter grid, each selected on the regime's val set. Same SIZE (5)
-# across families so no family gets a larger search budget.
-# Set a grid to a single value to disable that family's tuning.
-PROBE_GRIDS: dict[str, list[float]] = {
-    "logistic": [0.01, 0.1, 1.0, 10.0, 100.0],  # C (inverse L2 strength)
-    "mlp": [1e-4, 1e-3, 1e-2, 1e-1, 1.0],        # alpha (L2), fixed 2-layer arch below
-    "knn": [5, 10, 20, 50, 100],                  # n_neighbors (cosine distance)
-}
-PROBE_DEFAULT_HP: dict[str, float] = {"logistic": 1.0, "mlp": 1e-3, "knn": 20}
-PROBE_C_GRID: list[float] = PROBE_GRIDS["logistic"]  # backward-compat alias
-
-MLP_HIDDEN: tuple[int, ...] = (256, 128)  # 2-layer head (≈ TESSERA's PASTIS MLP capacity)
-PROBE_MLP_MAX_ITER: int = 500
+LINEAR_SOLVER = "liblinear"
+LINEAR_MULTICLASS_SOLVER = "lbfgs"
+LINEAR_MAX_ITER = 20_000
+LINEAR_TOL = 1e-5
+LINEAR_GRID: list[float] = [0.01, 0.1, 1.0, 10.0, 100.0]
+LINEAR_DEFAULT_HP = 1.0
 
 
-def _build_probe(family: str, hp: float, *, solver: str, seed: int, n_fit: int):
-    """Build a standardized probe pipeline for ``family`` at hyperparameter ``hp``.
-
-    Only ``logistic`` uses ``solver``/``class_weight``; ``mlp`` and ``knn`` are class-
-    balanced upstream by resampling (see :func:`_class_balanced_resample`), so all three
-    train on balanced data. ``knn`` neighbors are clamped to the training size.
-    """
-    if family == "logistic":
-        clf = LogisticRegression(
-            C=hp, max_iter=PROBE_MAX_ITER, class_weight="balanced", solver=solver, tol=PROBE_TOL, random_state=seed,
-        )
-    elif family == "mlp":
-        clf = MLPClassifier(hidden_layer_sizes=MLP_HIDDEN, alpha=hp, max_iter=PROBE_MLP_MAX_ITER, random_state=seed)
-    elif family == "knn":
-        clf = KNeighborsClassifier(n_neighbors=max(1, min(int(hp), n_fit - 1)), metric="cosine", weights="distance")
-    else:
-        raise ValueError(f"Unknown probe family {family!r}; known: {PROBE_FAMILIES}")
+def _build_logistic(hp: float, *, solver: str, seed: int, n_fit: int) -> Any:
+    del n_fit
+    clf = LogisticRegression(
+        C=hp,
+        max_iter=LINEAR_MAX_ITER,
+        class_weight="balanced",
+        solver=solver,
+        tol=LINEAR_TOL,
+        random_state=seed,
+    )
     return make_pipeline(StandardScaler(), clf)
 
 
-def _class_balanced_resample(x: np.ndarray, y: np.ndarray, seed: int):
-    """Resample ``(x, y)`` to a class-balanced set of ~the same total size.
+# ── MLP probe ────────────────────────────────────────────────────────────────
 
-    Used for families with no ``class_weight`` option (``mlp``, ``knn``) so EVERY probe
-    family trains on class-balanced data: ``logistic`` balances via
-    ``class_weight="balanced"`` (the paper-faithful config), ``mlp``/``knn`` via this
-    resample. Bounded to the original size (each class drawn ``len(y) // n_classes``
-    times, with replacement only when oversampling), so many-class crop-type does not
-    blow up. Deterministic in ``seed`` so the grid sweep is stable.
-    """
+MLP_HIDDEN: tuple[int, ...] = (256, 128)
+MLP_MAX_ITER = 500
+MLP_GRID: list[float] = [1e-4, 1e-3, 1e-2, 1e-1, 1.0]
+MLP_DEFAULT_HP = 1e-3
+
+
+def _build_mlp(hp: float, *, solver: str, seed: int, n_fit: int) -> Any:
+    del solver, n_fit
+    clf = MLPClassifier(hidden_layer_sizes=MLP_HIDDEN, alpha=hp, max_iter=MLP_MAX_ITER, random_state=seed)
+    return make_pipeline(StandardScaler(), clf)
+
+
+# ── KNN probe ────────────────────────────────────────────────────────────────
+
+KNN_GRID: list[float] = [5, 10, 20, 50, 100]
+KNN_DEFAULT_HP = 20
+
+
+def _build_knn(hp: float, *, solver: str, seed: int, n_fit: int) -> Any:
+    del solver, seed
+    clf = KNeighborsClassifier(
+        n_neighbors=max(1, min(int(hp), n_fit - 1)),
+        metric="cosine",
+        weights="distance",
+    )
+    return make_pipeline(StandardScaler(), clf)
+
+
+# ── Probe dispatch ───────────────────────────────────────────────────────────
+
+PROBE_FAMILIES: list[str] = ["logistic", "mlp", "knn"]
+PROBE_MAX_ITER_BY_FAMILY: dict[str, int] = {"logistic": LINEAR_MAX_ITER, "mlp": MLP_MAX_ITER, "knn": -1}
+PROBE_GRIDS: dict[str, list[float]] = {
+    "logistic": LINEAR_GRID,
+    "mlp": MLP_GRID,
+    "knn": KNN_GRID,
+}
+PROBE_DEFAULT_HP: dict[str, float] = {
+    "logistic": LINEAR_DEFAULT_HP,
+    "mlp": MLP_DEFAULT_HP,
+    "knn": KNN_DEFAULT_HP,
+}
+PROBE_C_GRID: list[float] = PROBE_GRIDS["logistic"]
+
+
+def _build_probe(family: str, hp: float, *, solver: str, seed: int, n_fit: int) -> Any:
+    if family == "logistic":
+        return _build_logistic(hp, solver=solver, seed=seed, n_fit=n_fit)
+    if family == "mlp":
+        return _build_mlp(hp, solver=solver, seed=seed, n_fit=n_fit)
+    if family == "knn":
+        return _build_knn(hp, solver=solver, seed=seed, n_fit=n_fit)
+    raise ValueError(f"Unknown probe family {family!r}; known: {PROBE_FAMILIES}")
+
+
+# ── Shared helpers ───────────────────────────────────────────────────────────
+
+
+def _class_balanced_resample(x: np.ndarray, y: np.ndarray, seed: int):
     rng = np.random.default_rng(seed)
     classes = np.unique(y)
     per_class = max(1, len(y) // len(classes))
@@ -103,11 +128,6 @@ def _class_balanced_resample(x: np.ndarray, y: np.ndarray, seed: int):
 
 
 def _fit_probe(x: np.ndarray, y: np.ndarray, *, family: str, hp: float, solver: str, seed: int):
-    """Fit a probe of ``family`` at ``hp``; return ``(clf, n_iter, convergence_warnings)``.
-
-    ``mlp``/``knn`` (no ``class_weight``) are fit on a class-balanced resample so every
-    family handles imbalance equivalently; ``logistic`` uses ``class_weight="balanced"``.
-    """
     if family in ("mlp", "knn"):
         x, y = _class_balanced_resample(x, y, seed)
     clf = _build_probe(family, hp, solver=solver, seed=seed, n_fit=len(y))
@@ -119,18 +139,12 @@ def _fit_probe(x: np.ndarray, y: np.ndarray, *, family: str, hp: float, solver: 
     n_iter = int(np.max(estimator.n_iter_)) if hasattr(estimator, "n_iter_") else -1
     return clf, n_iter, convergence_warnings
 
-# --------------------------------------------------------------------------- #
-# Feature-transform hook
-# --------------------------------------------------------------------------- #
+
+# ── Feature-transform protocol ───────────────────────────────────────────────
+
 
 class FeatureTransform(Protocol):
-    """A fitted robustness method: a pure map on the frozen embedding space.
-
-    This is the (currently dormant) post-hoc-adaptation hook. A future method would fit itself
-    (using invariant pairs, unlabeled target features, group labels, ...) and, by the time it
-    reaches ``run_probes``, already be fitted; the probe just applies ``transform`` to train and
-    test features identically. ``None`` means the ERM baseline — the only mode used right now.
-    """
+    """Feature-space transform hook."""
 
     def transform(self, x: np.ndarray) -> np.ndarray: ...
 
@@ -139,9 +153,7 @@ def _apply(transform: FeatureTransform | None, x: np.ndarray) -> np.ndarray:
     return x if transform is None else transform.transform(x)
 
 
-# --------------------------------------------------------------------------- #
-# Calibrated binary probe
-# --------------------------------------------------------------------------- #
+# ── Binary probe fitting and scoring ─────────────────────────────────────────
 
 
 def best_f1_threshold(y_true: np.ndarray, prob: np.ndarray) -> float:
@@ -170,17 +182,7 @@ def fit_probe_with_calibration(
     family: str = "logistic",
     tune_internal: bool = False,
 ) -> tuple[Any, float, int, int, dict[str, Any]]:
-    """Fit a binary probe of ``family`` and an F1 threshold on a validation set.
-
-    The hyperparameter (``C`` for logistic, ``alpha`` for mlp, ``n_neighbors`` for knn)
-    is swept over ``PROBE_GRIDS[family]`` and selected by val AUC; the probe is fit on
-    all of ``x_train`` and the threshold calibrated on ``x_cal``. With no usable val it
-    falls back to the legacy 80/20 internal split at the family's default hyperparameter.
-
-    ``tune_internal`` (used by the target-ID oracle): with no external val, select the
-    hyperparameter on a held-out internal split of ``x_train`` and then REFIT on ALL of
-    ``x_train`` -- so the final model trains on the full pool, source-free, while still tuning.
-    """
+    """Fit a binary probe and calibrate an F1 threshold."""
     grid = PROBE_GRIDS[family]
     use_external = (
         x_cal is not None and len(x_cal) > 0 and y_cal is not None and len(np.unique(y_cal)) == 2
@@ -189,16 +191,15 @@ def fit_probe_with_calibration(
         f"probe.fit/binary/{family}",
         n_samples=len(y_train), n_features=x_train.shape[1], n_classes=len(np.unique(y_train)),
     ):
-        cal_prob = None  # set by tune_internal to OUT-OF-FOLD probabilities for the threshold
+        cal_prob = None
         if not use_external and tune_internal and len(y_train) >= 20 and len(np.unique(y_train)) == 2 \
                 and min(np.bincount(y_train)) >= 4:
-            # select HP on an internal val (disjoint from its selection-fit), then REFIT on ALL train.
             idx = np.arange(len(y_train))
             fit_idx, cal_idx = train_test_split(idx, test_size=0.20, random_state=seed, stratify=y_train)
             best = None
             for hp in grid:
                 clf_i, _, _ = _fit_probe(
-                    x_train[fit_idx], y_train[fit_idx], family=family, hp=hp, solver=PROBE_SOLVER, seed=seed
+                    x_train[fit_idx], y_train[fit_idx], family=family, hp=hp, solver=LINEAR_SOLVER, seed=seed
                 )
                 try:
                     score = float(roc_auc_score(y_train[cal_idx], clf_i.predict_proba(x_train[cal_idx])[:, 1]))
@@ -206,23 +207,19 @@ def fit_probe_with_calibration(
                     score = 0.0
                 if best is None or score > best[0]:
                     best = (score, hp, clf_i)
-            chosen_hp, clf_oof = best[1], best[2]  # clf_oof was trained WITHOUT cal_idx
+            chosen_hp, clf_oof = best[1], best[2]
             clf, n_iter, convergence_warnings = _fit_probe(
-                x_train, y_train, family=family, hp=chosen_hp, solver=PROBE_SOLVER, seed=seed
+                x_train, y_train, family=family, hp=chosen_hp, solver=LINEAR_SOLVER, seed=seed
             )
             cal_x, cal_y = x_train[cal_idx], y_train[cal_idx]
-            # OUT-OF-FOLD threshold: calibrate on the selection model's probs for cal_idx (which it
-            # never trained on), not the full-pool refit's in-sample probs (that was optimistic).
             cal_prob = clf_oof.predict_proba(cal_x)[:, 1]
             n_fit, n_cal = len(y_train), len(cal_idx)
             calibration_source = "target_internal_tuned_oof"
             grid_size = len(grid)
         elif use_external:
-            # Fit on ALL of train at each grid point, pick by val AUC (threshold-free),
-            # then calibrate the threshold on the same val.
             best = None
             for hp in grid:
-                clf, n_iter, cw = _fit_probe(x_train, y_train, family=family, hp=hp, solver=PROBE_SOLVER, seed=seed)
+                clf, n_iter, cw = _fit_probe(x_train, y_train, family=family, hp=hp, solver=LINEAR_SOLVER, seed=seed)
                 val_auc = float(roc_auc_score(y_cal, clf.predict_proba(x_cal)[:, 1]))
                 if best is None or val_auc > best[0]:
                     best = (val_auc, hp, clf, n_iter, cw)
@@ -239,7 +236,7 @@ def fit_probe_with_calibration(
                 fit_idx = cal_idx = idx
             chosen_hp = PROBE_DEFAULT_HP[family]
             clf, n_iter, convergence_warnings = _fit_probe(
-                x_train[fit_idx], y_train[fit_idx], family=family, hp=chosen_hp, solver=PROBE_SOLVER, seed=seed
+                x_train[fit_idx], y_train[fit_idx], family=family, hp=chosen_hp, solver=LINEAR_SOLVER, seed=seed
             )
             cal_x, cal_y = x_train[cal_idx], y_train[cal_idx]
             n_fit, n_cal = len(fit_idx), len(cal_idx)
@@ -247,9 +244,9 @@ def fit_probe_with_calibration(
             grid_size = 1
     probe_meta = {
         "probe_family": family,
-        "probe_solver": PROBE_SOLVER if family == "logistic" else family,
-        "probe_max_iter": PROBE_MAX_ITER,
-        "probe_tol": PROBE_TOL,
+        "probe_solver": LINEAR_SOLVER if family == "logistic" else family,
+        "probe_max_iter": PROBE_MAX_ITER_BY_FAMILY[family],
+        "probe_tol": LINEAR_TOL if family == "logistic" else float("nan"),
         "probe_n_iter": n_iter,
         "probe_converged": int(len(convergence_warnings) == 0),
         "probe_convergence_warnings": len(convergence_warnings),
@@ -259,14 +256,14 @@ def fit_probe_with_calibration(
         "probe_C": chosen_hp if family == "logistic" else float("nan"),
         "probe_grid_size": grid_size,
     }
-    if cal_prob is None:  # tune_internal supplies out-of-fold probs; otherwise use this clf's
+    if cal_prob is None:
         cal_prob = clf.predict_proba(cal_x)[:, 1]
     threshold = best_f1_threshold(cal_y, cal_prob)
     return clf, threshold, int(n_fit), int(n_cal), probe_meta
 
 
 def expected_calibration_error(y_true: np.ndarray, prob: np.ndarray, n_bins: int = 10) -> float:
-    """ECE: mean absolute gap between accuracy and confidence per bin, weighted by bin size."""
+    """Expected calibration error."""
     bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
     bin_indices = np.digitize(prob, bin_edges[1:-1])
     ece = 0.0
@@ -283,19 +280,12 @@ def expected_calibration_error(y_true: np.ndarray, prob: np.ndarray, n_bins: int
 def score_binary(
     clf: Any, threshold: float, x_test: np.ndarray, y_test: np.ndarray, return_per_sample: bool = False
 ) -> dict[str, float] | tuple[dict[str, float], dict[str, np.ndarray]]:
-    """Default-threshold and calibrated-threshold binary metrics.
-
-    Probability-quality metrics (Brier, NLL/log-loss) complement ECE: ECE is
-    bin-sensitive and noisy on small holdouts, while Brier and NLL are proper
-    scoring rules that score the full predictive distribution. If
-    ``return_per_sample`` is set, also returns the per-sample prediction arrays
-    (y_true / prob / pred_default / pred_calibrated) for artifact logging.
-    """
+    """Binary probe metrics."""
     with perf.measure("probe.score/binary", n_samples=len(y_test), n_features=x_test.shape[1]):
         pred = clf.predict(x_test)
         prob = clf.predict_proba(x_test)[:, 1]
         calibrated_pred = (prob >= threshold).astype(np.int64)
-    two_class = len(np.unique(y_test)) == 2  # roc_auc / log_loss need both classes present
+    two_class = len(np.unique(y_test)) == 2
     test_optimal_threshold = best_f1_threshold(y_test, prob)
     calibrated_pred_target_optimal = (prob >= test_optimal_threshold).astype(np.int64)
     scores = {
@@ -309,7 +299,7 @@ def score_binary(
         "ece": expected_calibration_error(y_test, prob),
         "brier": float(brier_score_loss(y_test, prob)),
         "nll": float(log_loss(y_test, prob, labels=[0, 1])),
-        "test_pos_rate": float(np.mean(y_test)),  # test-set prevalence -> no-skill floor for F1/accuracy
+        "test_pos_rate": float(np.mean(y_test)),
     }
     n_classes = len(np.unique(y_test))
     perf.log_static("probe.macs/binary", macs=x_test.shape[1] * n_classes, n_samples=len(y_test))
@@ -324,9 +314,7 @@ def score_binary(
     return scores
 
 
-# --------------------------------------------------------------------------- #
-# Multiclass probe
-# --------------------------------------------------------------------------- #
+# ── Multiclass probe fitting and scoring ─────────────────────────────────────
 
 
 def fit_probe_multiclass(
@@ -338,16 +326,7 @@ def fit_probe_multiclass(
     family: str = "logistic",
     tune_internal: bool = False,
 ) -> tuple[Any, dict[str, Any]]:
-    """Fit a multiclass probe of ``family`` (no threshold calibration).
-
-    When a validation set ``(x_val, y_val)`` is supplied, the family's hyperparameter is
-    swept over ``PROBE_GRIDS[family]`` and selected by val balanced accuracy (the same
-    equal-budget grid used by the binary probe). Otherwise the default is used.
-
-    ``tune_internal`` (target-ID oracle): with no external val, select the hyperparameter on a
-    held-out internal split of ``x_train`` and REFIT on ALL of ``x_train`` -- full-pool fit,
-    source-free, still tuned.
-    """
+    """Fit a multiclass probe."""
     grid = PROBE_GRIDS[family]
     use_val = x_val is not None and len(x_val) > 0 and y_val is not None and len(y_val) > 0
     with perf.measure(
@@ -363,21 +342,21 @@ def fit_probe_multiclass(
             best = None
             for hp in grid:
                 clf_i, _, _ = _fit_probe(
-                    x_train[fit_idx], y_train[fit_idx], family=family, hp=hp, solver=PROBE_MULTICLASS_SOLVER, seed=seed
+                    x_train[fit_idx], y_train[fit_idx], family=family, hp=hp, solver=LINEAR_MULTICLASS_SOLVER, seed=seed
                 )
                 score = float(balanced_accuracy_score(y_train[cal_idx], clf_i.predict(x_train[cal_idx])))
                 if best is None or score > best[0]:
                     best = (score, hp)
             chosen_hp = best[1]
             clf, n_iter, convergence_warnings = _fit_probe(
-                x_train, y_train, family=family, hp=chosen_hp, solver=PROBE_MULTICLASS_SOLVER, seed=seed
+                x_train, y_train, family=family, hp=chosen_hp, solver=LINEAR_MULTICLASS_SOLVER, seed=seed
             )
             grid_size = len(grid)
         elif use_val:
             best = None
             for hp in grid:
                 clf, n_iter, cw = _fit_probe(
-                    x_train, y_train, family=family, hp=hp, solver=PROBE_MULTICLASS_SOLVER, seed=seed
+                    x_train, y_train, family=family, hp=hp, solver=LINEAR_MULTICLASS_SOLVER, seed=seed
                 )
                 val_score = float(balanced_accuracy_score(y_val, clf.predict(x_val)))
                 if best is None or val_score > best[0]:
@@ -387,13 +366,13 @@ def fit_probe_multiclass(
         else:
             chosen_hp = PROBE_DEFAULT_HP[family]
             clf, n_iter, convergence_warnings = _fit_probe(
-                x_train, y_train, family=family, hp=chosen_hp, solver=PROBE_MULTICLASS_SOLVER, seed=seed
+                x_train, y_train, family=family, hp=chosen_hp, solver=LINEAR_MULTICLASS_SOLVER, seed=seed
             )
             grid_size = 1
     probe_meta = {
         "probe_family": family,
-        "probe_solver": PROBE_MULTICLASS_SOLVER if family == "logistic" else family,
-        "probe_max_iter": PROBE_MAX_ITER,
+        "probe_solver": LINEAR_MULTICLASS_SOLVER if family == "logistic" else family,
+        "probe_max_iter": PROBE_MAX_ITER_BY_FAMILY[family],
         "probe_n_iter": n_iter,
         "probe_converged": int(len(convergence_warnings) == 0),
         "probe_convergence_warnings": len(convergence_warnings),
@@ -420,18 +399,10 @@ def score_multiclass(
     n_classes = len(getattr(clf, "classes_", []))
     perf.log_static("probe.macs/multiclass", macs=x_test.shape[1] * max(n_classes, 1), n_samples=len(y_test))
     _vals, _counts = np.unique(y_test, return_counts=True)
-    # Shared-vs-unseen-class decomposition. A source-only probe can NEVER predict a class absent
-    # from its training set (``clf.classes_``), so a transfer gap on the full label space mixes
-    # representation degradation with label-SUPPORT mismatch (target-only classes). ``shared_*``
-    # restrict scoring to test samples whose true class WAS seen in training (representation only);
-    # ``unseen_prevalence`` / ``n_classes_unseen`` size the support mismatch so the two are not
-    # collapsed into one robustness number (EuroCropsML's Estonia holdout has target-only crops).
     seen = np.asarray(getattr(clf, "classes_", []))
     seen_mask = np.isin(y_test, seen) if seen.size else np.zeros(len(y_test), dtype=bool)
     n_unseen = int(len(set(np.unique(y_test).tolist()) - set(seen.tolist())))
     with warnings.catch_warnings():
-        # Expected for multiclass at small label budgets: the probe can predict a class
-        # absent from this test split. The metric handles it; the warning is just noise.
         warnings.filterwarnings("ignore", message="y_pred contains classes not in y_true")
         scores = {
             "macro_f1": float(f1_score(y_test, pred, average="macro", zero_division=0)),
@@ -439,7 +410,7 @@ def score_multiclass(
             "balanced_accuracy": float(balanced_accuracy_score(y_test, pred)),
             "accuracy": float(accuracy_score(y_test, pred)),
             "macro_auc": macro_auc,
-            "test_n_classes": int(len(_vals)),  # for the chance/no-skill floor
+            "test_n_classes": int(len(_vals)),
             "test_majority_rate": float(_counts.max() / len(y_test)),
             "n_classes_seen": int(seen.size),
             "n_classes_unseen": n_unseen,
@@ -464,8 +435,3 @@ def score_multiclass(
         }
         return scores, per_sample
     return scores
-
-
-# Segmentation scoring is implemented in evals.confounds; re-exported here for
-# callers/tests that import all probe scoring from this module.
-from evals.confounds import per_class_iou, score_segmentation, score_segmentation_streamed  # noqa: E402,F401

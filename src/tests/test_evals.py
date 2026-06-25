@@ -4,13 +4,19 @@ import numpy as np
 import pytest
 
 from evals import evals as EV
+from evals.confounds import score_segmentation, score_segmentation_streamed
+from evals.probes import expected_calibration_error
+from evals.regimes import base as regime_base
+from evals.regimes import geographic_ood, official
+from evals.regimes.geographic_ood import make_strict_holdout_splits
+from evals.regimes.random_id import make_splits
 
 
 def test_make_strict_holdout_splits() -> None:
     y = np.array([0, 1, 0, 1, 0, 1, 0, 1])
     groups = np.array(["src1", "src1", "src2", "src2", "hold", "hold", "src3", "src3"], dtype=object)
 
-    train, val, test, train_val = EV.make_strict_holdout_splits(y, groups, "hold", seed=0)
+    train, val, test, train_val = make_strict_holdout_splits(y, groups, "hold", seed=0)
 
     assert set(test.tolist()) == {4, 5}
     assert set(train).isdisjoint(test)
@@ -20,15 +26,105 @@ def test_make_strict_holdout_splits() -> None:
     assert np.all(groups[val] != "hold")
 
 
+def test_geographic_holdout_validation_is_whole_source_domain() -> None:
+    y = np.array([0, 1] * 4)
+    groups = np.array(["A", "A", "B", "B", "C", "C", "D", "D"], dtype=object)
+
+    train, val, test, _train_val = make_strict_holdout_splits(
+        y, groups, "B", seed=0, require_domain_val=True
+    )
+
+    assert set(groups[test]) == {"B"}
+    assert set(groups[val]) == {"C"}
+    assert set(groups[train]) == {"A", "D"}
+
+
+def test_geographic_ood_fixed_split_is_one_partition() -> None:
+    y = np.array([0, 1] * 6)
+    groups = np.array(["train"] * 4 + ["val"] * 4 + ["test"] * 4, dtype=object)
+
+    [split] = list(
+        geographic_ood.iter_splits(
+            y,
+            groups,
+            seed=0,
+            holdouts={"label": "fixed", "train": ["train"], "val": ["val"], "test": ["test"]},
+        )
+    )
+
+    assert split.label == "fixed"
+    assert set(groups[split.train]) == {"train"}
+    assert set(groups[split.val]) == {"val"}
+    assert set(groups[split.test]) == {"test"}
+
+
 def test_make_splits_falls_back_when_a_class_is_singleton() -> None:
     y = np.array([0, 0, 0, 1, 1, 2, 3, 4, 5, 6])
 
-    train, val, test = EV.make_splits(y, seed=0)
+    train, val, test = make_splits(y, seed=0)
 
     assert len(set(train) & set(val)) == 0
     assert len(set(train) & set(test)) == 0
     assert len(set(val) & set(test)) == 0
     assert sorted(np.concatenate([train, val, test]).tolist()) == list(range(len(y)))
+
+
+def test_official_pastis_split_uses_published_folds() -> None:
+    class _Bench:
+        TRAIN_FOLDS = {1, 2, 3}
+        VAL_FOLDS = {4}
+        TEST_FOLDS = {5}
+
+    cfg = list(official.iter_fold_splits(_Bench))[0]
+
+    assert cfg.label == "fold_5"
+    assert cfg.train_folds == {1, 2, 3}
+    assert cfg.val_folds == {4}
+    assert cfg.test_folds == {5}
+    assert cfg.has_target is True
+
+
+def test_geographic_pastis_split_is_leave_one_fold_out() -> None:
+    class _Bench:
+        TRAIN_FOLDS = {1, 2, 3}
+        VAL_FOLDS = {4}
+        TEST_FOLDS = {5}
+
+    cfgs = list(geographic_ood.iter_fold_splits(_Bench))
+    fold_5 = [cfg for cfg in cfgs if cfg[0] == "fold_5"][0]
+
+    assert len(cfgs) == 5
+    assert fold_5 == ("fold_5", {2, 3, 4}, {1}, {5})
+
+
+def test_random_pastis_split_is_patch_level(tmp_path) -> None:
+    class _Bench:
+        TRAIN_FOLDS = {1, 2, 3}
+        VAL_FOLDS = {4}
+        TEST_FOLDS = {5}
+
+    for fold in range(1, 6):
+        fold_dir = tmp_path / f"fold_{fold}"
+        fold_dir.mkdir()
+        for patch in range(fold * 100, fold * 100 + 4):
+            np.save(fold_dir / f"{patch}_0_0.labels.npy", np.array([0, 1], dtype=np.int64))
+
+    [(regime, cfg)] = list(
+        regime_base.segmentation_fold_configs(_Bench, ["random_id"], seed=0, emb_dir=tmp_path, overwrite_mode=True)
+    )
+    train = cfg.train_patches
+    val = cfg.val_patches
+    test = cfg.test_patches
+
+    assert regime == "random_id"
+    assert cfg.label == "random_patch"
+    assert cfg.train_folds == {1, 2, 3, 4, 5}
+    assert cfg.has_target is False
+    assert train and val and test
+    assert train.isdisjoint(val)
+    assert train.isdisjoint(test)
+    assert val.isdisjoint(test)
+    assert len(train | val | test) == 20
 
 
 def test_subset_indices() -> None:
@@ -45,7 +141,19 @@ def test_expected_calibration_error() -> None:
     y = np.array([0, 0, 1, 1])
     prob = np.array([0.0, 0.0, 1.0, 1.0])
 
-    assert EV.expected_calibration_error(y, prob, n_bins=2) == 0.0
+    assert expected_calibration_error(y, prob, n_bins=2) == 0.0
+
+
+def test_probe_family_modules_build_expected_estimators() -> None:
+    from evals.probes import _build_logistic, _build_mlp, _build_knn
+
+    linear_probe = _build_logistic(1.0, solver="liblinear", seed=0, n_fit=8)
+    mlp_probe = _build_mlp(1e-3, solver="unused", seed=0, n_fit=8)
+    knn_probe = _build_knn(20, solver="unused", seed=0, n_fit=8)
+
+    assert linear_probe.steps[-1][1].__class__.__name__ == "LogisticRegression"
+    assert mlp_probe.steps[-1][1].__class__.__name__ == "MLPClassifier"
+    assert knn_probe.steps[-1][1].__class__.__name__ == "KNeighborsClassifier"
 
 
 def test_metric_roles_label_deployment_and_diagnostic_metrics() -> None:
@@ -280,7 +388,6 @@ def test_segmentation_probe_reports_official_validation_and_test_splits() -> Non
         y_train,
         y_val,
         seed=0,
-        # full-fold streaming eval: each split presented as a single in-memory "tile"
         eval_streams={
             "validation": lambda: iter([(x_val, y_val)]),
             "test": lambda: iter([(x_test, y_test)]),
@@ -295,11 +402,6 @@ def test_segmentation_probe_reports_official_validation_and_test_splits() -> Non
 
 
 def test_streamed_segmentation_matches_whole_array_scoring() -> None:
-    """Streaming tiles into the confusion-based scorer gives the exact same mIoU / pixel-accuracy as
-    scoring the concatenation in one shot -- so full-fold streaming is a faithful (not approximate)
-    replacement for the old capped-sample scoring."""
-    from evals.probes import score_segmentation, score_segmentation_streamed
-
     eval_classes = np.arange(19, dtype=np.int64)
     rng = np.random.default_rng(0)
 
@@ -321,8 +423,6 @@ def test_streamed_segmentation_matches_whole_array_scoring() -> None:
 
 
 def test_streamed_segmentation_rejects_invalid_labels() -> None:
-    from evals.probes import score_segmentation_streamed
-
     class _Clf:
         def predict(self, x):
             return np.array([0, 99])
@@ -366,7 +466,7 @@ def test_domain_confound_report_flags_geography_entanglement() -> None:
     from evals.confounds import domain_confound_report
 
     geography = np.array(["PT", "PT", "EE", "EE", "LV", "LV"])
-    year = np.array([2020, 2021, 2020, 2021, 2020, 2021])  # each country spans both years -> independent
+    year = np.array([2020, 2021, 2020, 2021, 2020, 2021])
     rep = domain_confound_report(
         {"geography": geography, "year": year, "class": np.zeros(6)}
     )

@@ -41,6 +41,19 @@ class Split:
     domain: str | None = None
 
 
+@dataclass(frozen=True)
+class DenseSplit:
+    label: str
+    train_folds: set[int]
+    val_folds: set[int]
+    test_folds: set[int]
+    train_patches: set[int] | None = None
+    val_patches: set[int] | None = None
+    test_patches: set[int] | None = None
+    has_target: bool = False
+    group_kind: str = "geography"
+
+
 def geography_domains(bench) -> np.ndarray:
     """Default domain assignment: the benchmark's native region/source groups."""
     return np.asarray(bench.groups, dtype=object)
@@ -56,6 +69,28 @@ def clear_regime_problems() -> None:
 def load_regime(regime_name: str):
     """Import a split-regime module."""
     return importlib.import_module(f"evals.regimes.{regime_name}")
+
+
+def holdouts_for(bench_mod, regime_name: str):
+    if regime_name == "official":
+        return getattr(bench_mod, "OFFICIAL_HOLDOUTS", getattr(bench_mod, "HOLDOUTS", []))
+    if regime_name == "geographic_ood":
+        if hasattr(bench_mod, "GEOGRAPHIC_SPLIT"):
+            return bench_mod.GEOGRAPHIC_SPLIT
+        return getattr(bench_mod, "GEOGRAPHIC_HOLDOUTS", getattr(bench_mod, "HOLDOUTS", []))
+    if regime_name == "spatial_cluster_ood":
+        return getattr(bench_mod, "SPATIAL_CLUSTER_SPLIT", {})
+    return getattr(bench_mod, "HOLDOUTS", [])
+
+
+def val_group_for(bench_mod, regime_name: str):
+    if regime_name == "official":
+        return getattr(bench_mod, "OFFICIAL_VAL_HOLDOUT", getattr(bench_mod, "VAL_HOLDOUT", None))
+    if regime_name == "geographic_ood":
+        return getattr(bench_mod, "GEOGRAPHIC_VAL_HOLDOUT", None)
+    if regime_name == "spatial_cluster_ood":
+        return None
+    return None
 
 
 def regime_problem(benchmark: str, regime: str, reason: str, *, overwrite_mode: bool) -> None:
@@ -110,7 +145,7 @@ def iter_splits(split_regime, bench, y, holdouts, seed, *, overwrite_mode: bool,
     n_splits = 0
     yielded_labels: set[str] = set()
     yielded_domains: set[str] = set()
-    for split in regime.iter_splits(y, domains, seed=seed, holdouts=holdouts, val_group=val_group):
+    for split in regime.iter_splits(y, domains, seed=seed, holdouts=holdouts, val_group=val_group, bench=bench):
         n_splits += 1
         yielded_labels.add(str(split.label))
         yielded_domains.add(str(getattr(split, "domain", None) or split.label))
@@ -124,7 +159,7 @@ def iter_splits(split_regime, bench, y, holdouts, seed, *, overwrite_mode: bool,
             f"produced 0 splits (domain labels seen: {shown})",
             overwrite_mode=overwrite_mode,
         )
-    elif getattr(regime, "USES_CURATED_HOLDOUTS", False):
+    elif getattr(regime, "USES_CURATED_HOLDOUTS", False) and not isinstance(holdouts, dict):
         missing = [str(h) for h in (holdouts or []) if str(h) not in yielded_labels]
         if missing:
             regime_problem(
@@ -145,10 +180,30 @@ def iter_splits(split_regime, bench, y, holdouts, seed, *, overwrite_mode: bool,
             )
 
 
-def segmentation_fold_configs(bench_mod, regimes, *, overwrite_mode: bool):
+def _dense_split_from_tuple(regime, item) -> DenseSplit:
+    if isinstance(item, DenseSplit):
+        return item
+    label, train_folds, val_folds, test_folds = item
+    return DenseSplit(
+        str(label),
+        set(train_folds),
+        set(val_folds),
+        set(test_folds),
+        has_target=bool(getattr(regime, "HAS_TARGET", False)),
+        group_kind=str(getattr(regime, "GROUP_KIND", "geography")),
+    )
+
+
+def segmentation_fold_configs(bench_mod, regimes, *, seed: int, emb_dir, overwrite_mode: bool, bench=None):
     """Yield dense fold configs for segmentation regimes."""
     for regime_name in regimes:
-        fold_iter = getattr(load_regime(regime_name), "iter_fold_splits", None)
+        regime = load_regime(regime_name)
+        dense_iter = getattr(regime, "iter_dense_splits", None)
+        fold_iter = getattr(regime, "iter_fold_splits", None)
+        if dense_iter is not None:
+            for item in dense_iter(bench_mod, emb_dir=emb_dir, seed=seed, bench=bench):
+                yield regime_name, _dense_split_from_tuple(regime, item)
+            continue
         if fold_iter is None:
             regime_problem(
                 getattr(bench_mod, "BENCHMARK", "?"),
@@ -157,8 +212,8 @@ def segmentation_fold_configs(bench_mod, regimes, *, overwrite_mode: bool):
                 overwrite_mode=overwrite_mode,
             )
             continue
-        for label, train_folds, val_folds, test_folds in fold_iter(bench_mod):
-            yield (regime_name, label, train_folds, val_folds, test_folds)
+        for item in fold_iter(bench_mod):
+            yield regime_name, _dense_split_from_tuple(regime, item)
 
 
 def _append_prediction_rows(
@@ -357,18 +412,21 @@ def _split_manifest_entry(
     return row
 
 
-def _dense_fold_stats(emb_dir, folds: set[int]) -> dict[str, Any]:
+def _dense_fold_stats(emb_dir, folds: set[int], patch_ids: set[int] | None = None) -> dict[str, Any]:
     """Exact dense label/domain stats for cached PASTIS fold partitions."""
     class_counts: dict[str, int] = {}
     domain_counts: dict[str, int] = {}
     n_tiles = 0
     patches: set[int] = set()
+    wanted = {int(p) for p in patch_ids} if patch_ids is not None else None
     for fold in sorted(folds):
         fold_dir = emb_dir / f"fold_{int(fold)}"
         for label_path in sorted(fold_dir.glob("*.labels.npy")):
+            patch_id = int(label_path.name.split("_", 1)[0])
+            if wanted is not None and patch_id not in wanted:
+                continue
             labels = np.asarray(np.load(label_path, mmap_mode="r"), dtype=np.int64)
             n_tiles += 1
-            patch_id = int(label_path.name.split("_", 1)[0])
             patches.add(patch_id)
             domain_counts[str(int(fold))] = domain_counts.get(str(int(fold)), 0) + int(len(labels))
             for label, count in _value_counts(labels).items():
@@ -393,6 +451,9 @@ def _segmentation_split_manifest_entry(
     train_folds: set[int],
     val_folds: set[int],
     test_folds: set[int],
+    train_patches: set[int] | None = None,
+    val_patches: set[int] | None = None,
+    test_patches: set[int] | None = None,
     emb_dir,
 ) -> dict[str, Any]:
     """Describe one dense fold split with exact cached-pixel class counts."""
@@ -413,13 +474,12 @@ def _segmentation_split_manifest_entry(
         "domain_basis": "geography",
         "holdout": str(holdout),
     }
-    add_part(row, "train", _dense_fold_stats(emb_dir, train_folds))
-    add_part(row, "val", _dense_fold_stats(emb_dir, val_folds))
-    add_part(row, "test", _dense_fold_stats(emb_dir, test_folds))
+    add_part(row, "train", _dense_fold_stats(emb_dir, train_folds, train_patches))
+    add_part(row, "val", _dense_fold_stats(emb_dir, val_folds, val_patches))
+    add_part(row, "test", _dense_fold_stats(emb_dir, test_folds, test_patches))
     return row
 
 
 def _write_split_manifest(results_dir, rows: list[dict[str, Any]]) -> None:
     """Write the split audit artifact beside the probe outputs."""
     IOU.write_json(results_dir / "split_manifest.json", {"splits": rows})
-

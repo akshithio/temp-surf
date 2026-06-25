@@ -58,10 +58,12 @@ def _delta_rows(extra_regimes=()):
 
 
 def test_compute_deltas_surfaces_secondary_ood_regimes():
-    rows = _delta_rows(extra_regimes=("geographic_ood",))
+    rows = _delta_rows(extra_regimes=("official",))
     out = [r for r in IOU.compute_deltas(rows, ["auc"], n_boot=100, seed=0) if r["metric"] == "auc"]
-    r = out[0]
-    assert r["delta_ci_lo"] <= r["delta"] <= r["delta_ci_hi"]
+    by_regime = {r["ood_regime"]: r for r in out}
+    assert {"official", "geographic_ood"} <= set(by_regime)
+    assert by_regime["geographic_ood"]["delta_ci_lo"] <= by_regime["geographic_ood"]["delta"]
+    assert by_regime["official"]["ood"] == 0.63
 
 
 def test_sample_ci_filters_to_anchor_budgets():
@@ -373,7 +375,7 @@ def test_leave_one_domain_out_dropped_domain_surfaced(monkeypatch):
             return np.array(["A", "A", "B", "B", "C", "C"], dtype=object)
 
         @staticmethod
-        def iter_splits(y, groups, *, seed, holdouts, val_group=None):
+        def iter_splits(y, groups, *, seed, holdouts, val_group=None, **_):
             for d in ("A", "B"):           # C is silently dropped (degenerate) -> must be surfaced
                 idx = np.flatnonzero(groups == d)
                 tr = np.flatnonzero(groups != d)

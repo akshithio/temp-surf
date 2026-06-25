@@ -1,10 +1,4 @@
-"""Benchmark-agnostic evaluation protocol: constants, sweep orchestration.
-
-Scope:
-  * shared protocol constants (holdouts, budgets, metrics)
-  * budget-sweep orchestration (``_sweep_budgets``, ``_sweep_target_budgets``)
-  * per-benchmark public runners (``run_probes*``)
-"""
+"""Benchmark-agnostic evaluation entry points."""
 
 from __future__ import annotations
 
@@ -14,21 +8,14 @@ from typing import Any
 
 import numpy as np
 
-from evals.probes import (  # noqa: F401
+from evals.probes import (
     FeatureTransform,
-    _apply,
-    expected_calibration_error,
     fit_probe_multiclass,
     fit_probe_with_calibration,
     score_binary,
     score_multiclass,
 )
 from evals.regimes import base as regime_base
-
-# Split-regime constructors now live with their regimes (evals/regimes/<regime>.py);
-# re-exported here so existing callers (EV.make_splits, ...) keep working.
-from evals.regimes.geographic_ood import make_strict_holdout_splits  # noqa: F401
-from evals.regimes.random_id import make_splits  # noqa: F401
 from utils import perfutils as perf
 
 for _thread_var in [
@@ -61,7 +48,7 @@ def _validate_source_budgets(budgets: list[float | int]) -> None:
 
 
 def _budget_lists(budget_regimes: dict[str, list[float | int]] | None) -> tuple[list[float | int], list[float | int]]:
-    """Return source and target budget lists, defaulting to the protocol constants."""
+    """Return validated budget lists."""
     if budget_regimes is None:
         return list(SOURCE_BUDGETS), list(ALL_TARGET_BUDGETS)
     missing = {"source", "target"} - set(budget_regimes)
@@ -77,24 +64,13 @@ def _budget_lists(budget_regimes: dict[str, list[float | int]] | None) -> tuple[
     return source, target
 
 
-# --------------------------------------------------------------------------- #
-# Protocol constants
-# --------------------------------------------------------------------------- #
 SOURCE_BUDGETS: list[float] = [0.05, 0.10, 0.25, 1.00]
 TARGET_BUDGETS: list[int | float] = [5, 10, 25, 50]
 
-# Sentinel for the in-distribution target upper bound:
-#   Train on 80% of the target region (no source), test on the remaining 20%.
-#   Provides the "how good can we get on this region if trained in-distribution?"
-#   baseline, used to separate transfer loss from inherent regional difficulty.
 TARGET_ID_UPPER_BOUND: int = -1
 
-# Extended target budgets including the strict geographic holdout (0) and the
-# target-ID upper bound (-1).
 ALL_TARGET_BUDGETS: list[int | float] = [0, *TARGET_BUDGETS, TARGET_ID_UPPER_BOUND]
 
-# Reported metrics per label family. calibrated_* use a source-validation threshold
-# rather than 0.5 -- default-0.5 F1 misrepresents transfer under distribution shift.
 METRICS_BINARY_BASE: list[str] = [
     "f1",
     "auc",
@@ -104,8 +80,8 @@ METRICS_BINARY_BASE: list[str] = [
     "calibrated_f1_target_optimal",
     "optimal_threshold_test",
     "ece",
-    "brier",  # proper scoring rule: mean squared prob error (lower better)
-    "nll",    # negative log-likelihood / log-loss (lower better)
+    "brier",
+    "nll",
 ]
 METRICS_BINARY_WORST_GROUP: list[str] = [
     "worst_group_f1",
@@ -130,8 +106,6 @@ METRICS_MULTICLASS_WORST_GROUP: list[str] = [
     "worst_group_accuracy",
     "worst_group_score",
 ]
-# Shared-vs-unseen-class decomposition (see probes.score_multiclass): isolates representation loss
-# (shared_*) from target-only label-support mismatch (unseen_prevalence / n_classes_unseen).
 METRICS_MULTICLASS_SHARED: list[str] = [
     "shared_macro_f1",
     "shared_balanced_accuracy",
@@ -164,8 +138,6 @@ METRIC_ROLES: dict[str, dict[str, list[str]]] = {
         "deployment": ["macro_f1", "balanced_accuracy", "worst_group_macro_f1", "worst_group_balanced_accuracy"],
         "diagnostic": [
             "weighted_f1", "accuracy", "macro_auc",
-            # representation-only (shared classes) vs the target-only support mismatch that the
-            # full-label gap also absorbs -- report these alongside, never collapsed into the gap.
             "shared_macro_f1", "shared_balanced_accuracy", "shared_accuracy",
             "unseen_prevalence", "n_classes_unseen", "n_classes_seen",
         ],
@@ -175,11 +147,6 @@ METRIC_ROLES: dict[str, dict[str, list[str]]] = {
         "diagnostic": ["pixel_accuracy", "macro_f1", "weighted_f1", "n_tiles_scored"],
     },
 }
-
-# --------------------------------------------------------------------------- #
-# Target-budget sweep: sample N target labels for training, rest stays as test
-# --------------------------------------------------------------------------- #
-
 
 def run_probes(
     rows: list[dict[str, Any]],
@@ -200,7 +167,7 @@ def run_probes(
     y_val: np.ndarray | None = None,
     family: str = "logistic",
 ) -> None:
-    """Binary calibrated-probe budget sweep (source-fraction budgets)."""
+    """Run binary source-budget probes."""
     _validate_source_budgets(budgets)
 
     def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False):
@@ -246,12 +213,7 @@ def run_probes_target(
     y_val: np.ndarray | None = None,
     family: str = "logistic",
 ) -> None:
-    """Binary calibrated-probe *target-budget* sweep.
-
-    Includes budgets 0 (strict geographic holdout, train on source only),
-    TARGET_BUDGETS (few-shot target training), and TARGET_ID_UPPER_BOUND
-    (target-ID upper bound, train on 80 % of target only).
-    """
+    """Run binary target-budget probes."""
 
     def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False):
         clf, threshold, n_fit, n_cal, probe_meta = fit_probe_with_calibration(
@@ -300,11 +262,7 @@ def run_probes_multiclass(
     y_val: np.ndarray | None = None,
     family: str = "logistic",
 ) -> None:
-    """Multiclass logistic-probe source-budget sweep (crop-type classification).
-
-    The multiclass probe has no threshold to calibrate, but ``x_val``/``y_val`` (the
-    regime's held-out val) are used to select the L2 strength on a fixed grid.
-    """
+    """Run multiclass source-budget probes."""
     _validate_source_budgets(budgets)
 
     def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False):
@@ -343,13 +301,7 @@ def run_probes_multiclass_target(
     y_val: np.ndarray | None = None,
     family: str = "logistic",
 ) -> None:
-    """Multiclass target-budget sweep.
-
-    Includes budgets 0 (strict geographic holdout, train on source only),
-    TARGET_BUDGETS (few-shot target training), and TARGET_ID_UPPER_BOUND
-    (target-ID upper bound, train on 80 % of target only). ``x_val``/``y_val`` (the
-    regime's source-side val) select the L2 strength on a fixed grid.
-    """
+    """Run multiclass target-budget probes."""
 
     def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False):
         clf, probe_meta = fit_probe_multiclass(
@@ -416,23 +368,20 @@ def run_probes_segmentation_target(
         meta=meta, family=family, target_id_budget=TARGET_ID_UPPER_BOUND,
     )
 
-# --------------------------------------------------------------------------- #
 # Pair-level execution
-# --------------------------------------------------------------------------- #
 
 def load_benchmark(benchmark_name: str):
     return importlib.import_module(f"evals.benchmarks.{benchmark_name}")
 
 
 def build_methods(label_kind: str, seed: int):
-    """name -> (cls_or_none, kwargs). Only plain ERM for now."""
+    """Return enabled adaptation methods."""
     return {"erm": (None, {})}
 
 
 def _id_source_budget(source_budgets: list[float | int]) -> float | int:
-    """Prefer the explicit full-source anchor when choosing the ID row for deltas."""
+    """Select the source-budget anchor for deltas."""
     for budget in source_budgets:
         if abs(float(budget) - 1.0) < 1e-9:
             return budget
     return max(source_budgets)
-

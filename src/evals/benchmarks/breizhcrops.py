@@ -29,14 +29,19 @@ from dataio.get_input import (
 BENCHMARK = "breizhcrops"
 LABEL_KIND = "multiclass"
 HOLDOUTS = ["frh04"]  # paper's TEST region
-# Paper fold: frh01+frh02 train, frh03 validation, frh04 test. VAL_HOLDOUT makes frh03 the
-# validation region (not a random carve), so geographic_ood reproduces the published split
-# instead of scattering frh03/belle-ile into training.
 VAL_HOLDOUT = "frh03"
-# Region holdout is the only OOD axis here: crop-type task (phenology is label-confounded),
-# a single year 2017 (no forward-time split), and although parcels now carry real coordinates,
-# all of Brittany sits in one Köppen zone (no climate contrast to hold out).
-SPLIT_REGIMES = ["random_id", "geographic_ood"]
+OFFICIAL_HOLDOUTS = ["frh04"]
+OFFICIAL_VAL_HOLDOUT = "frh03"
+GEOGRAPHIC_HOLDOUTS = ["frh01", "frh02", "frh03", "frh04"]
+GEOGRAPHIC_PURGE_KM = 5.0
+SPATIAL_CLUSTER_SPLIT = {
+    "label": "spatial_cluster_purge5km",
+    "n_clusters": 8,
+    "val_fraction": 0.10,
+    "test_fraction": 0.20,
+    "purge_km": 5.0,
+}
+SPLIT_REGIMES = ["random_id", "official", "geographic_ood", "spatial_cluster_ood"]
 
 # The breizhcrops package returns L1C ``X`` as (T, 13) with bands in THIS order
 # (alphabetical), from which we keep the 10 S2 spectral bands + a computed NDVI.
