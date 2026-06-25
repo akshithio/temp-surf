@@ -77,8 +77,6 @@ METRICS_BINARY_BASE: list[str] = [
     "balanced_accuracy",
     "calibrated_f1",
     "calibrated_balanced_accuracy",
-    "calibrated_f1_target_optimal",
-    "optimal_threshold_test",
     "ece",
     "brier",
     "nll",
@@ -130,8 +128,8 @@ METRIC_ROLES: dict[str, dict[str, list[str]]] = {
             "worst_group_calibrated_balanced_accuracy",
         ],
         "diagnostic": [
-            "f1", "auc", "balanced_accuracy", "calibrated_f1_target_optimal",
-            "optimal_threshold_test", "ece", "brier", "nll",
+            "f1", "auc", "balanced_accuracy", "diagnostic_calibrated_f1_target_optimal",
+            "diagnostic_optimal_threshold_test", "ece", "brier", "nll",
         ],
     },
     "multiclass": {

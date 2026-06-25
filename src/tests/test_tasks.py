@@ -3,11 +3,14 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from evals import evals as EV
+from evals import probes
 from evals.benchmarks import breizhcrops, cropharvest, eurocropsml, pastis
 from evals.regimes import base as regime_base
 from evals.regimes import spatial_cluster_ood
+from utils import cacheutils, gputils
 
 
 def test_bin_crop_class_targets() -> None:
@@ -59,6 +62,54 @@ def test_spatial_cluster_regime_is_available_for_located_benchmarks() -> None:
         assert "spatial_cluster_ood" in mod.SPLIT_REGIMES
 
 
+def test_best_f1_threshold_falls_back_when_grid_scores_zero(capsys) -> None:
+    probes._F1_THRESHOLD_WARNED = False
+    threshold = probes.best_f1_threshold(np.array([0, 1]), np.array([np.nan, np.nan]))
+    assert threshold == 0.5
+    assert "degenerate" in capsys.readouterr().out
+
+
+def test_test_optimal_binary_metrics_are_not_aggregate_metrics() -> None:
+    assert "calibrated_f1_target_optimal" not in EV.METRICS_BINARY
+    assert "optimal_threshold_test" not in EV.METRICS_BINARY
+    assert "diagnostic_calibrated_f1_target_optimal" in EV.METRIC_ROLES["binary"]["diagnostic"]
+
+
+def test_hf_default_checkpoint_key_tracks_local_bytes(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "models" / "presto" / "model-f317d103.pth"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"AAAA")
+    monkeypatch.setattr(cacheutils, "_INPUT_BASE", tmp_path)
+    cacheutils._hash_file_content.cache_clear()
+    first = cacheutils._checkpoint_fingerprint("presto")
+    path.write_bytes(b"BBBBB")
+    cacheutils._hash_file_content.cache_clear()
+    assert cacheutils._checkpoint_fingerprint("presto") != first
+
+
+def test_invalid_shard_config_raises(monkeypatch) -> None:
+    monkeypatch.setenv(gputils.SHARD_ENV, "4")
+    monkeypatch.setenv(gputils.NUM_SHARDS_ENV, "4")
+    with pytest.raises(ValueError):
+        gputils.take_shard([1, 2, 3])
+    monkeypatch.delenv(gputils.SHARD_ENV)
+    monkeypatch.setenv("RB_SHARD_BASE", "3")
+    with pytest.raises(ValueError):
+        gputils.fan_out(num_shards=2)
+
+
+def test_dense_training_sample_is_pixel_random_not_tile_balanced(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_1"
+    fold_dir.mkdir()
+    np.save(fold_dir / "100_0_0.labels.npy", np.zeros(100, dtype=np.int64))
+    np.save(fold_dir / "100_0_0.npy", np.zeros((100, 2), dtype=np.float32))
+    np.save(fold_dir / "999_0_0.labels.npy", np.ones(2, dtype=np.int64))
+    np.save(fold_dir / "999_0_0.npy", np.ones((2, 2), dtype=np.float32))
+    _x, y, _groups, _tile_ids, patch_ids = cacheutils.load_dense_samples(tmp_path, {1}, 20, seed=0)
+    assert len(y) == 20
+    assert 999 not in set(patch_ids.tolist())
+
+
 def test_source_budget_probe_scores_source_diagnostics() -> None:
     rng = np.random.default_rng(3)
     x_train = rng.normal(size=(40, 4))
@@ -107,7 +158,7 @@ def test_spatial_cluster_pastis_split_is_patch_level(tmp_path) -> None:
             ["spatial_cluster_ood"],
             seed=0,
             emb_dir=tmp_path,
-            overwrite_mode=True,
+            strict_mode=True,
             bench=bench,
         )
     )

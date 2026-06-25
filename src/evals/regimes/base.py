@@ -84,15 +84,15 @@ def val_group_for(bench_mod, regime_name: str):
     return None
 
 
-def regime_problem(benchmark: str, regime: str, reason: str, *, overwrite_mode: bool) -> None:
+def regime_problem(benchmark: str, regime: str, reason: str, *, strict_mode: bool) -> None:
     """Surface a declared regime that did not run."""
     REGIME_PROBLEMS.append((benchmark, regime, reason))
-    if overwrite_mode:
+    if strict_mode:
         raise RuntimeError(f"declared regime did not run -- {benchmark}/{regime}: {reason}")
     bar = "!" * 78
     print(
         f"\n{bar}\n!! REGIME DECLARED BUT DID NOT RUN -- {benchmark}/{regime}\n!! {reason}"
-        f"\n!! (OVERWRITE_MODE is False for this run; it would be a hard failure with OVERWRITE_MODE=True)\n{bar}\n",
+        f"\n!! (STRICT_MODE is False for this run; it would be a hard failure with STRICT_MODE=True)\n{bar}\n",
         flush=True,
     )
 
@@ -108,8 +108,12 @@ def report_regime_problems() -> None:
     print(f"{bar}\n", flush=True)
 
 
-def iter_splits(split_regime, bench, y, holdouts, seed, *, overwrite_mode: bool, val_group=None):
+def iter_splits(
+    split_regime, bench, y, holdouts, seed, *, strict_mode: bool = False, overwrite_mode: bool | None = None, val_group=None
+):
     """Yield split metadata and regime-assigned domain labels."""
+    if overwrite_mode is not None:
+        strict_mode = bool(overwrite_mode)
     regime = load_regime(split_regime)
     bench_name = getattr(bench, "name", "?")
     try:
@@ -119,7 +123,7 @@ def iter_splits(split_regime, bench, y, holdouts, seed, *, overwrite_mode: bool,
             bench_name,
             split_regime,
             f"domain assignment failed ({type(exc).__name__}: {exc})",
-            overwrite_mode=overwrite_mode,
+            strict_mode=strict_mode,
         )
         return
     if len(domains) != len(y):
@@ -151,7 +155,7 @@ def iter_splits(split_regime, bench, y, holdouts, seed, *, overwrite_mode: bool,
             bench_name,
             split_regime,
             f"produced 0 splits (domain labels seen: {shown})",
-            overwrite_mode=overwrite_mode,
+            strict_mode=strict_mode,
         )
     elif getattr(regime, "USES_CURATED_HOLDOUTS", False) and not isinstance(holdouts, dict):
         missing = [str(h) for h in (holdouts or []) if str(h) not in yielded_labels]
@@ -160,7 +164,7 @@ def iter_splits(split_regime, bench, y, holdouts, seed, *, overwrite_mode: bool,
                 bench_name,
                 split_regime,
                 f"curated holdout(s) dropped (no valid split): {missing}",
-                overwrite_mode=overwrite_mode,
+                strict_mode=strict_mode,
             )
     elif getattr(regime, "LEAVE_ONE_DOMAIN_OUT", False):
         attempted = {str(d) for d in domains if str(d) not in ("unknown", "nan")}
@@ -170,7 +174,7 @@ def iter_splits(split_regime, bench, y, holdouts, seed, *, overwrite_mode: bool,
                 bench_name,
                 split_regime,
                 f"domain(s) dropped (no valid split): {missing}",
-                overwrite_mode=overwrite_mode,
+                strict_mode=strict_mode,
             )
 
 
@@ -188,8 +192,12 @@ def _dense_split_from_tuple(regime, item) -> DenseSplit:
     )
 
 
-def segmentation_fold_configs(bench_mod, regimes, *, seed: int, emb_dir, overwrite_mode: bool, bench=None):
+def segmentation_fold_configs(
+    bench_mod, regimes, *, seed: int, emb_dir, strict_mode: bool = False, overwrite_mode: bool | None = None, bench=None
+):
     """Yield dense fold configs for segmentation regimes."""
+    if overwrite_mode is not None:
+        strict_mode = bool(overwrite_mode)
     for regime_name in regimes:
         regime = load_regime(regime_name)
         dense_iter = getattr(regime, "iter_dense_splits", None)
@@ -203,7 +211,7 @@ def segmentation_fold_configs(bench_mod, regimes, *, seed: int, emb_dir, overwri
                 getattr(bench_mod, "BENCHMARK", "?"),
                 regime_name,
                 "no dense (segmentation) realization -- regime exposes no iter_fold_splits",
-                overwrite_mode=overwrite_mode,
+                strict_mode=strict_mode,
             )
             continue
         for item in fold_iter(bench_mod):

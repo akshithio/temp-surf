@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import functools
 import hashlib
 import importlib
@@ -41,15 +43,14 @@ MODELS: dict[str, tuple[str, str]] = {
     "tessera": ("models.tessera", "TesseraModel"),
 }
 
-EMB_DTYPE = "float16"
+EMB_DTYPE = "float32"
 
 
 class MissingEmbeddingCache(FileNotFoundError):
-    """Raised when a probing run requests an embedding cache that is absent."""
+    pass
 
 
 def _hash_files(*paths: str | Path) -> str:
-    """Short hash of source-file contents -- folds CODE into a cache key."""
     h = hashlib.sha256()
     for p in sorted(map(str, paths)):
         try:
@@ -67,16 +68,27 @@ def _atomic_tmp(path: Path) -> Path:
     return path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
 
 
+@contextlib.contextmanager
+def _cache_lock(path: Path):
+    lock_path = path.with_name(f".{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def _update_file_content_hash(path: str | Path, h: Any) -> None:
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
 
 
-def _input_fingerprint(bench_dir: Path) -> str:
-    """Fingerprint a dataset dir; deep mode hashes paths and bytes, top mode hashes directory stats."""
+def _input_fingerprint(bench_dir: Path, mode: str | None = None) -> str:
     h = hashlib.sha256()
-    mode = os.environ.get("DATA_FINGERPRINT", "deep").strip().lower()
+    mode = (mode or os.environ.get("DATA_FINGERPRINT", "deep")).strip().lower()
     try:
         if mode == "top":
             for e in sorted(bench_dir.iterdir(), key=lambda x: x.name):
@@ -98,45 +110,50 @@ def _input_fingerprint(bench_dir: Path) -> str:
     return h.hexdigest()[:10]
 
 
+@functools.lru_cache(maxsize=32)
+def _benchmark_input_fingerprint(benchmark: str, mode: str, _data_version: str) -> str:
+    return _input_fingerprint(INPUT_ROOT / benchmark, mode)
+
+
 def bench_tag(benchmark: str, kwargs: dict) -> str:
-    """Identity of an assembled benchmark: params + loader-code hash + input-data hash."""
     params = "_".join(f"{k}-{kwargs[k]}" for k in sorted(kwargs)) or "default"
     spec_path = REPO / "src" / (BENCHMARK_MODULES[benchmark].replace(".", "/") + ".py")
     code = _hash_files(BENCH_SRC, spec_path)
-    data = _input_fingerprint(INPUT_ROOT / benchmark)
     data_version = os.environ.get("DATA_VERSION", "").strip()
+    data = _benchmark_input_fingerprint(benchmark, os.environ.get("DATA_FINGERPRINT", "deep").strip().lower(), data_version)
     suffix = f"__dv-{data_version}" if data_version else ""
-    # OVERWRITE_MODE changes which samples survive loading (corrupt/missing are excluded vs raise),
-    # so it is part of the assembled-benchmark identity -- otherwise a permissive cache would be
-    # silently reused by a strict run, skipping the strict check entirely.
-    if os.environ.get("OVERWRITE_MODE", "").strip().lower() not in ("", "0", "false", "no"):
+    if os.environ.get("STRICT_MODE", "").strip().lower() not in ("", "0", "false", "no"):
         suffix += "__strict"
     return f"{params}__code-{code}__data-{data}{suffix}"
 
 
 def cached_bench(benchmark: str, tag: str, **kwargs):
-    """Load the assembled Benchmark from a content-keyed pickle cache (build on miss)."""
     path = CACHE_DIR / "benchmark" / f"{benchmark}__{tag}.pkl"
     if path.exists():
         try:
             return pickle.loads(path.read_bytes())
         except Exception:
             pass  # degraded/partial cache -> rebuild
-    with perf.measure(f"bench.load/{benchmark}", tag=tag):
-        bench = GI.get_input(benchmark, root=INPUT_ROOT, **kwargs)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _atomic_tmp(path)
-    try:
-        with open(tmp, "wb") as f:
-            pickle.dump(bench, f)
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
-    return bench
+    with _cache_lock(path):
+        if path.exists():
+            try:
+                return pickle.loads(path.read_bytes())
+            except Exception:
+                pass
+        with perf.measure(f"bench.load/{benchmark}", tag=tag):
+            bench = GI.get_input(benchmark, root=INPUT_ROOT, **kwargs)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _atomic_tmp(path)
+        try:
+            with open(tmp, "wb") as f:
+                pickle.dump(bench, f)
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return bench
 
 
 def build_model(name: str, **kwargs) -> Any:
-    """Instantiate a model, passing only accepted kwargs."""
     mod_path, cls_name = MODELS[name]
     cls = getattr(importlib.import_module(mod_path), cls_name)
     sig = inspect.signature(cls)
@@ -170,21 +187,7 @@ def _model_source_files(model_name: str) -> list[Path]:
     return files
 
 
-# Per-model checkpoint identity, folded into the embedding key so a weights change invalidates
-# stale embeddings. It MUST be download-independent (identical before and after an HF lazy
-# download), or a gen run (weights absent) and a later probe run (weights present) would key
-# differently and never hit the cache -- which is why there is no legacy fallback.
-#   * HF models  -> the pinned repo/filename/variant string. Changing the intended weights means
-#                   editing the wrapper, already captured by the wrapper-source hash.
-#   * local models -> size+mtime of the resolved file, so replacing the weights in place (the
-#                   exact stale-reuse scenario) yields a new key.
-# The HF pin includes the IMMUTABLE commit revision (must match the wrapper's *_HF_REVISION),
-# so a moved branch / re-uploaded weights file changes the key. value: (kind, env_var, default_rel, hf_pin)
-# The HF pin includes the weights revision AND (for pip-installed external model code: presto,
-# olmoearth) the pinned package revision, so changing either the weights or the model CODE
-# invalidates the embedding key. presto code commit must match sync.sh; olmoearth must match the
-# [tool.uv.sources] olmoearth-pretrain rev in pyproject.toml. (galileo runs on local galileoutil,
-# already covered by the model-source hash.)
+# Per-model checkpoint identity folded into embedding cache keys.
 _CHECKPOINT_SPECS: dict[str, tuple[str, str | None, str | None, str | None]] = {
     "presto": ("hf", None, None,
                "torchgeo/presto@44835fba5116ed5f000d5eea3973655985bf765b:model-f317d103.pth"
@@ -197,13 +200,15 @@ _CHECKPOINT_SPECS: dict[str, tuple[str, str | None, str | None, str | None]] = {
     "tessera": ("local", "TESSERA_WEIGHTS", "models/tessera/tessera_v1_1_mpc_encoder.pt", None),
     "raw": ("raw", None, None, None),  # no checkpoint; identity is the RAW_MODE featurization
 }
+_HF_DEFAULTS = {
+    "presto": ("models/presto/model-f317d103.pth", ("model-f317d103.pth",)),
+    "olmoearth": ("models/olmoearth-v1_1-base", ("config.json", "weights.pth")),
+    "galileo": ("models/galileo/base", ("config.json", "model.pt")),
+}
 
 
 @functools.lru_cache(maxsize=128)
 def _hash_file_content(path_str: str, size: int, mtime_ns: int) -> str:
-    """Whole-file sha (size + bytes), memoised by (path, size, mtime) so a multi-GB checkpoint is
-    read at most once per process even though the fingerprint is requested many times (per
-    benchmark, and again for the run signature)."""
     h = hashlib.sha256()
     h.update(str(size).encode())
     with open(path_str, "rb") as f:
@@ -213,7 +218,6 @@ def _hash_file_content(path_str: str, size: int, mtime_ns: int) -> str:
 
 
 def _local_weight_id(path: Path) -> str:
-    """Full-content id of a local checkpoint: fully immutable (any byte change -> new id)."""
     if path.is_dir():
         files = sorted(p for p in path.rglob("*") if p.is_file())
         return _hash_str("|".join(f"{f.relative_to(path)}:{_local_weight_id(f)}" for f in files))
@@ -221,20 +225,10 @@ def _local_weight_id(path: Path) -> str:
     return _hash_file_content(str(path), st.st_size, st.st_mtime_ns)
 
 
-# Checkpoints live under the INPUT base (data/input/models/...), NOT under INPUT_ROOT, which
-# points at data/input/benchmarks. Resolve them against the base so the default agrifm/tessera
-# paths match the wrappers' own resolution (otherwise the fingerprint stats a nonexistent path
-# and weight replacement never invalidates).
 _INPUT_BASE = INPUT_ROOT.parent
 
 
 def _checkpoint_fingerprint(model_name: str, weights_override: str | Path | None = None) -> str:
-    """Download-independent identity of a model's checkpoint, or '' if it has none.
-
-    ``weights_override`` is the EFFECTIVE weights path passed to the wrapper (e.g. via
-    ``enc_kwargs['weights_path']``); when given it takes precedence over the spec's default/env
-    resolution, so a custom checkpoint gets its own cache key instead of sharing another's.
-    """
     if weights_override:
         p = Path(weights_override).expanduser()
         if p.exists():
@@ -245,6 +239,12 @@ def _checkpoint_fingerprint(model_name: str, weights_override: str | Path | None
         return ""
     kind, env_name, default_rel, hf_pin = spec
     if kind == "hf":
+        local = _HF_DEFAULTS.get(model_name)
+        if local:
+            rel, required = local
+            path = _INPUT_BASE / rel
+            if all((path / r).exists() for r in required) if path.is_dir() else path.exists():
+                return _hash_str(f"hf:{hf_pin}:local:{_local_weight_id(path)}")[:10]
         return _hash_str(f"hf:{hf_pin}")[:10]
     if kind == "raw":  # raw baseline has no weights; its output depends on the featurization mode
         return _hash_str(f"raw:{os.environ.get('RAW_MODE', 'flatten')}")[:10]
@@ -258,7 +258,7 @@ def _checkpoint_fingerprint(model_name: str, weights_override: str | Path | None
 
 
 def _emb_sig(bench: Any, model_name: str, tag: str, weights_override=None) -> str:
-    base = f"n{bench.n_samples}_b{_hash_str(tag)}_e{_hash_files(*_model_source_files(model_name))}"
+    base = f"n{bench.n_samples}_d{EMB_DTYPE}_b{_hash_str(tag)}_e{_hash_files(*_model_source_files(model_name))}"
     fp = _checkpoint_fingerprint(model_name, weights_override)
     return f"{base}_w{fp}" if fp else base
 
@@ -337,31 +337,34 @@ def extract_and_cache(
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and not overwrite:
         return np.load(path).astype(np.float32, copy=False)
-    model = build_model(model_name, **enc_kwargs)
-    print(f"  encoding {model_name} ...", flush=True)
-    with perf.measure(f"encode/{model_name}", n_samples=bench.n_samples):
-        arr = model.encode(bench)
-    if not hasattr(model, "_macs"):
+    with _cache_lock(path):
+        if path.exists() and not overwrite:
+            return np.load(path).astype(np.float32, copy=False)
+        model = build_model(model_name, **enc_kwargs)
+        print(f"  encoding {model_name} ...", flush=True)
+        with perf.measure(f"encode/{model_name}", n_samples=bench.n_samples):
+            arr = model.encode(bench)
+        if not hasattr(model, "_macs"):
+            try:
+                model._macs = model.compute_macs()
+            except Exception as exc:
+                print(f"  (compute_macs failed for {model_name}: {type(exc).__name__}; recording 0)", flush=True)
+                model._macs = 0
+        perf.log_static(
+            f"encode/{model_name}",
+            macs=model._macs * bench.n_samples,
+            n_samples=bench.n_samples,
+            n_features=model.embedding_dim,
+        )
+        arr = arr.astype(EMB_DTYPE, copy=False)
+        tmp = _atomic_tmp(path)
         try:
-            model._macs = model.compute_macs()
-        except Exception as exc:
-            print(f"  (compute_macs failed for {model_name}: {type(exc).__name__}; recording 0)", flush=True)
-            model._macs = 0
-    perf.log_static(
-        f"encode/{model_name}",
-        macs=model._macs * bench.n_samples,
-        n_samples=bench.n_samples,
-        n_features=model.embedding_dim,
-    )
-    arr = arr.astype(EMB_DTYPE, copy=False)  # cache dtype; round BEFORE returning so a single-process
-    tmp = _atomic_tmp(path)  # run probes on the exact same values a two-stage load would.
-    try:
-        with open(tmp, "wb") as f:
-            np.save(f, arr)
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
-    return arr.astype(np.float32, copy=False)
+            with open(tmp, "wb") as f:
+                np.save(f, arr)
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return arr.astype(np.float32, copy=False)
 
 
 def extract_dense_and_cache(
@@ -372,12 +375,7 @@ def extract_dense_and_cache(
     overwrite: bool = False,
     **enc_kwargs,
 ) -> Path:
-    """Encode a lazy spatial benchmark one tile at a time.
-
-    Each tile is an independent cache entry, so a full PASTIS-R run never holds
-    the release or its complete feature tensor in memory and resumes at tile
-    granularity after interruption.
-    """
+    """Encode a lazy spatial benchmark one tile at a time."""
     root = dense_embedding_cache_dir(bench, benchmark, model_name, tag, enc_kwargs.get("weights_path"))
     root.mkdir(parents=True, exist_ok=True)
     model = None
@@ -388,33 +386,23 @@ def extract_dense_and_cache(
         label_path = fold_dir / f"{tile_id}.labels.npy"
         if feature_path.exists() and label_path.exists() and not overwrite:
             continue
-        if model is None:
-            model = build_model(model_name, **enc_kwargs)
-        with perf.measure(
-            f"encode_dense/{model_name}",
-            tile=tile_id,
-            fold=fold,
-            n_pixels=len(labels),
-        ):
-            if hasattr(model, "encode_dense"):
-                features = model.encode_dense(tile)
-            else:
-                features = model.encode(tile.pixel_benchmark())
-        if features.shape[0] != labels.shape[0]:
-            raise ValueError(
-                f"Dense model returned {features.shape[0]} rows for {labels.shape[0]} valid pixels"
-            )
-        for path, values, dtype in (
-            (feature_path, features, EMB_DTYPE),
-            (label_path, labels, "uint8"),
-        ):
-            tmp = _atomic_tmp(path)
-            try:
-                with open(tmp, "wb") as handle:
-                    np.save(handle, np.asarray(values, dtype=dtype))
-                os.replace(tmp, path)
-            finally:
-                tmp.unlink(missing_ok=True)
+        with _cache_lock(feature_path):
+            if feature_path.exists() and label_path.exists() and not overwrite:
+                continue
+            if model is None:
+                model = build_model(model_name, **enc_kwargs)
+            with perf.measure(f"encode_dense/{model_name}", tile=tile_id, fold=fold, n_pixels=len(labels)):
+                features = model.encode_dense(tile) if hasattr(model, "encode_dense") else model.encode(tile.pixel_benchmark())
+            if features.shape[0] != labels.shape[0]:
+                raise ValueError(f"Dense model returned {features.shape[0]} rows for {labels.shape[0]} valid pixels")
+            for path, values, dtype in ((feature_path, features, EMB_DTYPE), (label_path, labels, "uint8")):
+                tmp = _atomic_tmp(path)
+                try:
+                    with open(tmp, "wb") as handle:
+                        np.save(handle, np.asarray(values, dtype=dtype))
+                    os.replace(tmp, path)
+                finally:
+                    tmp.unlink(missing_ok=True)
     return root
 
 
@@ -432,10 +420,6 @@ def _dense_label_paths(emb_dir: Path, folds: set[int], patch_ids: set[int] | Non
 
 
 def dense_fold_patches(emb_dir: Path, folds: set[int]) -> list[int]:
-    """Sorted unique original 128x128 patch ids cached for ``folds`` (filename-only, no pixel load).
-
-    Used by the dense target sweep to draw its 80/20 split over whole patches.
-    """
     return sorted({int(p.name.split("_", 1)[0]) for p in _dense_label_paths(emb_dir, folds)})
 
 
@@ -446,28 +430,28 @@ def load_dense_samples(
     seed: int,
     patch_ids: set[int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load a deterministic bounded pixel SAMPLE from cached dense tile features -- for TRAINING.
-
-    Returns ``(features, labels, groups, tile_ids, patch_ids)``; ``patch_ids`` (per pixel) is the
-    original 128x128 patch each pixel belongs to. ``patch_ids=`` restricts to those patches (used to
-    build the target few-shot / oracle training pool). For EVALUATION use :func:`iter_dense_tiles`
-    (every pixel, streamed) -- this capped sample is appropriate only for fitting the probe.
-    """
     label_paths = _dense_label_paths(emb_dir, folds, patch_ids)
     if not label_paths:
         raise FileNotFoundError(f"No dense caches for folds {sorted(folds)} (patches={patch_ids}) under {emb_dir}")
     rng = np.random.default_rng(seed)
-    per_tile = max(1, int(np.ceil(max_pixels / len(label_paths))))
+    lengths = [len(np.load(p, mmap_mode="r")) for p in label_paths]
+    total = int(sum(lengths))
+    chosen = np.arange(total) if total <= max_pixels else np.sort(rng.choice(total, size=max_pixels, replace=False))
     feature_parts: list[np.ndarray] = []
     label_parts: list[np.ndarray] = []
     group_parts: list[np.ndarray] = []
     tile_parts: list[np.ndarray] = []
     patch_parts: list[np.ndarray] = []
-    for tile_idx, label_path in enumerate(label_paths):
+    start = 0
+    for tile_idx, (label_path, n) in enumerate(zip(label_paths, lengths, strict=True)):
+        stop = start + n
+        take = chosen[(chosen >= start) & (chosen < stop)] - start
+        start = stop
+        if len(take) == 0:
+            continue
         feature_path = label_path.with_name(label_path.name.replace(".labels.npy", ".npy"))
         labels = np.load(label_path, mmap_mode="r")
         features = np.load(feature_path, mmap_mode="r")
-        take = rng.choice(len(labels), size=min(per_tile, len(labels)), replace=False)
         fold = int(label_path.parent.name.removeprefix("fold_"))
         patch_id = int(label_path.name.split("_", 1)[0])  # filename is "{patch}_{row}_{col}.labels.npy"
         feature_parts.append(np.asarray(features[take], dtype=np.float32))
@@ -480,20 +464,10 @@ def load_dense_samples(
     groups = np.concatenate(group_parts)
     tile_ids = np.concatenate(tile_parts)
     patch_ids_out = np.concatenate(patch_parts)
-    if len(y) > max_pixels:
-        take = rng.choice(len(y), size=max_pixels, replace=False)
-        x, y, groups, tile_ids, patch_ids_out = x[take], y[take], groups[take], tile_ids[take], patch_ids_out[take]
     return x, y, groups, tile_ids, patch_ids_out
 
 
 def iter_dense_tiles(emb_dir: Path, folds: set[int], patch_ids: set[int] | None = None):
-    """Yield ``(features (n, D) float32, labels (n,) int64)`` for EVERY cached tile -- full, no
-    subsample -- optionally restricted to an original-patch set.
-
-    This is the full-fold streaming evaluation source: scoring a probe tile-by-tile over every
-    valid pixel gives the exact fold mIoU (and credible per-tile worst-case), instead of the noisy
-    estimate a capped pixel sample would give. One tile (<=64x64 pixels) is in memory at a time.
-    """
     for label_path in _dense_label_paths(emb_dir, folds, patch_ids):
         feature_path = label_path.with_name(label_path.name.replace(".labels.npy", ".npy"))
         labels = np.asarray(np.load(label_path), dtype=np.int64)

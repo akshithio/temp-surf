@@ -1,5 +1,3 @@
-"""Run-stage validation, result signatures, and resume-state helpers."""
-
 from __future__ import annotations
 
 import os
@@ -13,7 +11,6 @@ from utils import perfutils as perf
 VALID_RUN_STAGES = {"gen_embeddings", "probing"}
 
 def validate_run_stages(run_stages: list[str]) -> set[str]:
-    """Validate the configured run stages."""
     stages = set(run_stages)
     unknown = stages - VALID_RUN_STAGES
     if unknown:
@@ -35,7 +32,6 @@ def run_signature(
     max_samples,
     max_dense_pixels,
 ) -> str:
-    """Fingerprint the result-defining experiment inputs and source files."""
     src = cacheutils.REPO / "src"
     code = cacheutils._hash_files(
         src / "main.py",
@@ -68,7 +64,6 @@ def run_signature(
 
 
 def check_run_signature(results_dir, signature: str, *, overwrite_mode: bool) -> None:
-    """Refuse to resume a result directory from a different experiment."""
     if overwrite_mode:
         return
     sig_path = results_dir / "run_signature.txt"
@@ -90,7 +85,6 @@ def check_run_signature(results_dir, signature: str, *, overwrite_mode: bool) ->
 
 
 def publish_run_signature(results_dir, signature: str) -> None:
-    """Write the run signature atomically."""
     results_dir.mkdir(parents=True, exist_ok=True)
     sig_path = results_dir / "run_signature.txt"
     tmp = cacheutils._atomic_tmp(sig_path)
@@ -102,7 +96,6 @@ def publish_run_signature(results_dir, signature: str) -> None:
 
 
 def budget_row_key(row):
-    """Budget-level identity of a result or prediction row."""
     return (
         row.get("seed"),
         row.get("split_regime"),
@@ -116,7 +109,6 @@ def budget_row_key(row):
 
 
 def prune_partial_budgets(rows, rows_path, preds_path, rerun_keys):
-    """Remove existing rows/predictions for budgets that are about to be regenerated."""
     if not rerun_keys:
         return rows
     kept = [r for r in rows if budget_row_key(r) not in rerun_keys]
@@ -248,6 +240,7 @@ def _run_segmentation_pair(
     active_probes,
     budget_regimes,
     overwrite_mode,
+    strict_mode,
     enc_kwargs,
 ) -> None:
     """Run dense PASTIS-R execution over fold-based regimes."""
@@ -327,7 +320,7 @@ def _run_segmentation_pair(
     fold_configs_by_seed = {
         seed: list(
             regime_base.segmentation_fold_configs(
-                bench_mod, regimes, seed=seed, emb_dir=emb_dir, overwrite_mode=overwrite_mode, bench=bench
+                bench_mod, regimes, seed=seed, emb_dir=emb_dir, strict_mode=strict_mode, bench=bench
             )
         )
         for seed in seeds

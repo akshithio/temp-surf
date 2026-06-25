@@ -154,28 +154,29 @@ def test_append_jsonl_roundtrips_batch(tmp_path):
 def test_dropped_curated_holdout_is_surfaced_and_strict_raises():
     from evals.regimes import base as RB
     groups = np.array(["A"] * 20 + ["B"] * 20 + ["C"] * 5, dtype=object)
-    y = np.array([0, 1] * 20 + [0] * 5)          # C is one-class -> dropped
+    y = np.array([0, 1] * 20 + [0] * 5)
     bench = type("FB", (), {"name": "fb", "groups": groups})()
 
     RB.REGIME_PROBLEMS.clear()
-    list(RB.iter_splits("geographic_ood", bench, y, holdouts=["A", "B", "C"], seed=0, overwrite_mode=False))
+    list(RB.iter_splits("geographic_ood", bench, y, holdouts=["A", "B", "C"], seed=0, strict_mode=False))
     assert any("C" in reason for _, reg, reason in RB.REGIME_PROBLEMS if reg == "geographic_ood")
 
     with pytest.raises(RuntimeError):
-        list(RB.iter_splits("geographic_ood", bench, y, holdouts=["A", "B", "C"], seed=0, overwrite_mode=True))
+        list(RB.iter_splits("geographic_ood", bench, y, holdouts=["A", "B", "C"], seed=0, strict_mode=True))
 
 
-def test_overwrite_mode_defaults_false():
+def test_file_mode_false_and_error_mode_true_by_default():
     import importlib
 
     import main
-    saved = os.environ.pop("OVERWRITE_MODE", None)
+    saved = os.environ.pop("STRICT_MODE", None)
     try:
         importlib.reload(main)
-        assert main.OVERWRITE_MODE is False       # in-file default is False (lenient)
+        assert main.OVERWRITE_MODE is False
+        assert main.STRICT_MODE is True
     finally:
         if saved is not None:
-            os.environ["OVERWRITE_MODE"] = saved
+            os.environ["STRICT_MODE"] = saved
         importlib.reload(main)
 
 
@@ -390,7 +391,7 @@ def test_leave_one_domain_out_dropped_domain_surfaced(monkeypatch):
         np.array([0, 1, 0, 1, 0, 1]),
         holdouts=None,
         seed=0,
-        overwrite_mode=False,
+        strict_mode=False,
     ))
     assert any("C" in reason for _, reg, reason in RB.REGIME_PROBLEMS if reg == "geographic_ood")
 

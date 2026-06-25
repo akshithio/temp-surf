@@ -152,10 +152,9 @@ the row reports the worst test domain rather than only the average.
 
 ## Current Limitations
 
-- **EuroCropsML is harmonized to monthly composites.** Each parcel's irregular Sentinel-2
-  series is converted to 12 calendar-month means with empty months masked. This matches
-  Presto's monthly cadence, but it is not the official variable-length EuroCropsML
-  leaderboard protocol.
+- **EuroCropsML is loaded as native irregular S2 series.** Model adapters choose their own
+  temporal view: monthly-cadence models request calendar-month composites, while native-series
+  models consume the original acquisition sequence.
 - **EuroCropsML preprocessed inputs are S2-only.** Missing S1 and climate channels are
   masked for Presto on that benchmark.
 
@@ -192,10 +191,11 @@ adding decorative comparisons.
 │       └── perfutils.py     # timing and static diagnostics
 ├── data/                    # git-ignored; input is source of truth
 │   ├── input/               # staged benchmarks + model artifacts
-│   ├── cache/               # generated benchmark caches
+│   ├── cache/
+│   │   ├── benchmark/       # assembled benchmark pickles
+│   │   └── embeddings/      # cached frozen-embedding .npy per (bench, model, signature)
 │   └── output/
-│       ├── embeddings/<bench>/<model>/<signature>/baseline.npy
-│       └── results/<model>/<benchmark>/
+│       └── results/         # probe results, predictions, summaries per <model>/<benchmark>/
 └── notebooks/
 ```
 
@@ -252,22 +252,7 @@ environment. `uv.lock` pins the current upstream `olmoearth_pretrain` source bec
 the PyPI 0.1.0 release predates v1.1's linear patch embed. The model's `config.json` and `weights.pth` are downloaded from
 `allenai/OlmoEarth-v1_1-Base` on first use into `data/input/models/olmoearth-v1_1-base/`.
 
-On `cranberry`, the conda env and all caches live on scratch (the NFS `$HOME` is a 10 GB
-quota), under:
-
-```text
-/local/scratch/a/agarapat/envs/robustness
-```
-
-Build or refresh the entire remote environment in one command from your Mac — it installs
-miniforge to scratch, creates the conda env from `environment.yml`, and runs the uv +
-presto installs, with every cache redirected to scratch so nothing touches the `$HOME` quota:
-
-```bash
-./sync.sh env
-```
-
-To build it by hand (locally, or on the box), use the same conda environment name:
+To build the environment, use the same conda environment name:
 
 ```bash
 conda env create -f environment.yml
@@ -293,13 +278,7 @@ ruff check src
 python -m pytest src/tests
 ```
 
-GPU smoke tests on cranberry use fixed in-file configuration:
 
-```bash
-cd src
-python tests/smoke_models.py
-python tests/smoke_pastis.py
-```
 
 Edit the config block at the top of `src/main.py`, then run:
 
@@ -336,7 +315,9 @@ BUDGET_REGIMES = {
 MAX_SAMPLES = None            # None = all samples
 MAX_DENSE_PIXELS = 50_000     # sampled PASTIS pixels per fold partition
 SEEDS = [0]                   # expand to [0, 1, 2] for additional bulk runs
-OVERWRITE_MODE = False       # False resumes; True overwrites cached outputs and enables strict mode
+OVERWRITE_MODE = False        # False resumes; True overwrites cached outputs
+STRICT_MODE = True            # True raises on recoverable data/regime issues
+LAUNCH_GPU_SHARDS = False     # True launches one main.py worker per local GPU
 ```
 
 Set `RUN_STAGES = ["gen_embeddings"]` to build or refresh embedding caches without
@@ -387,43 +368,9 @@ Everything is cache-backed and resumable:
 
 To split work across GPUs:
 
-```bash
-cd src && python utils/gputils.py
-```
+Set `LAUNCH_GPU_SHARDS = True` in `src/main.py`, then run `cd src && python main.py`.
 
-### Remote Data On cranberry (sshfs)
 
-`data/` lives only on cranberry's 7.3 TB scratch (`/local/scratch/a/agarapat/robustness-data`),
-never on the Mac. The Mac sees it through an sshfs mount, so paths like `data/input/...`
-resolve transparently for code and notebooks without storing the bytes locally. On
-cranberry, `~/robustness/data` is a symlink to that scratch directory (its `$HOME` is a
-10 GB NFS quota, so no bulk data lands there).
-
-```bash
-./sync.sh setup     # one-time: scratch data dirs + ownership README + data/ symlink on cranberry
-./sync.sh env       # one-time: build the conda+uv environment on cranberry (scratch-backed)
-./sync.sh push      # push code up to cranberry
-./sync.sh mount     # sshfs-mount cranberry's data/ onto local ./data
-./sync.sh umount    # unmount it
-```
-
-`./sync.sh mount` needs an sshfs implementation on the Mac (one-time). FUSE-T is the
-easiest — no kernel extension and no reboot:
-
-```bash
-brew install fuse-t fuse-t-sshfs
-```
-
-Alternatively, macFUSE (needs admin approval of a kernel extension and a reboot):
-
-```bash
-brew install --cask macfuse   # approve the kext in System Settings, then REBOOT
-brew install gromgit/fuse/sshfs-mac
-```
-
-`./sync.sh input` / `./sync.sh pull` still exist for rsync-based transfer when you are not
-using the sshfs mount. Override the remote location with `REMOTE_SCRATCH=...` or
-`REMOTE_DATA_DIR=...`.
 
 ### Cache Invalidation
 
@@ -432,4 +379,4 @@ Deleting generated cache is safe since cache keys are content-aware and `data/in
 | Cache | Key includes | Rebuilds when you change |
 |---|---|---|
 | `data/cache/benchmark/<bench>__<tag>.pkl` | benchmark params, `get_input.py` hash, input-data fingerprint | loader code or staged benchmark inputs |
-| `data/output/embeddings/<bench>/<model>/<signature>/baseline.npy` | benchmark identity and model source hash | benchmark inputs or model code |
+| `data/cache/embeddings/<bench>/<model>/<signature>/baseline.npy` | benchmark identity and model source hash | benchmark inputs or model code |

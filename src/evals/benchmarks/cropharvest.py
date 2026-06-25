@@ -174,11 +174,10 @@ def load_benchmark(
         valid_count += 1
 
     if skipped:
-        # Corrupt/malformed arrays must not silently shrink the dataset.
         msg = f"CropHarvest: {skipped} labeled arrays were unreadable/malformed in {arrays_dir}"
-        if os.environ.get("OVERWRITE_MODE", "").strip().lower() not in ("", "0", "false", "no"):
-            raise ValueError(msg + " (OVERWRITE_MODE is set)")
-        print(f"   !! {msg} -- those samples are skipped (set OVERWRITE_MODE=1 to fail instead)", flush=True)
+        if os.environ.get("STRICT_MODE", "").strip().lower() not in ("", "0", "false", "no"):
+            raise ValueError(msg + " (STRICT_MODE is set)")
+        print(f"   !! {msg} -- those samples are skipped (set STRICT_MODE=True to fail instead)", flush=True)
     if not s2_series:
         raise ValueError(f"No valid CropHarvest arrays parsed from {arrays_dir}")
 
