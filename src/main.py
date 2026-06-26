@@ -32,8 +32,8 @@ BUDGET_REGIMES = {
 }
 MAX_SAMPLES = None
 MAX_DENSE_PIXELS = 50_000  # sampled pixels per PASTIS fold partition
-OVERWRITE_MODE = False
-STRICT_MODE = True
+OVERWRITE_MODE = True
+STRICT_MODE = False
 LAUNCH_GPU_SHARDS = False
 GPU_SHARDS = None
 SEEDS = [0]
