@@ -10,6 +10,7 @@ from utils import perfutils as perf
 
 VALID_RUN_STAGES = {"gen_embeddings", "probing"}
 
+
 def validate_run_stages(run_stages: list[str]) -> set[str]:
     stages = set(run_stages)
     unknown = stages - VALID_RUN_STAGES
@@ -113,7 +114,7 @@ def prune_partial_budgets(rows, rows_path, preds_path, rerun_keys):
         return rows
     kept = [r for r in rows if budget_row_key(r) not in rerun_keys]
     if len(kept) != len(rows):
-        tmp_rows = rows_path.with_name(f".{rows_path.name}.tmp")
+        tmp_rows = cacheutils._atomic_tmp(rows_path)
         tmp_rows.unlink(missing_ok=True)
         if kept:
             IOU.append_jsonl(tmp_rows, kept)
@@ -123,7 +124,7 @@ def prune_partial_budgets(rows, rows_path, preds_path, rerun_keys):
     preds = IOU.read_jsonl(preds_path)
     kept_preds = [p for p in preds if budget_row_key(p) not in rerun_keys]
     if len(kept_preds) != len(preds):
-        tmp_preds = preds_path.with_name(f".{preds_path.name}.tmp")
+        tmp_preds = cacheutils._atomic_tmp(preds_path)
         tmp_preds.unlink(missing_ok=True)
         if kept_preds:
             IOU.append_jsonl(tmp_preds, kept_preds)
@@ -243,14 +244,11 @@ def _run_segmentation_pair(
     strict_mode,
     enc_kwargs,
 ) -> None:
-    """Run dense PASTIS-R execution over fold-based regimes."""
-    from evals import compat
-    from evals import evals as EV
+    from evals import compat, evals as EV  # noqa: I001
     from evals.regimes import base as regime_base
 
     stages = validate_run_stages(run_stages)
-    gen_embeddings = "gen_embeddings" in stages
-    probing = "probing" in stages
+    gen_embeddings, probing = "gen_embeddings" in stages, "probing" in stages
     source_budgets, target_budgets = EV._budget_lists(budget_regimes)
     bench_mod = EV.load_benchmark(benchmark_name)
     bench_kwargs = dict(max_samples=max_samples, shuffle=True, seed=0)
@@ -295,12 +293,15 @@ def _run_segmentation_pair(
             results_dir / "probe_results.csv",
             results_dir / "summary.csv",
             results_dir / "deltas.csv",
+            results_dir / "data_quality.json",
             results_dir / "split_manifest.json",
             results_dir / "run_signature.txt",
         ):
             if path.exists():
                 path.unlink()
     publish_run_signature(results_dir, signature)
+    if data_quality := getattr(bench, "data_quality", None):
+        IOU.write_json(results_dir / "data_quality.json", data_quality)
     rows = IOU.read_jsonl(rows_path)
     fam_fields = ("seed", "method", "split_regime", "holdout", "probe_family")
 
@@ -349,7 +350,7 @@ def _run_segmentation_pair(
     incomplete = set(present_by_family) - done_families
     if incomplete:
         rows = [r for r in rows if _fam_key(r) not in incomplete]
-        tmp_rows = rows_path.with_name(f".{rows_path.name}.tmp")
+        tmp_rows = cacheutils._atomic_tmp(rows_path)
         tmp_rows.unlink(missing_ok=True)
         if rows:
             IOU.append_jsonl(tmp_rows, rows)
@@ -487,12 +488,12 @@ def _run_segmentation_pair(
         target_id_budget=EV.TARGET_ID_UPPER_BOUND if EV.TARGET_ID_UPPER_BOUND in target_budgets else None,
     )
     IOU.write_csv(results_dir / "deltas.csv", deltas)
-    declared = set(compat.input_modalities(model_name))
-    available = {"s2", "s1", "time"}
+    declared, available = set(compat.input_modalities(model_name)), {"s2", "s1", "time"}
     IOU.write_json(results_dir / "model_inputs.json", {
         "model": model_name, "benchmark": benchmark_name, "s2_only_mode": False,
-        "declared_modalities": sorted(declared),
-        "available_modalities": sorted(available),
+        "compatibility_rank": compat.rank(benchmark_name, model_name),
+        "adaptation_severity": compat.adaptation_severity(benchmark_name, model_name),
+        "declared_modalities": sorted(declared), "available_modalities": sorted(available),
         "effective_modalities": sorted(declared & available),
     })
     perf.write_log(results_dir / "perf.jsonl")

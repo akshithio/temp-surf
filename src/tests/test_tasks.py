@@ -11,6 +11,7 @@ from evals.benchmarks import breizhcrops, cropharvest, eurocropsml, pastis
 from evals.regimes import base as regime_base
 from evals.regimes import spatial_cluster_ood
 from utils import cacheutils, gputils
+from utils import ioutils as IOU
 
 
 def test_bin_crop_class_targets() -> None:
@@ -23,6 +24,53 @@ def test_bin_crop_class_targets() -> None:
     assert y.dtype == np.int64
     np.testing.assert_array_equal(y, np.array([0, 1]))
     np.testing.assert_array_equal(groups, bench.groups)
+
+
+def test_prune_partial_budgets_uses_unique_temp_paths(tmp_path, monkeypatch):
+    from utils import runstate
+
+    rows_path = tmp_path / "probe_results.jsonl"
+    preds_path = tmp_path / "predictions.jsonl"
+    row = {
+        "seed": 0, "split_regime": "random_id", "holdout": "id", "method": "erm",
+        "probe_family": "logistic", "budget_type": "source", "label_budget": 1.0,
+        "evaluation_split": "test",
+    }
+    IOU.append_jsonl(rows_path, [row])
+    IOU.append_jsonl(preds_path, [row])
+    made = []
+
+    def fake_tmp(path):
+        made.append(path.with_name(f".{path.name}.{len(made)}.tmp"))
+        return made[-1]
+
+    monkeypatch.setattr(cacheutils, "_atomic_tmp", fake_tmp)
+    runstate.prune_partial_budgets([row], rows_path, preds_path, {runstate.budget_row_key(row)})
+    assert len(made) == 2 and made[0] != made[1]
+
+
+def test_read_jsonl_only_tolerates_unterminated_final_row(tmp_path) -> None:
+    p = tmp_path / "rows.jsonl"
+    p.write_text('{"a": 1}\n{"bad":')
+    assert IOU.read_jsonl(p) == [{"a": 1}]
+    p.write_text('{"a": 1}\n{"bad":\n{"a": 2}\n')
+    with pytest.raises(ValueError, match="Corrupt JSONL row 2"):
+        IOU.read_jsonl(p)
+
+
+def test_eurocrops_official_splits_use_release_membership(tmp_path) -> None:
+    base = tmp_path / "eurocropsml" / "split" / "latvia_vs_estonia"
+    (base / "pretrain").mkdir(parents=True)
+    (base / "finetune").mkdir()
+    (base / "pretrain" / "region_split.json").write_text('{"train":["LV_a.npz"],"val":["LV_b.npz"]}')
+    (base / "finetune" / "region_split_all.json").write_text(
+        '{"train":["EE_a.npz"],"val":["EE_b.npz"],"test":["EE_c.npz"]}'
+    )
+    splits = eurocropsml._official_splits(tmp_path / "eurocropsml", ["LV_a.npz", "LV_b.npz", "EE_c.npz"])
+    split = splits["latvia_vs_estonia"]
+    assert split["train"].tolist() == [0]
+    assert split["val"].tolist() == [1]
+    assert split["test"].tolist() == [2]
 
 
 def test_cropharvest_geo_group_collapses_dataset_aliases() -> None:

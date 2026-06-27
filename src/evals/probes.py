@@ -162,17 +162,24 @@ def best_f1_threshold(y_true: np.ndarray, prob: np.ndarray) -> float:
     global _F1_THRESHOLD_WARNED
     if len(np.unique(y_true)) < 2:
         return 0.5
-    candidates = np.unique(prob)
-    if len(candidates) > 256:
-        candidates = np.quantile(prob, np.linspace(0.01, 0.99, 199))
-    best_threshold = 0.5
-    best_score = -1.0
-    for threshold in candidates:
-        pred = (prob >= threshold).astype(np.int64)
-        score = float(f1_score(y_true, pred, zero_division=0))
-        if score > best_score:
-            best_score = score
-            best_threshold = float(threshold)
+    finite = np.isfinite(prob)
+    if not finite.any():
+        best_score = 0.0
+    else:
+        y = np.asarray(y_true, dtype=np.int64)[finite]
+        p = np.asarray(prob, dtype=np.float64)[finite]
+        order = np.argsort(p, kind="mergesort")
+        p_sorted, y_sorted = p[order], y[order]
+        thresholds, starts = np.unique(p_sorted, return_index=True)
+        tp = np.cumsum(y_sorted[::-1])[::-1][starts].astype(float)
+        pred_pos = (len(y_sorted) - starts).astype(float)
+        fp = pred_pos - tp
+        fn = float(y_sorted.sum()) - tp
+        denom = 2 * tp + fp + fn
+        scores = np.divide(2 * tp, denom, out=np.zeros_like(tp), where=denom > 0)
+        best = int(np.argmax(scores))
+        best_score = float(scores[best])
+        best_threshold = float(thresholds[best])
     if best_score <= 0.0:
         if not _F1_THRESHOLD_WARNED:
             print("   !! F1 threshold calibration is degenerate; using threshold=0.5", flush=True)
@@ -395,6 +402,7 @@ def fit_probe_multiclass(
 def score_multiclass(
     clf: Any, x_test: np.ndarray, y_test: np.ndarray, return_per_sample: bool = False
 ) -> dict[str, float] | tuple[dict[str, float], dict[str, np.ndarray]]:
+    proba = None
     with perf.measure("probe.score/multiclass", n_samples=len(y_test), n_features=x_test.shape[1]):
         pred = clf.predict(x_test)
         try:
@@ -439,7 +447,7 @@ def score_multiclass(
             "y_true": np.asarray(y_test, dtype=np.int64),
             "pred": np.asarray(pred, dtype=np.int64),
             "classes": np.asarray(getattr(clf, "classes_", []), dtype=np.int64),
-            "proba": np.asarray(proba, dtype=np.float64) if "proba" in locals() else np.zeros((len(y_test), 0)),
+            "proba": np.asarray(proba, dtype=np.float64) if proba is not None else np.zeros((len(y_test), 0)),
         }
         return scores, per_sample
     return scores

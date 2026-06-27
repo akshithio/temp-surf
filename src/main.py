@@ -8,8 +8,11 @@ Edit the config block below, then run:
 from __future__ import annotations
 
 import os
-import sys  # noqa: E402
-from typing import Any  # noqa: E402
+import sys
+from typing import Any
+
+for _thread_var in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"]:
+    os.environ.setdefault(_thread_var, "1")
 
 import numpy as np  # noqa: E402
 from joblib import Parallel, delayed  # noqa: E402
@@ -34,7 +37,7 @@ MAX_SAMPLES = None
 MAX_DENSE_PIXELS = 50_000  # sampled pixels per PASTIS fold partition
 OVERWRITE_MODE = True
 STRICT_MODE = False
-LAUNCH_GPU_SHARDS = False
+LAUNCH_GPU_SHARDS = True
 GPU_SHARDS = None
 SEEDS = [0]
 # =============================================================================
@@ -125,7 +128,10 @@ def _run_tabular_pair(
         )
 
     results_dir = cacheutils.OUTPUT_DIR / "results" / model_name / (benchmark_name + suffix)
+    data_quality = getattr(bench, "data_quality", None)
     if not probing:
+        if data_quality:
+            IOU.write_json(results_dir / "data_quality.json", data_quality)
         n_events = perf.write_log(results_dir / "perf.jsonl")
         print(f"  embedding stage complete; perf: {n_events} events logged", flush=True)
         return
@@ -151,12 +157,15 @@ def _run_tabular_pair(
             results_dir / "probe_results.csv",
             results_dir / "summary.csv",
             results_dir / "deltas.csv",
+            results_dir / "data_quality.json",
             results_dir / "split_manifest.json",
             results_dir / "run_signature.txt",
         ]:
             if p.exists():
                 p.unlink()
     runstate.publish_run_signature(results_dir, signature)
+    if data_quality:
+        IOU.write_json(results_dir / "data_quality.json", data_quality)
 
     rows = IOU.read_jsonl(rows_path)
     done = {
@@ -344,6 +353,8 @@ def _run_tabular_pair(
         {
             "model": model_name,
             "benchmark": benchmark_name,
+            "compatibility_rank": compat.rank(benchmark_name, model_name),
+            "adaptation_severity": compat.adaptation_severity(benchmark_name, model_name),
             "s2_only_mode": s2_only,
             "declared_modalities": sorted(declared),
             "available_modalities": sorted(available),

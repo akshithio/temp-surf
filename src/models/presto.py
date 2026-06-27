@@ -79,18 +79,6 @@ _REPO = Path(__file__).resolve().parents[2]
 _INPUT = Path(os.environ.get("ROBUSTNESS_INPUT", _REPO / "data" / "input"))
 DEFAULT_PRESTO_WEIGHTS = _INPUT / "models" / "presto" / PRESTO_HF_FILENAME
 
-# Calendar month (0=Jan) of timestep 0, per benchmark. Presto's month embedding is keyed
-# to the absolute start month, so timestep 0 must be labeled with the right calendar month.
-# Presto's own CropHarvest benchmark fixes this to February: every CropHarvest sample is the
-# 2020-2021 agricultural year (export_end_date = Feb 1, so the 12-month series begins in
-# February). This is start_month=1 verbatim from presto/eval/cropharvest_eval.py. Benchmarks
-# absent from this map (e.g. EuroCropsML, harmonized to calendar Jan-Dec monthly composites
-# whose timestep 0 really is January) fall back to deriving the start month from day-of-year.
-# The monthly view (bench.monthly) is always calendar-ordered (Jan first), so timestep 0 is
-# January for every benchmark and the start month is derived from the view's doy. (No per-benchmark
-# override is needed now that temporal aggregation is the model's own, on a canonical Jan-Dec grid.)
-PRESTO_START_MONTH: dict[str, int] = {}
-
 # Which Benchmark modality supplies each Presto band (None = never available).
 _BAND_MODALITY: dict[str, str | None] = {
     "VV": "s1", "VH": "s1",
@@ -213,12 +201,7 @@ class PrestoModel:
 
         dynamic_world = np.full((n, t), DYNAMIC_WORLD_MISSING, dtype=np.int64)
         latlons = np.nan_to_num(bench.latlon.astype(np.float32), nan=0.0)
-        start_month = PRESTO_START_MONTH.get(getattr(bench, 'name', ''))
-        months = (
-            np.full(n, start_month, dtype=np.int64)
-            if start_month is not None
-            else _doy_to_month(doy_arr[:, 0])
-        )
+        months = _doy_to_month(doy_arr[:, 0])
         return x, mask, dynamic_world, latlons, months
 
     # ---- MAC estimate (thop) ---------------------------------------------

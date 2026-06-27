@@ -11,7 +11,7 @@ import pickle
 import re
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -48,6 +48,12 @@ EMB_DTYPE = "float32"
 
 class MissingEmbeddingCache(FileNotFoundError):
     pass
+
+
+class ModelWrapper(Protocol):
+    embedding_dim: int
+
+    def encode(self, bench: Any) -> np.ndarray: ...
 
 
 def _hash_files(*paths: str | Path) -> str:
@@ -153,7 +159,7 @@ def cached_bench(benchmark: str, tag: str, **kwargs):
         return bench
 
 
-def build_model(name: str, **kwargs) -> Any:
+def build_model(name: str, **kwargs) -> ModelWrapper:
     mod_path, cls_name = MODELS[name]
     cls = getattr(importlib.import_module(mod_path), cls_name)
     sig = inspect.signature(cls)
@@ -164,15 +170,16 @@ def build_model(name: str, **kwargs) -> Any:
 
 
 def _model_source_files(model_name: str) -> list[Path]:
-    """Wrapper source + the model-specific util modules it imports (e.g. galileoutil,
-    agrifmutils), so a change to transitive model code also invalidates the embedding cache."""
     mod_src = REPO / "src" / (MODELS[model_name][0].replace(".", "/") + ".py")
     files = [mod_src]
     try:
         text = mod_src.read_text()
     except OSError:
         return files
-    for name in re.findall(r"utils\.\w+\.([A-Za-z_]\w*?util[s]?)\b", text):
+    names = set(re.findall(r"utils\.models\.([A-Za-z_]\w*)", text))
+    for imports in re.findall(r"from\s+utils\.models\s+import\s+([^\n]+)", text):
+        names.update(part.strip().split(" as ", 1)[0] for part in imports.split(","))
+    for name in sorted(names):
         util_path = REPO / "src" / "utils" / "models" / f"{name}.py"
         if util_path.exists() and util_path not in files:
             files.append(util_path)

@@ -1,0 +1,6 @@
+/scratch/gilbreth/agarapat/robustness/.venv/lib/python3.11/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+
+========== [shard 0/1] tessera / pastis ==========
+  split_regimes=['random_id', 'official', 'geographic_ood', 'spatial_cluster_ood']
+  run_stages=['gen_embeddings', 'probing']

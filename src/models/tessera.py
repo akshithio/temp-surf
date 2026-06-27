@@ -25,6 +25,7 @@ TESSERA_EMBEDDING_DIM = 128
 TESSERA_REPRESENTATION_DIM = 192
 TESSERA_LATENT_DIM = 192
 
+# Upstream source: ucam-eo/tessera `tessera_infer_QAT/src/datasets/v1_1_norm_stats.py`.
 # The released checkpoints are bound to this non-wavelength-ordered S2 layout.
 TESSERA_S2_BANDS = ["B4", "B2", "B3", "B8", "B8A", "B5", "B6", "B7", "B11", "B12"]
 TESSERA_S1_BANDS = ["VV", "VH"]

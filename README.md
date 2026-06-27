@@ -54,11 +54,11 @@ and label budget. Each split produces one probe fit per budget level.
 | `breizhcrops` | BreizhCrops | multiclass crop type | frh04 | macro/weighted F1, balanced accuracy, accuracy, macro AUC | real crop type |
 | `pastis` | PASTIS-R | semantic segmentation | official folds 1-3/4/5 | mIoU, pixel accuracy, macro/weighted F1 | per-pixel crop type |
 
-PASTIS-R is streamed lazily as four 64x64 tiles per source patch. S2 and
-ascending-orbit S1 observations are monthly aggregated. Class 19 (void) is
-removed, while background class 0 remains part of the evaluation. OlmoEarth,
-Galileo, and AgriFM use their native spatial feature grids; Presto and TESSERA
-encode bounded pixel batches. Dense tile caches are resumable.
+PASTIS-R is streamed lazily as four 64x64 tiles per source patch. Calendar-grid
+models aggregate S2/S1 observations to monthly tiles; AgriFM samples the native
+S2 frame sequence expected by its video backbone. Class 19 (void) is removed,
+while background class 0 remains part of the evaluation. Dense tile caches are
+resumable.
 
 **Model × benchmark compatibility**
 
@@ -87,7 +87,7 @@ those domains become train/test splits:
 | Regime | Domain basis | Splits per benchmark | Description |
 |---|---|---:|---|
 | `random_id` | geography | 1 | Random stratified 80/10/10 split. Train and test share regions/domains (in-distribution upper bound). |
-| `official` | geography | benchmark-defined | Benchmark-recommended split. CropHarvest: Kenya/Brazil/Togo targets. EuroCropsML: Estonia. BreizhCrops: frh04 test with frh03 validation. PASTIS-R: folds 1-3/4/5. |
+| `official` | geography | benchmark-defined | Benchmark-recommended split. CropHarvest: Kenya/Brazil/Togo targets. EuroCropsML: exact release splits for Latvia→Estonia and Latvia+Portugal→Estonia. BreizhCrops: frh04 test with frh03 validation. PASTIS-R: folds 1-3/4/5. |
 | `geographic_ood` | geography | strict stress splits | Stricter-than-official geographic stress. CropHarvest uses lat/lon spatial blocks plus a distance purge. EuroCropsML, BreizhCrops, and PASTIS-R use leave-one-geographic-unit-out over all countries/regions/folds with disjoint OOD validation. |
 | `spatial_cluster_ood` | spatial clusters | 1 | Coordinate-only spatial stress split. K-means clusters lat/lon, test uses one spatial extreme, val uses the opposite extreme, train uses the remaining clusters after distance purging. Runs on all four benchmarks. |
 
@@ -105,7 +105,7 @@ clusters PASTIS-R patch centroids and evaluates whole held-out patches.
 
 | Type | Levels | Meaning |
 |---|---|---|
-| Target budgets | `[0, 5, 10, 25, 50, -1]` | `0` = zero-shot OOD; `5..50` = absolute count of target labels added (nested); `-1` = target-ID oracle (trains on the 80% target pool). |
+| Target budgets | `[0, 5, 10, 25, 50, -1]` | `0` = zero-shot OOD; `5..50` = absolute target samples added for tabular benchmarks and absolute target patches for PASTIS-R; `-1` = target-ID oracle. |
 | Source budgets | `[0.05, 0.10, 0.25, 1.00]` | Fraction of source training data used. |
 
 Each budget level fits a calibrated probe and scores the metrics on the test set.
