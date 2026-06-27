@@ -165,21 +165,6 @@ def test_dropped_curated_holdout_is_surfaced_and_strict_raises():
         list(RB.iter_splits("geographic_ood", bench, y, holdouts=["A", "B", "C"], seed=0, strict_mode=True))
 
 
-def test_file_mode_false_and_error_mode_true_by_default():
-    import importlib
-
-    import main
-    saved = os.environ.pop("STRICT_MODE", None)
-    try:
-        importlib.reload(main)
-        assert main.OVERWRITE_MODE is False
-        assert main.STRICT_MODE is True
-    finally:
-        if saved is not None:
-            os.environ["STRICT_MODE"] = saved
-        importlib.reload(main)
-
-
 def test_subset_indices_guards_tiny_pool():
     from evals.evals import subset_indices
     assert list(subset_indices(np.array([1]), budget=0.5, seed=0)) == [0]   # no crash on <2 pool

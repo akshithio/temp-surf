@@ -1,0 +1,2 @@
+[main] stdout/stderr -> /scratch/gilbreth/agarapat/robustness/data/output/logs/main.log
+[gputils] shard 0/1 -> GPU 0 | pid 2143710 | log /scratch/gilbreth/agarapat/robustness/data/output/logs/shard_0.log

@@ -1,9 +1,4 @@
-"""Result IO and summary aggregation for experiment runners.
-
-Kept dependency-free (numpy only) so it never imports the eval/method modules:
-the caller passes the metric list to summarize, since this project has three benchmark
-families (binary, multiclass, regression) with different metrics.
-"""
+"""Result IO and summary aggregation for experiment runners."""
 
 from __future__ import annotations
 
@@ -63,19 +58,25 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    """Read a JSON-lines result log (one row dict per line). Skips blank/degraded lines."""
+    """Read a JSON-lines result log."""
     path = Path(path)
     if not path.exists():
         return []
     rows: list[dict[str, Any]] = []
-    for line in path.read_text().splitlines():
+    text = path.read_text()
+    lines = text.splitlines()
+    final_may_be_partial = bool(lines) and not text.endswith("\n")
+    for i, line in enumerate(lines):
         line = line.strip()
         if not line:
             continue
         try:
             rows.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue  # tolerate a half-written final line from a crash
+        except json.JSONDecodeError as exc:
+            if final_may_be_partial and i == len(lines) - 1:
+                print(f"   !! Dropping unterminated final JSONL row from {path}", flush=True)
+                continue
+            raise ValueError(f"Corrupt JSONL row {i + 1} in {path}: {exc}") from exc
     return rows
 
 

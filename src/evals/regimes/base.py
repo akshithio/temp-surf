@@ -28,6 +28,7 @@ class Split:
     source_val: np.ndarray = field(default_factory=_empty)
     source_test: np.ndarray = field(default_factory=_empty)
     domain: str | None = None
+    has_target: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -145,7 +146,8 @@ def iter_splits(
         yielded_labels.add(str(split.label))
         yielded_domains.add(str(getattr(split, "domain", None) or split.label))
         yield (
-            split.label, split.train, split.val, split.test, domains, regime.HAS_TARGET,
+            split.label, split.train, split.val, split.test, domains,
+            regime.HAS_TARGET if split.has_target is None else split.has_target,
             regime.GROUP_KIND, split.source_val, split.source_test,
         )
     if n_splits == 0:

@@ -7,7 +7,7 @@ This module provides the shared dataclasses and a thin ``get_input()`` dispatche
 from __future__ import annotations
 
 import importlib
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -77,6 +77,10 @@ class Benchmark:
     latlon: np.ndarray  # (N, 2) [lat, lon]; used by location-aware models (Presto, ...)
     label_names: list[str] | None = None  # class id -> name, for multiclass
     years: np.ndarray | None = None  # (N,) representative calendar year per sample
+    sample_ids: np.ndarray | None = None
+    official_splits: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
+    data_quality: dict[str, Any] = field(default_factory=dict)
+    monthly_order: np.ndarray | None = None
 
     @property
     def n_samples(self) -> int:
@@ -109,8 +113,11 @@ class Benchmark:
         for i in range(n):
             if c and len(ms.values[i]):
                 values[i], mask[i] = monthly_composite(ms.values[i], ms.months[i], n_months)
-        doy = np.broadcast_to(_synthetic_month_doy(n_months), (n, n_months)).astype(np.float32)
-        return values, mask, doy, list(ms.bands)
+        order = np.arange(n_months) if self.monthly_order is None else np.asarray(self.monthly_order, dtype=np.int64)
+        if len(order) != n_months or set(order.tolist()) != set(range(n_months)):
+            raise ValueError(f"monthly_order must be a permutation of 0..{n_months - 1}")
+        doy = np.broadcast_to(_synthetic_month_doy(n_months)[order], (n, n_months)).astype(np.float32)
+        return values[:, order], mask[:, order], doy, list(ms.bands)
 
     def native_series(self, modality: str):
         """Native (ragged) view: ``(values_list, doy_list, months_list, bands)`` — the full
@@ -154,6 +161,8 @@ class Benchmark:
 
 def _synthetic_month_doy(timesteps: int) -> np.ndarray:
     """Synthetic day-of-year for monthly-regularized benchmarks."""
+    if timesteps < 1 or timesteps > 12:
+        raise ValueError(f"monthly day-of-year table requires 1..12 timesteps, got {timesteps}")
     days = [datetime(2000, m, 15).timetuple().tm_yday for m in range(1, timesteps + 1)]
     return np.asarray(days, dtype=np.float32)
 

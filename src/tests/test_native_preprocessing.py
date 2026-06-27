@@ -19,7 +19,7 @@ from dataio.get_input import (
 S2_BANDS = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12", "NDVI"]
 
 
-def _native_bench(s2_series, s2_months, s2_bands, *, name="eurocropsml") -> Benchmark:
+def _native_bench(s2_series, s2_months, s2_bands, *, name="eurocropsml", monthly_order=None) -> Benchmark:
     n = len(s2_series)
     doy = [_synthetic_month_doy(12)[np.asarray(m) % 12].astype(np.float32) for m in s2_months]
     years = [np.full(len(s), 2021, dtype=np.int64) for s in s2_series]
@@ -31,6 +31,7 @@ def _native_bench(s2_series, s2_months, s2_bands, *, name="eurocropsml") -> Benc
         name=name, label_kind="multiclass", native=native,
         labels=np.zeros(n, np.int64), groups=np.array(["g"] * n, dtype=object),
         latlon=np.zeros((n, 2), np.float32), years=np.full(n, 2021, np.int64),
+        monthly_order=None if monthly_order is None else np.asarray(monthly_order, dtype=np.int64),
     )
 
 
@@ -42,6 +43,13 @@ def test_monthly_composite_means_per_calendar_month() -> None:
     assert mask[0] == 1.0 and mask[5] == 1.0 and mask[1] == 0.0
 
 
+def test_synthetic_month_doy_rejects_non_calendar_width() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="1..12"):
+        _synthetic_month_doy(13)
+
+
 def test_benchmark_monthly_view_composites_native_series() -> None:
     raw = np.arange(24 * 3, dtype=np.float32).reshape(24, 3)  # 24 sub-monthly acquisitions
     months = np.repeat(np.arange(12), 2)  # 2 per calendar month
@@ -51,6 +59,15 @@ def test_benchmark_monthly_view_composites_native_series() -> None:
     assert vals.shape == (1, 12, 3)
     np.testing.assert_allclose(vals[0], expected)
     assert mask.min() == 1.0 and bands == ["A", "B", "C"]
+
+
+def test_benchmark_monthly_view_can_preserve_agricultural_year_order() -> None:
+    raw = np.arange(12, dtype=np.float32).reshape(12, 1)
+    months = np.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0])
+    bench = _native_bench([raw], [months], ["A"], name="cropharvest", monthly_order=months)
+    vals, _mask, doy, _bands = bench.monthly("s2")
+    np.testing.assert_allclose(vals[0, :, 0], np.arange(12))
+    assert int(doy[0, 0]) == int(_synthetic_month_doy(12)[1])
 
 
 def test_presto_monthly_grid_is_calendar_ordered_january_start() -> None:

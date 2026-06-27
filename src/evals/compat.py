@@ -45,6 +45,19 @@ def rank(benchmark: str, model: str) -> int | None:
     return RUN_RANK.get((benchmark, model))
 
 
+def adaptation_severity(benchmark: str, model: str) -> str:
+    r = rank(benchmark, model)
+    if r is None:
+        return "unranked"
+    if r <= 2:
+        return "native"
+    if r <= 4:
+        return "minor_adaptation"
+    if r <= 6:
+        return "moderate_adaptation"
+    return "major_adaptation"
+
+
 def is_eligible(benchmark: str, model: str) -> bool:
     """True when the model should run on the benchmark."""
     return benchmark in BENCHMARKS and model in MODEL_ORDER and model not in BLOCKED_MODELS.get(benchmark, set())

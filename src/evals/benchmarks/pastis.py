@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +105,7 @@ class PastisBenchmark:
     patches: tuple[PastisPatch, ...]
     tile_size: int = 64
     ignore_index: int = IGNORE_INDEX
+    data_quality: dict[str, Any] = field(default_factory=dict)
 
     @property
     def n_samples(self) -> int:
@@ -289,7 +290,7 @@ def load_benchmark(
         order = order[:max_samples]
 
     patches: list[PastisPatch] = []
-    missing = 0
+    missing_records: list[dict[str, Any]] = []
     for i in order:
         r = rows[int(i)]
         pid = int(r["ID_PATCH"])
@@ -297,7 +298,7 @@ def load_benchmark(
         s1_path = base / "DATA_S1A" / f"S1A_{pid}.npy"
         target_path = base / "ANNOTATIONS" / f"TARGET_{pid}.npy"
         if not (s2_path.exists() and s1_path.exists() and target_path.exists()):
-            missing += 1
+            missing_records.append({"patch_id": pid, "reason": "missing s2/s1/target npy"})
             continue
         patches.append(
             PastisPatch(
@@ -312,8 +313,8 @@ def load_benchmark(
             )
         )
 
-    if missing:
-        msg = f"PASTIS: {missing}/{len(order)} metadata patches have missing .npy files in {base}"
+    if missing_records:
+        msg = f"PASTIS: {len(missing_records)}/{len(order)} metadata patches have missing .npy files in {base}"
         if os.environ.get("STRICT_MODE", "").strip().lower() not in ("", "0", "false", "no"):
             raise ValueError(msg + " (STRICT_MODE is set)")
         print(f"   !! {msg} -- those patches are skipped (set STRICT_MODE=True to fail instead)", flush=True)
@@ -325,6 +326,7 @@ def load_benchmark(
         patches=tuple(patches),
         tile_size=PASTIS_TILE_SIZE,
         ignore_index=IGNORE_INDEX,
+        data_quality={"skipped_inputs": missing_records} if missing_records else {},
     )
 
 
@@ -415,15 +417,18 @@ def run_probes_segmentation_target(
         cal_x, cal_y, tune_internal = x_val, y_val, False
         if budget == 0:
             x_tr, y_tr = x_source, y_source
+            n_patch_train = 0
         elif budget == target_id_budget:
             xo, yo = sample_target(set(pool_order), sub_seed)[:2]
             x_tr, y_tr = _apply(transform, xo), yo
             cal_x, cal_y, tune_internal = None, None, True
+            n_patch_train = len(pool_order)
         else:
             k = min(len(pool_order), perf._target_budget_count(budget, len(pool_order)))
             xf, yf = sample_target(set(pool_order[:k]), sub_seed)[:2]
             x_tr = np.concatenate([x_source, _apply(transform, xf)])
             y_tr = np.concatenate([y_source, yf])
+            n_patch_train = k
         clf, probe_meta = fit_probe_multiclass(
             x_tr, y_tr, sub_seed, x_val=cal_x, y_val=cal_y, family=family, tune_internal=tune_internal
         )
@@ -432,6 +437,9 @@ def run_probes_segmentation_target(
             "evaluation_split": "held_out",
             "budget_type": "target",
             "label_budget": budget,
+            "label_budget_unit": "target_patches",
+            "n_target_patches_train": n_patch_train,
+            "n_target_patches_test": len(test_patches),
             "seed": seed,
             "n_train_sub": int(len(y_tr)),
             **probe_meta,
@@ -443,6 +451,9 @@ def run_probes_segmentation_target(
                 "evaluation_split": "full",
                 "budget_type": "target",
                 "label_budget": budget,
+                "label_budget_unit": "target_patches",
+                "n_target_patches_train": n_patch_train,
+                "n_target_patches_test": len(all_patches),
                 "seed": seed,
                 "n_train_sub": int(len(y_tr)),
                 **probe_meta,

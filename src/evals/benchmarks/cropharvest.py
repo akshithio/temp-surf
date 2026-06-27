@@ -140,8 +140,8 @@ def load_benchmark(
     files = _select_files([p for p in arrays_dir.glob("*.h5") if p.is_file()], shuffle, seed, None)
 
     s2_series, s1_series, clim_series = [], [], []
-    labels, groups, latlons, years = [], [], [], []
-    skipped = 0
+    labels, groups, latlons, years, sample_ids = [], [], [], [], []
+    skipped_records: list[dict[str, str]] = []
     valid_count = 0
     for path in files:
         if max_samples is not None and valid_count >= max_samples:
@@ -153,14 +153,14 @@ def load_benchmark(
         try:
             with h5py.File(path, "r") as f:
                 if "array" not in f:
-                    skipped += 1
+                    skipped_records.append({"path": str(path), "reason": "missing array dataset"})
                     continue
                 arr = np.asarray(f["array"], dtype=np.float32)
         except OSError:
-            skipped += 1  # unreadable / corrupt HDF5
+            skipped_records.append({"path": str(path), "reason": "unreadable hdf5"})
             continue
         if arr.ndim != 2 or arr.shape[0] != CH_TIMESTEPS or arr.shape[1] < CH_MIN_CHANNELS:
-            skipped += 1  # malformed shape
+            skipped_records.append({"path": str(path), "reason": f"malformed shape {arr.shape}"})
             continue
         arr = np.nan_to_num(arr, nan=0.0)
         is_crop, lat, lon, year = label_map[key]
@@ -171,10 +171,11 @@ def load_benchmark(
         groups.append(_ch_geo_group(dataset))
         latlons.append((lat, lon))
         years.append(year)
+        sample_ids.append(path.name)
         valid_count += 1
 
-    if skipped:
-        msg = f"CropHarvest: {skipped} labeled arrays were unreadable/malformed in {arrays_dir}"
+    if skipped_records:
+        msg = f"CropHarvest: {len(skipped_records)} labeled arrays were unreadable/malformed in {arrays_dir}"
         if os.environ.get("STRICT_MODE", "").strip().lower() not in ("", "0", "false", "no"):
             raise ValueError(msg + " (STRICT_MODE is set)")
         print(f"   !! {msg} -- those samples are skipped (set STRICT_MODE=True to fail instead)", flush=True)
@@ -200,6 +201,9 @@ def load_benchmark(
         groups=np.asarray(groups, dtype=object),
         latlon=np.asarray(latlons, dtype=np.float32),
         years=np.asarray(years, dtype=np.int64),
+        sample_ids=np.asarray(sample_ids, dtype=object),
+        data_quality={"skipped_inputs": skipped_records} if skipped_records else {},
+        monthly_order=CH_MONTHS,
     )
 
 

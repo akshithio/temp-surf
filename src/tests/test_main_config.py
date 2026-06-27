@@ -25,6 +25,7 @@ def test_run_stage_set_rejects_empty_config() -> None:
 
 def test_main_dispatches_config_to_run_pair(monkeypatch) -> None:
     calls = []
+    monkeypatch.setattr(main, "LAUNCH_GPU_SHARDS", False)
     monkeypatch.setattr(main.compat, "eligible_models", lambda bm: ["raw"])
     monkeypatch.setattr(main.gputils, "take_shard", lambda pairs: pairs[:1])
     monkeypatch.setattr(main.gputils, "shard_indices", lambda: (0, 1))

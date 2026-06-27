@@ -41,6 +41,7 @@ _dense_fold_stats = regime_base._dense_fold_stats
 _segmentation_split_manifest_entry = regime_base._segmentation_split_manifest_entry
 _write_split_manifest = regime_base._write_split_manifest
 
+
 def _validate_source_budgets(budgets: list[float | int]) -> None:
     bad = [budget for budget in budgets if float(budget) <= 0.0 or float(budget) > 1.0]
     if bad:
@@ -88,7 +89,6 @@ METRICS_BINARY_WORST_GROUP: list[str] = [
     "worst_group_calibrated_balanced_accuracy",
     "worst_group_score",
 ]
-METRICS: list[str] = METRICS_BINARY_BASE
 METRICS_BINARY: list[str] = [*METRICS_BINARY_BASE, *METRICS_BINARY_WORST_GROUP]
 METRICS_MULTICLASS_BASE: list[str] = [
     "macro_f1",

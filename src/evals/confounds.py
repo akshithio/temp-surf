@@ -53,19 +53,13 @@ def confound_pair(a: np.ndarray, b: np.ndarray, max_cells: int = 30) -> dict:
     }
     if len(ua) <= max_cells and len(ub) <= max_cells:
         out["contingency"] = {
-            str(av): {str(bv): int(counts[i, j]) for j, bv in enumerate(ub) if counts[i, j]}
-            for i, av in enumerate(ua)
+            str(av): {str(bv): int(counts[i, j]) for j, bv in enumerate(ub) if counts[i, j]} for i, av in enumerate(ua)
         }
     return out
 
 
 def domain_confound_report(axes: dict[str, np.ndarray | None]) -> dict:
-    """Pairwise confound stats between the supplied per-sample domain axes.
-
-    ``axes`` maps an axis name (e.g. ``geography``, ``year``, ``class``) to a per-sample
-    label array (``None`` / single-valued axes are skipped). Returns the cardinality of each usable
-    axis and, for every pair, the :func:`confound_pair` stats.
-    """
+    """Pairwise confound stats between usable per-sample domain axes."""
     usable = [
         name
         for name, values in axes.items()
@@ -82,13 +76,8 @@ def domain_confound_report(axes: dict[str, np.ndarray | None]) -> dict:
     return report
 
 
-
 def _apply_transform(transform: Any | None, x: np.ndarray) -> np.ndarray:
     return x if transform is None else transform.transform(x)
-
-# --------------------------------------------------------------------------- #
-# Segmentation scoring (per-pixel) — PASTIS-style crop mapping
-# --------------------------------------------------------------------------- #
 
 
 def per_class_iou(y_true: np.ndarray, y_pred: np.ndarray, classes: np.ndarray) -> dict[int, float]:
@@ -116,18 +105,10 @@ def score_segmentation(
     eval_classes: np.ndarray | None = None,
     return_per_sample: bool = False,
 ) -> dict[str, float] | tuple[dict[str, float], dict[str, np.ndarray]]:
-    """Per-pixel multiclass scoring with segmentation metrics (the PASTIS linear-probe protocol).
-
-    ``x_test`` is the flattened valid-pixel feature matrix and ``y_test`` the per-pixel class
-    labels (background / void already dropped upstream). mIoU is averaged over ``eval_classes``
-    (default = the probe's trained classes), excluding classes absent from ``y_test`` (NaN) --
-    matching the standard frozen-model linear-probe mIoU report (Galileo Table 17 / OlmoEarth).
-    """
+    """Per-pixel multiclass segmentation scores."""
     with perf.measure("probe.score/segmentation", n_samples=len(y_test), n_features=x_test.shape[1]):
         pred = clf.predict(x_test)
-    classes = np.asarray(
-        eval_classes if eval_classes is not None else getattr(clf, "classes_", np.unique(y_test))
-    )
+    classes = np.asarray(eval_classes if eval_classes is not None else getattr(clf, "classes_", np.unique(y_test)))
     ious = per_class_iou(y_test, pred, classes)
     present = [v for v in ious.values() if not np.isnan(v)]
     with warnings.catch_warnings():
@@ -148,11 +129,6 @@ def score_segmentation(
         }
         return scores, per_sample
     return scores
-
-
-# --------------------------------------------------------------------------- #
-# Full-fold (streamed) segmentation scoring — exact, not a pixel sample
-# --------------------------------------------------------------------------- #
 
 
 def _miou_from_confusion(conf: np.ndarray) -> float:
@@ -188,11 +164,7 @@ def _as_eval_indices(values: np.ndarray, classes: np.ndarray, name: str) -> np.n
 
 
 def _segmentation_metrics_from_confusion(conf: np.ndarray, tile_mious: list[float]) -> dict[str, float]:
-    """Segmentation metrics from an accumulated confusion matrix (exact over all scored pixels).
-
-    Same definitions as :func:`score_segmentation`: mIoU over classes present in y_true, pixel
-    accuracy, macro/weighted F1, and aggregated per-tile mIoU.
-    """
+    """Segmentation metrics from an accumulated confusion matrix."""
     c = conf.astype(np.float64)
     tp = np.diag(c)
     row, col, total = c.sum(1), c.sum(0), c.sum()
@@ -213,25 +185,20 @@ def _segmentation_metrics_from_confusion(conf: np.ndarray, tile_mious: list[floa
     }
     if tile_mious:
         arr = np.asarray(tile_mious)
-        out.update({
-            "mean_per_tile_miou": float(arr.mean()),
-            "worst_tile_miou": float(arr.min()),
-            "n_tiles_scored": len(arr),
-        })
+        out.update(
+            {
+                "mean_per_tile_miou": float(arr.mean()),
+                "worst_tile_miou": float(arr.min()),
+                "n_tiles_scored": len(arr),
+            }
+        )
     else:
         out.update({"mean_per_tile_miou": float("nan"), "worst_tile_miou": float("nan"), "n_tiles_scored": 0})
     return out
 
 
 def score_segmentation_streamed(clf, tiles, eval_classes: np.ndarray, transform: Any | None = None) -> dict[str, float]:
-    """Exact full-fold segmentation scoring by streaming tiles (one 64x64 tile in memory at a time).
-
-    ``tiles`` yields ``(features, labels)`` for EVERY valid pixel of the evaluation fold (see
-    ``cacheutils.iter_dense_tiles``); the probe predicts each tile and the result accumulates into a
-    global confusion matrix plus a per-tile mIoU list. This is the true full-fold mIoU and a
-    credible worst-tile mIoU, replacing the noisy estimate from a capped pixel sample. ``transform``
-    (the optional feature map) is applied per tile so it matches the fitted train features.
-    """
+    """Exact full-fold segmentation scoring by streaming dense tiles."""
     k = len(eval_classes)
     conf = np.zeros((k, k), dtype=np.int64)
     tile_mious: list[float] = []
@@ -268,48 +235,31 @@ def compute_deltas(
     n_boot_sample: int = 1000,
     seed: int = 0,
 ) -> list[dict[str, Any]]:
-    """ID→OOD drop per metric and per (model, benchmark, method).
-
-    ``id``  = metric on the configured random-split in-distribution source-budget anchor.
-    ``ood`` = metric on the curated geographic holdout (geographic_ood, target budget 0).
-    ``target_id`` = metric on the *target-ID upper bound* (geographic_ood, target budget -1):
-      train on 80 % of the target region (no source), test on remaining 20 %.  This
-      separates "this region is intrinsically harder" from "transfer to this region is
-      harder".  Only reported when the underlying row exists.
-
-    Reports, per row:
-      * ``delta`` = id - ood (deployment gap; higher-better metrics +=drop, error metrics -=worse)
-      * ``relative_drop`` = delta / id
-      * ``chance`` / ``floor_norm_drop`` = (id-ood)/(id-chance): fraction of *above-chance*
-        performance erased OOD (only where a no-skill floor is defined; NaN otherwise)
-      * ``delta_ci_lo/hi`` = bootstrap 95% CI over region×seed estimates ("consistent across regions")
-      * ``delta_sample_pt`` + ``delta_sample_ci_lo/hi`` = hierarchical (region/sample) bootstrap CI
-        on the ensemble delta, centred on its own point ``delta_sample_pt`` (recomputed from
-        ``predictions`` when supplied; a distinct quantity from the seed-mean ``delta``)
-      * ``ood_std/min/max`` = spread across holdout regions
-      * ``target_id`` / ``inherent_difficulty`` / ``adjusted_delta`` / ``adjusted_relative_drop`` /
-        ``adjusted_floor_norm_drop`` = inherent-difficulty decomposition (see below).
-    """
+    """ID-to-OOD deployment-gap rows for configured metrics."""
     if isinstance(metrics, str):
         metrics = [metrics]
     rng = np.random.default_rng(seed)
-    keys = ("model", "benchmark", "method", "probe_family") if any("probe_family" in r for r in rows) else (
-        "model", "benchmark", "method"
+    keys = (
+        ("model", "benchmark", "method", "probe_family")
+        if any("probe_family" in r for r in rows)
+        else ("model", "benchmark", "method")
     )
 
     def _matches(r, split_regime, budget_type, budget, combo, metric, es=None):
-        # es filters target rows by evaluation_split ("full" = full-target zero-shot anchor,
-        # "held_out" = the matched fixed-20% test). Source rows without an evaluation_split are
-        # the test anchor; old target rows without one are the held-out anchor.
         if es is not None:
             actual = r.get("evaluation_split")
             if actual is None:
                 actual = "held_out" if budget_type == "target" else "test"
             if actual != es:
                 return False
-        return (r.get("split_regime") == split_regime and r.get("budget_type") == budget_type
-                and _close(r.get("label_budget"), budget) and metric in r and r[metric] is not None
-                and all(r.get(k) == combo[i] for i, k in enumerate(keys)))
+        return (
+            r.get("split_regime") == split_regime
+            and r.get("budget_type") == budget_type
+            and _close(r.get("label_budget"), budget)
+            and metric in r
+            and r[metric] is not None
+            and all(r.get(k) == combo[i] for i, k in enumerate(keys))
+        )
 
     def _eval_matches(row: dict[str, Any], accepted: set[str], *, budget_type: str) -> bool:
         actual = row.get("evaluation_split")
@@ -327,8 +277,6 @@ def compute_deltas(
         return out
 
     def vals_by_region(split_regime, budget_type, budget, combo, metric, es=None):
-        """Like ``vals`` but grouped by held-out region (each region: one value per seed) --
-        the cluster structure the delta CI needs for a hierarchical region/seed bootstrap."""
         out: dict[Any, list[float]] = {}
         for r in rows:
             if _matches(r, split_regime, budget_type, budget, combo, metric, es=es):
@@ -351,38 +299,39 @@ def compute_deltas(
                 return found
         return {}
 
-    # per-sample predictions indexed by combo -> split_regime, for the within-region bootstrap
     pred_by: dict[tuple, dict[str, list]] = {}
-    for p in (predictions or []):
+    for p in predictions or []:
         pred_by.setdefault(tuple(p.get(k) for k in keys), {}).setdefault(p.get("split_regime"), []).append(p)
 
     combos = sorted({tuple(r.get(k) for k in keys) for r in rows}, key=lambda t: tuple(str(x) for x in t))
     out_rows: list[dict[str, Any]] = []
     for combo in combos:
-        # ID test-set label stats (from the random_id anchor rows) -> chance/no-skill floor
-        id_stat = [r for r in rows if r.get("split_regime") == "random_id" and r.get("budget_type") == "source"
-                   and _close(r.get("label_budget"), id_source_budget)
-                   and _eval_matches(r, {"test"}, budget_type="source")
-                   and all(r.get(k) == combo[i] for i, k in enumerate(keys))]
+        id_stat = [
+            r
+            for r in rows
+            if r.get("split_regime") == "random_id"
+            and r.get("budget_type") == "source"
+            and _close(r.get("label_budget"), id_source_budget)
+            and _eval_matches(r, {"test"}, budget_type="source")
+            and all(r.get(k) == combo[i] for i, k in enumerate(keys))
+        ]
 
         def _avg(field: str, id_stat=id_stat):
             xs = [float(r[field]) for r in id_stat if r.get(field) is not None]
             return float(np.mean(xs)) if xs else None
+
         pos_rate, n_cls, majority = _avg("test_pos_rate"), _avg("test_n_classes"), _avg("test_majority_rate")
 
-        # Sample-level bootstrap inputs MUST be the same quantity as `delta`: the ID anchor
-        # (configured random_id source-budget anchor) and the OOD anchor (geographic_ood target budget 0).
-        # `pred_by` holds every budget's predictions, so filter to the anchors before stacking
-        # (otherwise the CI would mix all source fractions / zero-shot+few-shot+oracle).
         id_preds = [
-            p for p in pred_by.get(combo, {}).get("random_id", [])
-            if p.get("budget_type") == "source" and _close(p.get("label_budget"), id_source_budget)
+            p
+            for p in pred_by.get(combo, {}).get("random_id", [])
+            if p.get("budget_type") == "source"
+            and _close(p.get("label_budget"), id_source_budget)
             and _eval_matches(p, {"test"}, budget_type="source")
         ]
-        # Primary OOD anchor = the FULL-target zero-shot (evaluation_split "full"); fall back to
-        # the held-out rows for older results that predate the full-target anchor.
         _ood_preds_all = [
-            p for p in pred_by.get(combo, {}).get("geographic_ood", [])
+            p
+            for p in pred_by.get(combo, {}).get("geographic_ood", [])
             if p.get("budget_type") == "target" and _close(p.get("label_budget"), ood_target_budget)
         ]
         _ood_full = [p for p in _ood_preds_all if _eval_matches(p, {"full"}, budget_type="target")]
@@ -398,10 +347,6 @@ def compute_deltas(
                 continue
             idm, oodm = float(np.mean(id_vals)), float(np.mean(ood_vals))
             id_arr, ood_arr = np.asarray(id_vals), np.asarray(ood_vals)
-            # delta CI: HIERARCHICAL bootstrap -- resample held-out regions, then seed-values
-            # WITHIN each drawn region (OOD side), and resample seeds for the single-region ID
-            # anchor. Flattening region×seed and resampling iid (the old behaviour) treats a
-            # region's correlated per-seed replicates as independent and understates the interval.
             ood_by_region = _first_vals_by_region(
                 "geographic_ood", "target", ood_target_budget, combo, metric, ("full", "test", "held_out")
             )
@@ -411,69 +356,80 @@ def compute_deltas(
                 boot = np.empty(n_boot)
                 for b in range(n_boot):
                     id_mean = id_arr[rng.integers(0, len(id_arr), len(id_arr))].mean()
-                    ood_draw = np.concatenate([
-                        region_vals[ri][rng.integers(0, len(region_vals[ri]), len(region_vals[ri]))]
-                        for ri in rng.integers(0, n_reg, n_reg)
-                    ])
+                    ood_draw = np.concatenate(
+                        [
+                            region_vals[ri][rng.integers(0, len(region_vals[ri]), len(region_vals[ri]))]
+                            for ri in rng.integers(0, n_reg, n_reg)
+                        ]
+                    )
                     boot[b] = id_mean - ood_draw.mean()
                 lo, hi = float(np.percentile(boot, 2.5)), float(np.percentile(boot, 97.5))
             else:
                 lo = hi = float("nan")
             row = dict(zip(keys, combo, strict=False))
-            row.update({
-                "metric": metric, "id": idm, "ood": oodm, "delta": idm - oodm,
-                "relative_drop": (idm - oodm) / idm if idm > 0 else float("nan"),
-                "delta_ci_lo": lo, "delta_ci_hi": hi,
-                "n_id": len(id_vals), "n_ood": len(ood_vals),
-                "ood_std": float(np.std(ood_arr)), "ood_min": float(ood_arr.min()), "ood_max": float(ood_arr.max()),
-            })
-            # worst-region metric: for each seed, find min across holdouts, then average over seeds.
-            # Use the FULL-target zero-shot rows (the deployment scope), falling back to held_out
-            # for older results -- NEVER mix the two scopes (the held-out 20% is noisier and would
-            # masquerade as the worst region).
+            row.update(
+                {
+                    "metric": metric,
+                    "id": idm,
+                    "ood": oodm,
+                    "delta": idm - oodm,
+                    "relative_drop": (idm - oodm) / idm if idm > 0 else float("nan"),
+                    "delta_ci_lo": lo,
+                    "delta_ci_hi": hi,
+                    "n_id": len(id_vals),
+                    "n_ood": len(ood_vals),
+                    "ood_std": float(np.std(ood_arr)),
+                    "ood_min": float(ood_arr.min()),
+                    "ood_max": float(ood_arr.max()),
+                }
+            )
             _seed_holdout: dict[int, list[float]] = {}
             for want in ("full", "test", "held_out"):
                 for r in rows:
-                    if (r.get("split_regime") == "geographic_ood" and r.get("budget_type") == "target"
-                            and _close(r.get("label_budget"), ood_target_budget) and metric in r and r[metric] is not None
-                            and (r.get("evaluation_split") or "held_out") == want
-                            and all(r.get(k) == combo[i] for i, k in enumerate(keys))):
+                    if (
+                        r.get("split_regime") == "geographic_ood"
+                        and r.get("budget_type") == "target"
+                        and _close(r.get("label_budget"), ood_target_budget)
+                        and metric in r
+                        and r[metric] is not None
+                        and (r.get("evaluation_split") or "held_out") == want
+                        and all(r.get(k) == combo[i] for i, k in enumerate(keys))
+                    ):
                         s = r.get("seed")
                         if s is not None:
                             _seed_holdout.setdefault(int(s), []).append(float(r[metric]))
                 if _seed_holdout:
                     break
             if _seed_holdout:
-                # worst region = MIN for higher-better metrics, MAX for error metrics (brier/nll/ece)
                 pick_worst = max if metric in _LOWER_BETTER else min
                 seed_worst = np.asarray([pick_worst(vs) for vs in _seed_holdout.values()])
-                row.update({
-                    "ood_worst_region": float(np.mean(seed_worst)),
-                    "ood_worst_region_std": float(np.std(seed_worst)) if len(seed_worst) > 1 else float("nan"),
-                })
-            # floor-normalized drop: fraction of above-chance ID performance erased OOD
+                row.update(
+                    {
+                        "ood_worst_region": float(np.mean(seed_worst)),
+                        "ood_worst_region_std": float(np.std(seed_worst)) if len(seed_worst) > 1 else float("nan"),
+                    }
+                )
             chance = _chance(metric, pos_rate, n_cls, majority)
             row["chance"] = float(chance) if chance is not None else float("nan")
             row["floor_norm_drop"] = (
                 (idm - oodm) / (idm - chance) if (chance is not None and (idm - chance) > 1e-9) else float("nan")
             )
-            # hierarchical (region/sample) bootstrap CI on the ENSEMBLE delta, centred on its own
-            # point estimate delta_sample_pt = id_pt - ood_pt (distinct from the seed-mean `delta`).
             if id_preds and ood_preds:
                 lo_s, hi_s, id_pt, ood_pt = _sample_delta_ci(metric, id_preds, ood_preds, n_boot_sample, rng)
                 if not np.isnan(id_pt):
-                    row.update({
-                        "delta_sample_pt": id_pt - ood_pt,
-                        "delta_sample_ci_lo": lo_s, "delta_sample_ci_hi": hi_s,
-                        "n_id_samples": len(id_preds), "n_ood_samples": len(ood_preds),
-                    })
-            # --- inherent-difficulty decomposition ---
-            # target-ID upper-bound (budget -1): train on the 80% target pool, test on the fixed
-            # held-out 20%. The decomposition compares it to the zero-shot on that SAME held-out
-            # 20% (``ood_matched``) -- like-with-like -- NOT the full-target primary ``ood``.
+                    row.update(
+                        {
+                            "delta_sample_pt": id_pt - ood_pt,
+                            "delta_sample_ci_lo": lo_s,
+                            "delta_sample_ci_hi": hi_s,
+                            "n_id_samples": len(id_preds),
+                            "n_ood_samples": len(ood_preds),
+                        }
+                    )
             tid_vals = (
                 _first_vals("geographic_ood", "target", target_id_budget, combo, metric, ("held_out", "test"))
-                if target_id_budget is not None else []
+                if target_id_budget is not None
+                else []
             )
             if tid_vals:
                 tidm = float(np.mean(tid_vals))
@@ -481,16 +437,19 @@ def compute_deltas(
                     "geographic_ood", "target", ood_target_budget, combo, metric, ("held_out", "test")
                 )
                 ood_matched = float(np.mean(ood_matched_vals)) if ood_matched_vals else oodm
-                row.update({
-                    "target_id": tidm,
-                    "ood_matched": ood_matched,
-                    "inherent_difficulty": idm - tidm,
-                    "adjusted_delta": tidm - ood_matched,
-                    "adjusted_relative_drop": (tidm - ood_matched) / idm if idm > 0 else float("nan"),
-                    "adjusted_floor_norm_drop": (
-                        (tidm - ood_matched) / (idm - chance)
-                        if (chance is not None and (idm - chance) > 1e-9) else float("nan")
-                    ),
-                })
+                row.update(
+                    {
+                        "target_id": tidm,
+                        "ood_matched": ood_matched,
+                        "inherent_difficulty": idm - tidm,
+                        "adjusted_delta": tidm - ood_matched,
+                        "adjusted_relative_drop": (tidm - ood_matched) / idm if idm > 0 else float("nan"),
+                        "adjusted_floor_norm_drop": (
+                            (tidm - ood_matched) / (idm - chance)
+                            if (chance is not None and (idm - chance) > 1e-9)
+                            else float("nan")
+                        ),
+                    }
+                )
             out_rows.append(row)
     return out_rows

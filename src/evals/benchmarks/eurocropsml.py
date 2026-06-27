@@ -8,8 +8,8 @@ principled coarsening to a broader crop-type level. We truncate to
 ``HCAT_PREFIX`` digits (6 -> ~36 crop-type classes, vs ~100 at full granularity)
 and re-encode to contiguous ids.
 
-Evaluated as transnational transfer: train on Latvia + Portugal, test on Estonia
-(``groups`` is the country, so holding out "Estonia" reproduces that split).
+The official regime reads the release split files for Latvia->Estonia and
+Latvia+Portugal->Estonia. Geographic OOD uses country/domain holdouts.
 
 The loader emits the NATIVE per-parcel acquisition series (every real S2 observation, true
 dates, ALL 13 native bands + NDVI). It does NOT pre-aggregate or drop bands: each model does its
@@ -35,7 +35,7 @@ from dataio.get_input import (
 BENCHMARK = "eurocropsml"
 LABEL_KIND = "multiclass"
 HOLDOUTS = ["Estonia"]
-OFFICIAL_HOLDOUTS = ["Estonia"]
+OFFICIAL_HOLDOUTS = ["latvia_vs_estonia", "latvia_portugal_vs_estonia"]
 GEOGRAPHIC_HOLDOUTS = ["Estonia", "Latvia", "Portugal"]
 GEOGRAPHIC_PURGE_KM = 25.0
 SPATIAL_CLUSTER_SPLIT = {
@@ -59,6 +59,32 @@ EC_COUNTRY_PREFIX = {"EE": "Estonia", "LV": "Latvia", "PT": "Portugal"}
 
 def _ec_country(stem: str) -> str:
     return EC_COUNTRY_PREFIX.get(stem[:2], stem[:2])
+
+
+def _split_indices(split_ids: list[str], id_to_idx: dict[str, int]) -> np.ndarray:
+    return np.asarray([id_to_idx[x] for x in split_ids if x in id_to_idx], dtype=np.int64)
+
+
+def _official_splits(base: Path, sample_ids: list[str]) -> dict[str, dict[str, np.ndarray]]:
+    import json
+
+    id_to_idx = {sid: i for i, sid in enumerate(sample_ids)}
+    out: dict[str, dict[str, np.ndarray]] = {}
+    for name in OFFICIAL_HOLDOUTS:
+        split_dir = base / "split" / name
+        pretrain = split_dir / "pretrain" / "region_split.json"
+        finetune = split_dir / "finetune" / "region_split_all.json"
+        if not (pretrain.exists() and finetune.exists()):
+            continue
+        pre = json.loads(pretrain.read_text())
+        fin = json.loads(finetune.read_text())
+        out[name] = {
+            "train": _split_indices(pre.get("train", []), id_to_idx),
+            "val": _split_indices(pre.get("val", []), id_to_idx),
+            "test": _split_indices(fin.get("test", []), id_to_idx),
+            "target_train": _split_indices(fin.get("train", []) + fin.get("val", []), id_to_idx),
+        }
+    return out
 
 
 def load_benchmark(
@@ -86,7 +112,7 @@ def load_benchmark(
         raise ValueError(f"No EuroCropsML npz files in {preprocess_dir}")
 
     s2_series, s2_months, s2_doy, s2_years = [], [], [], []
-    label_codes, groups, latlons, years = [], [], [], []
+    label_codes, groups, latlons, years, sample_ids = [], [], [], [], []
     for path in files:
         with np.load(str(path)) as data:
             raw = data["data"].astype(np.float32)
@@ -107,6 +133,7 @@ def load_benchmark(
         groups.append(_ec_country(path.stem))
         latlons.append((float(center[1]), float(center[0])) if center is not None else (float("nan"), float("nan")))
         years.append(int(str(dates_arr.ravel()[0])[:4]) if dates_arr.size else 0)
+        sample_ids.append(path.name)
 
     if not s2_series:
         raise ValueError(f"No valid EuroCropsML parcels parsed from {preprocess_dir}")
@@ -128,6 +155,8 @@ def load_benchmark(
         latlon=np.asarray(latlons, dtype=np.float32),
         label_names=list(encoder.classes_),
         years=np.asarray(years, dtype=np.int64),
+        sample_ids=np.asarray(sample_ids, dtype=object),
+        official_splits=_official_splits(base, sample_ids),
     )
 
 
