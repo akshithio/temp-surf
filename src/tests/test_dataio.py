@@ -104,6 +104,27 @@ def test_load_cached_embeddings_reads_existing_matrix(tmp_path, monkeypatch) -> 
     np.testing.assert_array_equal(actual, expected.astype(np.float32))
 
 
+def test_dense_cache_skips_tiles_without_valid_pixels(tmp_path, monkeypatch) -> None:
+    class EmptyDenseBench:
+        n_samples = 1
+        tile_size = 64
+        patches = ()
+
+        def iter_tiles(self, cache_root=None, overwrite=False):
+            yield "empty", 1, object(), np.array([], dtype=np.uint8)
+
+    def fail_build_model(*_args, **_kwargs):
+        raise AssertionError("all-void dense tiles should not build a model")
+
+    monkeypatch.setattr(cacheutils, "dense_embedding_cache_dir", lambda *_args, **_kwargs: tmp_path / "dense")
+    monkeypatch.setattr(cacheutils, "build_model", fail_build_model)
+
+    root = cacheutils.extract_dense_and_cache(EmptyDenseBench(), "pastis", "raw", "full")
+
+    assert root == tmp_path / "dense"
+    assert list(root.rglob("*.npy")) == []
+
+
 def test_cropharvest_geo_group_collapses_rwanda_aliases() -> None:
     assert cropharvest._ch_geo_group("rwanda-ceo") == "rwanda"
     assert cropharvest._ch_geo_group("rwanda") == "rwanda"
