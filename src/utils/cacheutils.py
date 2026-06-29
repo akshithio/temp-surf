@@ -431,6 +431,8 @@ def extract_dense_and_cache(
     root.mkdir(parents=True, exist_ok=True)
     model = None
     for tile_id, fold, tile, labels in bench.iter_tiles(cache_root=root, overwrite=overwrite):
+        if len(labels) == 0:
+            continue
         fold_dir = root / f"fold_{fold}"
         fold_dir.mkdir(parents=True, exist_ok=True)
         feature_path = fold_dir / f"{tile_id}.npy"
