@@ -3,5 +3,6 @@ __pycache__
 *.egg-info/
 data/input/
 data/cache/
+data/output/
 .env
 .ipynb_checkpoints/
