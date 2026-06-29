@@ -126,37 +126,53 @@ class PastisBenchmark:
         tiles_per_patch = (128 // self.tile_size) ** 2
         return np.repeat([patch.latlon for patch in self.patches], tiles_per_patch, axis=0).astype(np.float32)
 
-    def iter_tiles(self, folds: set[int] | None = None):
+    def iter_tiles(self, folds: set[int] | None = None, cache_root: Path | None = None, overwrite: bool = False):
         """Yield native-cadence tiles."""
         for patch in self.patches:
             if folds is not None and patch.fold not in folds:
                 continue
+            tile_coords = [
+                (row, col)
+                for row in range(0, 128, self.tile_size)
+                for col in range(0, 128, self.tile_size)
+            ]
+            if cache_root is not None and not overwrite:
+                fold_dir = cache_root / f"fold_{patch.fold}"
+                tile_coords = [
+                    (row, col)
+                    for row, col in tile_coords
+                    if not (
+                        (fold_dir / f"{patch.patch_id}_{row // self.tile_size}_{col // self.tile_size}.npy").exists()
+                        and (fold_dir / f"{patch.patch_id}_{row // self.tile_size}_{col // self.tile_size}.labels.npy").exists()
+                    )
+                ]
+                if not tile_coords:
+                    continue
             s2 = np.load(patch.s2_path, mmap_mode="r")  # (T_s2, 10, 128, 128) native cadence
             s1 = np.load(patch.s1_path, mmap_mode="r")  # (T_s1, 3, 128, 128)
             target = np.load(patch.target_path, mmap_mode="r")[0]
             s2_ones = np.ones(s2.shape[0], dtype=np.float32)
             s1_ones = np.ones(s1.shape[0], dtype=np.float32)
 
-            for row in range(0, target.shape[0], self.tile_size):
-                for col in range(0, target.shape[1], self.tile_size):
-                    ys = slice(row, row + self.tile_size)
-                    xs = slice(col, col + self.tile_size)
-                    labels = np.asarray(target[ys, xs], dtype=np.int64)
-                    valid = labels != self.ignore_index
-                    tile_id = f"{patch.patch_id}_{row // self.tile_size}_{col // self.tile_size}"
-                    tile = PastisTile(
-                        s2=np.asarray(s2[:, :, ys, xs], dtype=np.float32),
-                        s1=np.asarray(s1[:, :, ys, xs], dtype=np.float32),
-                        s2_months=patch.s2_months,
-                        s1_months=patch.s1_months,
-                        s2_mask=s2_ones,
-                        s1_mask=s1_ones,
-                        labels=labels,
-                        valid=valid,
-                        fold=patch.fold,
-                        latlon=patch.latlon,
-                    )
-                    yield tile_id, patch.fold, tile, labels[valid]
+            for row, col in tile_coords:
+                ys = slice(row, row + self.tile_size)
+                xs = slice(col, col + self.tile_size)
+                labels = np.asarray(target[ys, xs], dtype=np.int64)
+                valid = labels != self.ignore_index
+                tile_id = f"{patch.patch_id}_{row // self.tile_size}_{col // self.tile_size}"
+                tile = PastisTile(
+                    s2=np.asarray(s2[:, :, ys, xs], dtype=np.float32),
+                    s1=np.asarray(s1[:, :, ys, xs], dtype=np.float32),
+                    s2_months=patch.s2_months,
+                    s1_months=patch.s1_months,
+                    s2_mask=s2_ones,
+                    s1_mask=s1_ones,
+                    labels=labels,
+                    valid=valid,
+                    fold=patch.fold,
+                    latlon=patch.latlon,
+                )
+                yield tile_id, patch.fold, tile, labels[valid]
 
 
 # --------------------------------------------------------------------------- #

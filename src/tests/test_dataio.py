@@ -58,6 +58,16 @@ def test_pastis_is_lazy_and_yields_64_pixel_tiles(tmp_path) -> None:
     assert np.isclose(pixels.latlon[:, 0].mean(), 46.005)
     assert 19 not in tiles[0][3]
 
+    cache_root = tmp_path / "cache"
+    fold = cache_root / "fold_1"
+    fold.mkdir(parents=True)
+    for tile_id in ("10000_0_0", "10000_0_1", "10000_1_0", "10000_1_1"):
+        np.save(fold / f"{tile_id}.npy", np.zeros((1, 2), dtype=np.float32))
+        np.save(fold / f"{tile_id}.labels.npy", np.zeros(1, dtype=np.uint8))
+    (base / "DATA_S2" / "S2_10000.npy").unlink()
+
+    assert list(bench.iter_tiles(cache_root=cache_root, overwrite=False)) == []
+
 
 def test_summarize_rows_ignores_legacy_rows_missing_grouping_keys() -> None:
     rows = [

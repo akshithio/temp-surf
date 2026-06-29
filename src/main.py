@@ -25,7 +25,7 @@ from utils import ioutils as IOU  # noqa: E402
 from utils import perfutils as perf  # noqa: E402
 
 # === Configuration ===========================================================
-BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis"]
+BENCHMARKS = ["eurocropsml"]
 RUN_STAGES = ["gen_embeddings", "probing"]
 SPLIT_REGIMES = ["random_id", "official", "geographic_ood", "spatial_cluster_ood"]
 ACTIVE_PROBES = ["logistic"]
@@ -35,8 +35,9 @@ BUDGET_REGIMES = {
 }
 MAX_SAMPLES = None
 MAX_DENSE_PIXELS = 50_000  # sampled pixels per PASTIS fold partition
-OVERWRITE_MODE = True
+OVERWRITE_MODE = False
 STRICT_MODE = False
+WRITE_PREDICTIONS = False
 LAUNCH_GPU_SHARDS = True
 GPU_SHARDS = None
 SEEDS = [0]
@@ -89,6 +90,7 @@ def _run_tabular_pair(
     overwrite_mode,
     strict_mode,
     enc_kwargs,
+    write_predictions=True,
 ) -> None:
     stages = runstate.validate_run_stages(run_stages)
     gen_embeddings = "gen_embeddings" in stages
@@ -145,6 +147,7 @@ def _run_tabular_pair(
         budget_regimes=budget_regimes,
         max_samples=max_samples,
         max_dense_pixels=max_dense_pixels,
+        write_predictions=write_predictions,
     )
     runstate.check_run_signature(results_dir, signature, overwrite_mode=overwrite_mode)
     rows_path = results_dir / "probe_results.jsonl"
@@ -258,9 +261,33 @@ def _run_tabular_pair(
                         todo = _missing(base, "target", target_budgets)
                         if todo:
                             rerun_keys.update((*base, "target", b, sc) for b in todo for sc in _scopes("target", b))
+                            for budget in todo:
+                                jobs.append(
+                                    delayed(runstate._probe_cell_target)(
+                                        probe_fn_tgt,
+                                        emb,
+                                        train,
+                                        val,
+                                        test,
+                                        y,
+                                        groups,
+                                        cls,
+                                        kwargs,
+                                        uses_target_flag(cls),
+                                        {**meta, "budget_type": "target"},
+                                        seed,
+                                        family,
+                                        [budget],
+                                        write_predictions=write_predictions,
+                                    )
+                                )
+                    todo_src = _missing(base, "source", source_budgets, has_source_diag)
+                    if todo_src:
+                        rerun_keys.update((*base, "source", b, sc) for b in todo_src for sc in _scopes("source", b, has_source_diag))
+                        for budget in todo_src:
                             jobs.append(
-                                delayed(runstate._probe_cell_target)(
-                                    probe_fn_tgt,
+                                delayed(runstate._probe_cell)(
+                                    probe_fn_src,
                                     emb,
                                     train,
                                     val,
@@ -270,43 +297,23 @@ def _run_tabular_pair(
                                     cls,
                                     kwargs,
                                     uses_target_flag(cls),
-                                    {**meta, "budget_type": "target"},
+                                    {**meta, "budget_type": "source"},
                                     seed,
                                     family,
-                                    todo,
+                                    [budget],
+                                    source_val,
+                                    source_test,
+                                    write_predictions=write_predictions,
                                 )
                             )
-                    todo_src = _missing(base, "source", source_budgets, has_source_diag)
-                    if todo_src:
-                        rerun_keys.update((*base, "source", b, sc) for b in todo_src for sc in _scopes("source", b, has_source_diag))
-                        jobs.append(
-                            delayed(runstate._probe_cell)(
-                                probe_fn_src,
-                                emb,
-                                train,
-                                val,
-                                test,
-                                y,
-                                groups,
-                                cls,
-                                kwargs,
-                                uses_target_flag(cls),
-                                {**meta, "budget_type": "source"},
-                                seed,
-                                family,
-                                todo_src,
-                                source_val,
-                                source_test,
-                            )
-                        )
 
-    rows = runstate.prune_partial_budgets(rows, rows_path, preds_path, rerun_keys)
+    rows = runstate.prune_partial_budgets(rows, rows_path, preds_path if write_predictions else None, rerun_keys)
 
     if jobs:
         n_jobs = perf._effective_n_jobs(emb)
         print(f"  probe jobs={len(jobs)} n_jobs={n_jobs}", flush=True)
         for cell_rows, cell_preds in Parallel(n_jobs=n_jobs, return_as="generator", prefer="threads")(jobs):
-            if cell_preds:
+            if write_predictions and cell_preds:
                 IOU.append_jsonl(preds_path, cell_preds)
             IOU.append_jsonl(rows_path, cell_rows)
             rows.extend(cell_rows)
@@ -332,7 +339,7 @@ def _run_tabular_pair(
     deltas = IOU.compute_deltas(
         rows,
         metrics,
-        predictions=IOU.read_jsonl(preds_path),
+        predictions=IOU.read_jsonl(preds_path) if write_predictions else None,
         id_source_budget=EV._id_source_budget(source_budgets),
         ood_target_budget=0,
         target_id_budget=EV.TARGET_ID_UPPER_BOUND if EV.TARGET_ID_UPPER_BOUND in target_budgets else None,
@@ -380,6 +387,7 @@ def run_pair(
     budget_regimes,
     overwrite_mode,
     strict_mode,
+    write_predictions,
     enc_kwargs,
 ) -> None:
     """Run one configured model/benchmark pair."""
@@ -397,6 +405,7 @@ def run_pair(
             budget_regimes,
             overwrite_mode,
             strict_mode,
+            write_predictions,
             enc_kwargs,
         )
         return
@@ -413,6 +422,7 @@ def run_pair(
         overwrite_mode,
         strict_mode,
         enc_kwargs,
+        write_predictions,
     )
 
 
@@ -444,6 +454,7 @@ def main() -> int:
                 budget_regimes=BUDGET_REGIMES,
                 overwrite_mode=OVERWRITE_MODE,
                 strict_mode=STRICT_MODE,
+                write_predictions=WRITE_PREDICTIONS,
                 enc_kwargs=enc_kwargs,
             )
         except NotImplementedError as exc:

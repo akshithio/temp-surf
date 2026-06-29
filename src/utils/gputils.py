@@ -383,6 +383,15 @@ def device() -> str:
         return "cpu"
 
 
+def _visible_gpu_ids(local_gpus: int) -> list[str]:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible:
+        ids = [part.strip() for part in visible.split(",") if part.strip()]
+        if len(ids) >= local_gpus:
+            return ids[:local_gpus]
+    return [str(i) for i in range(local_gpus)]
+
+
 def shard_indices() -> tuple[int, int]:
     idx, n = int(os.environ.get(SHARD_ENV, 0)), int(os.environ.get(NUM_SHARDS_ENV, 1))
     if n < 1:
@@ -426,12 +435,13 @@ def fan_out(num_shards: int | None = None) -> int:
     log_dir = scratch / "output" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     per_shard_cores = max(1, (os.cpu_count() or 2) // local_gpus)
+    visible_gpu_ids = _visible_gpu_ids(local_gpus)
     procs = []
     for i in range(local_gpus):
         shard = base + i
         env = {
             **os.environ,
-            "CUDA_VISIBLE_DEVICES": str(i),
+            "CUDA_VISIBLE_DEVICES": visible_gpu_ids[i],
             SHARD_ENV: str(shard),
             NUM_SHARDS_ENV: str(total),
             "LOKY_MAX_CPU_COUNT": str(per_shard_cores),
@@ -445,11 +455,17 @@ def fan_out(num_shards: int | None = None) -> int:
             stdout=log,
             stderr=subprocess.STDOUT,
         )
-        print(f"[gputils] shard {shard}/{total} -> GPU {i} | pid {proc.pid} | log {log.name}", flush=True)
+        print(
+            f"[gputils] shard {shard}/{total} -> GPU {visible_gpu_ids[i]} | pid {proc.pid} | log {log.name}",
+            flush=True,
+        )
         procs.append((proc, log))
     code = 0
     for proc, log in procs:
-        code = max(code, proc.wait())
+        ret = proc.wait()
+        if ret < 0:
+            ret = 128 - ret
+        code = max(code, ret)
         log.close()
     print(f"[gputils] all {local_gpus} local shard(s) done (max exit code {code})", flush=True)
     return code
