@@ -470,13 +470,47 @@ def _sweep_target_budgets(
             )
 
 
-def _effective_n_jobs(embeddings) -> int:
-    """Concurrent probe fits: use 85 percent of available cores, bounded by memory."""
-    cpu_count = os.cpu_count() or 1
+def _cpu_capacity() -> int:
+    counts = [os.cpu_count() or 1]
+    try:
+        counts.append(len(os.sched_getaffinity(0)))
+    except Exception:
+        pass
+    for name in ("LOKY_MAX_CPU_COUNT", "SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"):
+        value = os.environ.get(name)
+        if value and value.isdigit():
+            counts.append(int(value))
+    return max(1, min(counts))
+
+
+def _available_memory_bytes() -> int:
+    try:
+        with open("/proc/meminfo") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return int(os.environ.get("PROBE_COPY_BUDGET_BYTES", str(8_000_000_000)))
+
+
+def _effective_n_jobs(embeddings=None, *, job_bytes: int | None = None) -> int:
+    """Concurrent probe fits: use available cores, bounded by measured free memory."""
+    cpu_count = _cpu_capacity()
     requested = max(1, int(0.85 * cpu_count))
-    arrays = embeddings.values() if hasattr(embeddings, "values") else [embeddings]
-    max_bytes = max((np.asarray(arr).nbytes for arr in arrays), default=0)
-    budget = int(os.environ.get("PROBE_COPY_BUDGET_BYTES", str(8_000_000_000)))
-    if max_bytes > 0:
+    tabular_probe = job_bytes is None and embeddings is not None
+    if job_bytes is not None:
+        max_bytes = int(job_bytes)
+    elif embeddings is None:
+        max_bytes = 0
+    else:
+        arrays = embeddings.values() if hasattr(embeddings, "values") else [embeddings]
+        max_bytes = max((np.asarray(arr).nbytes for arr in arrays), default=0)
+    if tabular_probe:
+        max_bytes *= 3
+    explicit_budget = os.environ.get("PROBE_COPY_BUDGET_BYTES")
+    memory_fraction = 0.65 if job_bytes is not None else 0.50
+    budget = int(explicit_budget) if explicit_budget else int(memory_fraction * _available_memory_bytes())
+    if max_bytes > 0 and budget > 0:
         requested = max(1, min(requested, budget // max_bytes))
     return requested
