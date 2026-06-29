@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 
 import numpy as np
@@ -439,6 +440,36 @@ def test_input_fingerprint_hashes_file_content(tmp_path):
     f.write_bytes(b"BBBB")
     os.utime(f, (mtime, mtime))
     assert C._input_fingerprint(d) != a
+
+
+def test_pastis_fingerprint_ignores_unused_heavy_products(tmp_path, monkeypatch):
+    bench = tmp_path / "pastis"
+    for name in ("DATA_S2", "DATA_S1A", "ANNOTATIONS", "DATA_S1D"):
+        (bench / name).mkdir(parents=True)
+    (bench / "metadata.geojson").write_text(json.dumps({
+        "type": "FeatureCollection",
+        "features": [
+            {"type": "Feature", "properties": {"ID_PATCH": 10001}, "geometry": None},
+        ],
+    }))
+    for path in (
+        bench / "DATA_S2" / "S2_10001.npy",
+        bench / "DATA_S1A" / "S1A_10001.npy",
+        bench / "ANNOTATIONS" / "TARGET_10001.npy",
+    ):
+        path.write_bytes(b"required")
+    unused = bench / "DATA_S1D" / "S1D_10001.npy"
+    unused.write_bytes(b"unused")
+
+    def guarded_hash(path, h):
+        assert "DATA_S1D" not in str(path)
+        return original_hash(path, h)
+
+    original_hash = C._update_file_content_hash
+    monkeypatch.setattr(C, "_update_file_content_hash", guarded_hash)
+    fp = C._pastis_input_fingerprint(bench, "deep")
+    unused.write_bytes(b"changed")
+    assert C._pastis_input_fingerprint(bench, "deep") == fp
 
 
 def test_run_signature_includes_cacheutils_in_code_hash():

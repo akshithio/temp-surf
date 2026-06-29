@@ -6,6 +6,7 @@ import functools
 import hashlib
 import importlib
 import inspect
+import json
 import os
 import pickle
 import re
@@ -116,8 +117,51 @@ def _input_fingerprint(bench_dir: Path, mode: str | None = None) -> str:
     return h.hexdigest()[:10]
 
 
+def _pastis_input_fingerprint(bench_dir: Path, mode: str | None = None) -> str:
+    """Fingerprint the PASTIS inputs actually consumed by the loader.
+
+    The release directory also contains large unused products such as descending-orbit
+    S1D and instance annotations. Walking and hashing every byte forces a tens-of-GB
+    reread before every resumed run, even when the dense tile cache is already complete.
+    PASTIS release arrays are immutable staged inputs here, so the manifest uses
+    metadata content plus array size/mtime identity for the S2, S1A, and TARGET files.
+    """
+    mode = (mode or os.environ.get("DATA_FINGERPRINT", "deep")).strip().lower()
+    if mode == "top":
+        return _input_fingerprint(bench_dir, mode)
+
+    h = hashlib.sha256()
+    metadata = bench_dir / "metadata.geojson"
+    try:
+        h.update(b"metadata.geojson\0")
+        _update_file_content_hash(metadata, h)
+        geo = json.loads(metadata.read_text())
+        patch_ids = sorted({int(feature["properties"]["ID_PATCH"]) for feature in geo["features"]})
+    except Exception:
+        h.update(b"metadata.geojson:<missing-or-invalid>")
+        patch_ids = []
+
+    required = (
+        ("DATA_S2", "S2_{}.npy"),
+        ("DATA_S1A", "S1A_{}.npy"),
+        ("ANNOTATIONS", "TARGET_{}.npy"),
+    )
+    for patch_id in patch_ids:
+        for subdir, template in required:
+            rel = Path(subdir) / template.format(patch_id)
+            path = bench_dir / rel
+            try:
+                st = path.stat()
+                h.update(f"{rel.as_posix()}:{st.st_size}:{st.st_mtime_ns}".encode())
+            except OSError:
+                h.update(f"{rel.as_posix()}:<missing>".encode())
+    return h.hexdigest()[:10]
+
+
 @functools.lru_cache(maxsize=32)
 def _benchmark_input_fingerprint(benchmark: str, mode: str, _data_version: str) -> str:
+    if benchmark == "pastis":
+        return _pastis_input_fingerprint(INPUT_ROOT / benchmark, mode)
     return _input_fingerprint(INPUT_ROOT / benchmark, mode)
 
 
@@ -386,7 +430,7 @@ def extract_dense_and_cache(
     root = dense_embedding_cache_dir(bench, benchmark, model_name, tag, enc_kwargs.get("weights_path"))
     root.mkdir(parents=True, exist_ok=True)
     model = None
-    for tile_id, fold, tile, labels in bench.iter_tiles():
+    for tile_id, fold, tile, labels in bench.iter_tiles(cache_root=root, overwrite=overwrite):
         fold_dir = root / f"fold_{fold}"
         fold_dir.mkdir(parents=True, exist_ok=True)
         feature_path = fold_dir / f"{tile_id}.npy"
