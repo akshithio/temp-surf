@@ -355,9 +355,19 @@ def require_dense_cache(bench: PastisBenchmark, benchmark: str, model_name: str,
     missing: list[str] = []
     for patch in bench.patches:
         fold_dir = root / f"fold_{patch.fold}"
+        target = None
+        target_path = getattr(patch, "target_path", None)
+        if target_path is not None:
+            target = np.load(target_path, mmap_mode="r")[0]
         for r in range(tiles_per_axis):
             for c in range(tiles_per_axis):
                 tile_id = f"{patch.patch_id}_{r}_{c}"
+                if target is not None:
+                    row = r * bench.tile_size
+                    col = c * bench.tile_size
+                    labels = target[row:row + bench.tile_size, col:col + bench.tile_size]
+                    if not np.any(labels != bench.ignore_index):
+                        continue
                 label_path = fold_dir / f"{tile_id}.labels.npy"
                 expected.add(label_path)
                 if not ((fold_dir / f"{tile_id}.npy").exists() and label_path.exists()):
