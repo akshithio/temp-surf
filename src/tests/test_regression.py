@@ -338,6 +338,27 @@ def test_require_dense_cache_rejects_extra_tile(tmp_path, monkeypatch):
         C.require_dense_cache(bench, "pastis", "raw", "tag")
 
 
+def test_require_dense_cache_ignores_all_void_tiles(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from utils import cacheutils as C
+
+    monkeypatch.setattr(C, "EMBEDDINGS_DIR", tmp_path)
+    target = np.zeros((1, 128, 128), dtype=np.uint8)
+    target[0, 64:, 64:] = 19
+    target_path = tmp_path / "target.npy"
+    np.save(target_path, target)
+    patch = SimpleNamespace(patch_id=7, fold=1, target_path=target_path)
+    bench = SimpleNamespace(patches=(patch,), tile_size=64, n_samples=4, ignore_index=19)
+    fold = C.dense_embedding_cache_dir(bench, "pastis", "raw", "tag") / "fold_1"
+    fold.mkdir(parents=True, exist_ok=True)
+    for tile_id in ("7_0_0", "7_0_1", "7_1_0"):
+        (fold / f"{tile_id}.npy").write_bytes(b"x")
+        (fold / f"{tile_id}.labels.npy").write_bytes(b"x")
+
+    assert C.require_dense_cache(bench, "pastis", "raw", "tag") == fold.parent
+
+
 def test_run_signature_rejects_empty_or_corrupt(tmp_path, monkeypatch):
     from utils import runstate
     d = tmp_path / "r"
