@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 
 import numpy as np
@@ -220,8 +221,8 @@ def test_target_sweep_shared_test_and_full_pool_oracle():
     full = [r for r in rows if r["label_budget"] == 0 and r.get("evaluation_split") == "full"]
     assert len(full) == 1 and full[0]["n_test"] == 200
     oracle = next(r for r in rows if r["label_budget"] == EV.TARGET_ID_UPPER_BOUND)
-    assert oracle["n_train_sub"] >= int(0.75 * 200)            # oracle trains on ~80% (not 64%)
-    assert oracle["threshold_source"] == "target_internal_tuned_oof"  # source-free tuned + OOF threshold
+    assert oracle["n_train_sub"] >= int(0.75 * 200)
+    assert oracle["threshold_source"] == "target_internal_tuned_oof"
 
 
 def test_run_signature_guard_rejects_mismatch(tmp_path, monkeypatch):
@@ -337,6 +338,45 @@ def test_require_dense_cache_rejects_extra_tile(tmp_path, monkeypatch):
         C.require_dense_cache(bench, "pastis", "raw", "tag")
 
 
+def test_require_dense_cache_ignores_all_void_tiles(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from utils import cacheutils as C
+
+    monkeypatch.setattr(C, "EMBEDDINGS_DIR", tmp_path)
+    target = np.zeros((1, 128, 128), dtype=np.uint8)
+    target[0, 64:, 64:] = 19
+    target_path = tmp_path / "target.npy"
+    np.save(target_path, target)
+    patch = SimpleNamespace(patch_id=7, fold=1, target_path=target_path)
+    bench = SimpleNamespace(patches=(patch,), tile_size=64, n_samples=4, ignore_index=19)
+    fold = C.dense_embedding_cache_dir(bench, "pastis", "raw", "tag") / "fold_1"
+    fold.mkdir(parents=True, exist_ok=True)
+    for tile_id in ("7_0_0", "7_0_1", "7_1_0"):
+        (fold / f"{tile_id}.npy").write_bytes(b"x")
+        (fold / f"{tile_id}.labels.npy").write_bytes(b"x")
+
+    assert C.require_dense_cache(bench, "pastis", "raw", "tag") == fold.parent
+
+
+def test_dense_loaders_return_cached_features_unaltered(tmp_path):
+    """Both loaders hand back the frozen embedding as cached -- same width, no extra columns."""
+    fold = tmp_path / "fold_1"
+    fold.mkdir()
+    np.save(fold / "7_0_0.npy", np.ones((2, 3), dtype=np.float32))
+    np.save(fold / "7_0_0.labels.npy", np.array([1, 2], dtype=np.uint8))
+
+    x, y, groups, _tiles, patch_ids = C.load_dense_samples(tmp_path, {1}, 10, 0)
+    assert x.shape == (2, 3)
+    np.testing.assert_array_equal(y, np.array([1, 2]))
+    np.testing.assert_array_equal(groups, np.array([1, 1]))
+    np.testing.assert_array_equal(patch_ids, np.array([7, 7]))
+
+    tiles = list(C.iter_dense_tiles(tmp_path, {1}))
+    assert len(tiles) == 1
+    np.testing.assert_allclose(tiles[0][0], x)
+
+
 def test_run_signature_rejects_empty_or_corrupt(tmp_path, monkeypatch):
     from utils import runstate
     d = tmp_path / "r"
@@ -357,7 +397,7 @@ def test_leave_one_domain_out_dropped_domain_surfaced(monkeypatch):
         LEAVE_ONE_DOMAIN_OUT = True
 
         @staticmethod
-        def assign_domains(bench):
+        def assign_domains(bench, holdouts=None):
             return np.array(["A", "A", "B", "B", "C", "C"], dtype=object)
 
         @staticmethod
@@ -394,6 +434,17 @@ def test_run_signature_includes_seeds_and_enc_kwargs():
     assert runstate.run_signature(
         "raw", "tag", ["random_id"], [0, 1, 2], {"device": "cpu", "weights_path": "/x"}, **kwargs
     ) != base
+    # Methods can no longer vary -- the harness is ERM-only and the signature carries the literal
+    # methods=['erm']. Probe tuning is the knob that legitimately moves the signature now.
+    prev = os.environ.get("RB_PROBE_TUNING")
+    try:
+        os.environ["RB_PROBE_TUNING"] = "1"
+        assert runstate.run_signature("raw", "tag", ["random_id"], [0, 1, 2], {"device": "cpu"}, **kwargs) != base
+    finally:
+        if prev is None:
+            os.environ.pop("RB_PROBE_TUNING", None)
+        else:
+            os.environ["RB_PROBE_TUNING"] = prev
     assert runstate.run_signature("raw", "tag", ["random_id"], [0, 1, 2], {"device": "cuda"}, **kwargs) == base
 
 
@@ -439,6 +490,36 @@ def test_input_fingerprint_hashes_file_content(tmp_path):
     f.write_bytes(b"BBBB")
     os.utime(f, (mtime, mtime))
     assert C._input_fingerprint(d) != a
+
+
+def test_pastis_fingerprint_ignores_unused_heavy_products(tmp_path, monkeypatch):
+    bench = tmp_path / "pastis"
+    for name in ("DATA_S2", "DATA_S1A", "ANNOTATIONS", "DATA_S1D"):
+        (bench / name).mkdir(parents=True)
+    (bench / "metadata.geojson").write_text(json.dumps({
+        "type": "FeatureCollection",
+        "features": [
+            {"type": "Feature", "properties": {"ID_PATCH": 10001}, "geometry": None},
+        ],
+    }))
+    for path in (
+        bench / "DATA_S2" / "S2_10001.npy",
+        bench / "DATA_S1A" / "S1A_10001.npy",
+        bench / "ANNOTATIONS" / "TARGET_10001.npy",
+    ):
+        path.write_bytes(b"required")
+    unused = bench / "DATA_S1D" / "S1D_10001.npy"
+    unused.write_bytes(b"unused")
+
+    def guarded_hash(path, h):
+        assert "DATA_S1D" not in str(path)
+        return original_hash(path, h)
+
+    original_hash = C._update_file_content_hash
+    monkeypatch.setattr(C, "_update_file_content_hash", guarded_hash)
+    fp = C._pastis_input_fingerprint(bench, "deep")
+    unused.write_bytes(b"changed")
+    assert C._pastis_input_fingerprint(bench, "deep") == fp
 
 
 def test_run_signature_includes_cacheutils_in_code_hash():

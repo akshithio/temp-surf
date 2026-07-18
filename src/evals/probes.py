@@ -1,25 +1,20 @@
-"""Probe families, fitting, scoring, and calibration.
+"""Probe family builders, fitting, and calibration.
 
 Three probe families are provided: logistic regression, MLP, and kNN.
-Each has its own hyper-parameter grid and build function. The module
-also exposes binary scoring (with F1-threshold calibration) and
-multiclass scoring (with shared-vs-unseen-class decomposition).
+Each has its own hyper-parameter grid and build function.
 """
 
 from __future__ import annotations
 
+import os
 import warnings
-from typing import Any, Protocol
+from typing import Any
 
 import numpy as np
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
-    accuracy_score,
     balanced_accuracy_score,
-    brier_score_loss,
-    f1_score,
-    log_loss,
     roc_auc_score,
 )
 from sklearn.model_selection import train_test_split
@@ -28,6 +23,18 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+from evals.metrics import (
+    best_f1_threshold,
+)
+from evals.metrics import (
+    expected_calibration_error as expected_calibration_error,
+)
+from evals.metrics import (
+    score_binary as score_binary,
+)
+from evals.metrics import (
+    score_multiclass as score_multiclass,
+)
 from utils import perfutils as perf
 
 # ── Logistic regression probe ────────────────────────────────────────────────
@@ -36,7 +43,34 @@ LINEAR_SOLVER = "liblinear"
 LINEAR_MULTICLASS_SOLVER = "lbfgs"
 LINEAR_MAX_ITER = 20_000
 LINEAR_TOL = 1e-5
-LINEAR_GRID: list[float] = [0.01, 0.1, 1.0, 10.0, 100.0]
+def _probe_tuning_enabled() -> bool:
+    """Whether to sweep the probe's hyperparameter grid (RB_PROBE_TUNING).
+
+    RB_METHOD_TUNING was the old spelling. It is refused rather than honoured or ignored: honouring
+    it would keep a name that describes machinery that no longer exists, and ignoring it would
+    silently change the probe grid out from under a launcher that still sets it -- which would move
+    published numbers with no error and no signature change.
+    """
+    if os.environ.get("RB_METHOD_TUNING", "").strip():
+        raise RuntimeError(
+            "RB_METHOD_TUNING is no longer supported: post-hoc adaptation has been removed and it "
+            "never tuned a method -- it sizes the PROBE hyperparameter grid. Use RB_PROBE_TUNING=1. "
+            "Refusing rather than ignoring, because silently dropping it would change the probe "
+            "grid, and therefore the numbers, without any error."
+        )
+    return os.environ.get("RB_PROBE_TUNING", "").strip().lower() in ("1", "true", "yes")
+
+
+# TRACTABILITY: the 5-value C-sweep costs 5x probe fits per cell. Collapsed to a single C=1.0 by
+# default on full EuroCropsML (706k); set RB_PROBE_TUNING=1 to restore the full grid.
+# (Formerly RB_METHOD_TUNING -- it never tuned a "method", it sizes the PROBE's hyperparameter
+# grid, and that name became actively misleading once post-hoc adaptation was removed. Supplying
+# the old name is a hard error rather than a silent no-op: see _probe_tuning_enabled.)
+LINEAR_GRID: list[float] = (
+    [0.01, 0.1, 1.0, 10.0, 100.0]
+    if _probe_tuning_enabled()
+    else [1.0]
+)
 LINEAR_DEFAULT_HP = 1.0
 
 
@@ -57,8 +91,16 @@ def _build_logistic(hp: float, *, solver: str, seed: int, n_fit: int) -> Any:
 
 MLP_HIDDEN: tuple[int, ...] = (256, 128)
 MLP_MAX_ITER = 500
-MLP_GRID: list[float] = [1e-4, 1e-3, 1e-2, 1e-1, 1.0]
 MLP_DEFAULT_HP = 1e-3
+# TRACTABILITY (mirrors LINEAR_GRID above): the probe-capacity ablation is a *sensitivity* check, not
+# a headline protocol, so by default we collapse the five-alpha MLP grid to the single default alpha.
+# Combined with the RB_PROBE_CAP training-size cap, this is what makes the capped MLP tractable on the
+# full tabular benchmarks. Set RB_PROBE_TUNING=1 to restore the full five-value sweep.
+MLP_GRID: list[float] = (
+    [1e-4, 1e-3, 1e-2, 1e-1, 1.0]
+    if _probe_tuning_enabled()
+    else [MLP_DEFAULT_HP]
+)
 
 
 def _build_mlp(hp: float, *, solver: str, seed: int, n_fit: int) -> Any:
@@ -114,6 +156,7 @@ def _build_probe(family: str, hp: float, *, solver: str, seed: int, n_fit: int) 
 
 
 def _class_balanced_resample(x: np.ndarray, y: np.ndarray, seed: int):
+    """Uniform class-balanced resample for the MLP/kNN families (ordinary probe machinery)."""
     rng = np.random.default_rng(seed)
     classes = np.unique(y)
     per_class = max(1, len(y) // len(classes))
@@ -126,7 +169,27 @@ def _class_balanced_resample(x: np.ndarray, y: np.ndarray, seed: int):
     return x[sel], y[sel]
 
 
-def _fit_probe(x: np.ndarray, y: np.ndarray, *, family: str, hp: float, solver: str, seed: int):
+#: ERM fits probes on unweighted samples, so these are constants. They are emitted directly rather
+#: than computed, because the weighting machinery is gone but all 14,773 canonical rows carry these
+#: columns -- dropping them would change the artifact schema.
+ERM_WEIGHT_METADATA: dict[str, Any] = {
+    "probe_sample_weighted": 0,
+    "probe_weight_min": float("nan"),
+    "probe_weight_max": float("nan"),
+    "probe_weight_std": float("nan"),
+    "probe_weight_ess": float("nan"),
+}
+
+
+def _fit_probe(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    family: str,
+    hp: float,
+    solver: str,
+    seed: int,
+):
     if family in ("mlp", "knn"):
         x, y = _class_balanced_resample(x, y, seed)
     clf = _build_probe(family, hp, solver=solver, seed=seed, n_fit=len(y))
@@ -139,53 +202,7 @@ def _fit_probe(x: np.ndarray, y: np.ndarray, *, family: str, hp: float, solver: 
     return clf, n_iter, convergence_warnings
 
 
-# ── Feature-transform protocol ───────────────────────────────────────────────
-
-
-class FeatureTransform(Protocol):
-    """Feature-space transform hook."""
-
-    def transform(self, x: np.ndarray) -> np.ndarray: ...
-
-
-def _apply(transform: FeatureTransform | None, x: np.ndarray) -> np.ndarray:
-    return x if transform is None else transform.transform(x)
-
-
-# ── Binary probe fitting and scoring ─────────────────────────────────────────
-
-
-_F1_THRESHOLD_WARNED = False
-
-
-def best_f1_threshold(y_true: np.ndarray, prob: np.ndarray) -> float:
-    global _F1_THRESHOLD_WARNED
-    if len(np.unique(y_true)) < 2:
-        return 0.5
-    finite = np.isfinite(prob)
-    if not finite.any():
-        best_score = 0.0
-    else:
-        y = np.asarray(y_true, dtype=np.int64)[finite]
-        p = np.asarray(prob, dtype=np.float64)[finite]
-        order = np.argsort(p, kind="mergesort")
-        p_sorted, y_sorted = p[order], y[order]
-        thresholds, starts = np.unique(p_sorted, return_index=True)
-        tp = np.cumsum(y_sorted[::-1])[::-1][starts].astype(float)
-        pred_pos = (len(y_sorted) - starts).astype(float)
-        fp = pred_pos - tp
-        fn = float(y_sorted.sum()) - tp
-        denom = 2 * tp + fp + fn
-        scores = np.divide(2 * tp, denom, out=np.zeros_like(tp), where=denom > 0)
-        best = int(np.argmax(scores))
-        best_score = float(scores[best])
-        best_threshold = float(thresholds[best])
-    if best_score <= 0.0:
-        if not _F1_THRESHOLD_WARNED:
-            print("   !! F1 threshold calibration is degenerate; using threshold=0.5", flush=True)
-            _F1_THRESHOLD_WARNED = True
-        return 0.5
-    return best_threshold
+# ── Binary probe fitting ─────────────────────────────────────────────────────
 
 
 def fit_probe_with_calibration(
@@ -214,7 +231,12 @@ def fit_probe_with_calibration(
             best = None
             for hp in grid:
                 clf_i, _, _ = _fit_probe(
-                    x_train[fit_idx], y_train[fit_idx], family=family, hp=hp, solver=LINEAR_SOLVER, seed=seed
+                    x_train[fit_idx],
+                    y_train[fit_idx],
+                    family=family,
+                    hp=hp,
+                    solver=LINEAR_SOLVER,
+                    seed=seed,
                 )
                 try:
                     score = float(roc_auc_score(y_train[cal_idx], clf_i.predict_proba(x_train[cal_idx])[:, 1]))
@@ -224,7 +246,12 @@ def fit_probe_with_calibration(
                     best = (score, hp, clf_i)
             chosen_hp, clf_oof = best[1], best[2]
             clf, n_iter, convergence_warnings = _fit_probe(
-                x_train, y_train, family=family, hp=chosen_hp, solver=LINEAR_SOLVER, seed=seed
+                x_train,
+                y_train,
+                family=family,
+                hp=chosen_hp,
+                solver=LINEAR_SOLVER,
+                seed=seed,
             )
             cal_x, cal_y = x_train[cal_idx], y_train[cal_idx]
             cal_prob = clf_oof.predict_proba(cal_x)[:, 1]
@@ -234,7 +261,14 @@ def fit_probe_with_calibration(
         elif use_external:
             best = None
             for hp in grid:
-                clf, n_iter, cw = _fit_probe(x_train, y_train, family=family, hp=hp, solver=LINEAR_SOLVER, seed=seed)
+                clf, n_iter, cw = _fit_probe(
+                    x_train,
+                    y_train,
+                    family=family,
+                    hp=hp,
+                    solver=LINEAR_SOLVER,
+                    seed=seed,
+                    )
                 val_auc = float(roc_auc_score(y_cal, clf.predict_proba(x_cal)[:, 1]))
                 if best is None or val_auc > best[0]:
                     best = (val_auc, hp, clf, n_iter, cw)
@@ -251,7 +285,12 @@ def fit_probe_with_calibration(
                 fit_idx = cal_idx = idx
             chosen_hp = PROBE_DEFAULT_HP[family]
             clf, n_iter, convergence_warnings = _fit_probe(
-                x_train[fit_idx], y_train[fit_idx], family=family, hp=chosen_hp, solver=LINEAR_SOLVER, seed=seed
+                x_train[fit_idx],
+                y_train[fit_idx],
+                family=family,
+                hp=chosen_hp,
+                solver=LINEAR_SOLVER,
+                seed=seed,
             )
             cal_x, cal_y = x_train[cal_idx], y_train[cal_idx]
             n_fit, n_cal = len(fit_idx), len(cal_idx)
@@ -270,6 +309,7 @@ def fit_probe_with_calibration(
         "probe_hp": chosen_hp,
         "probe_C": chosen_hp if family == "logistic" else float("nan"),
         "probe_grid_size": grid_size,
+        **ERM_WEIGHT_METADATA,
     }
     if cal_prob is None:
         cal_prob = clf.predict_proba(cal_x)[:, 1]
@@ -277,59 +317,7 @@ def fit_probe_with_calibration(
     return clf, threshold, int(n_fit), int(n_cal), probe_meta
 
 
-def expected_calibration_error(y_true: np.ndarray, prob: np.ndarray, n_bins: int = 10) -> float:
-    """Expected calibration error."""
-    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
-    bin_indices = np.digitize(prob, bin_edges[1:-1])
-    ece = 0.0
-    for b in range(n_bins):
-        in_bin = bin_indices == b
-        if not in_bin.any():
-            continue
-        acc = y_true[in_bin].mean()
-        conf = prob[in_bin].mean()
-        ece += in_bin.sum() * abs(acc - conf)
-    return float(ece / len(y_true))
-
-
-def score_binary(
-    clf: Any, threshold: float, x_test: np.ndarray, y_test: np.ndarray, return_per_sample: bool = False
-) -> dict[str, float] | tuple[dict[str, float], dict[str, np.ndarray]]:
-    """Binary probe metrics."""
-    with perf.measure("probe.score/binary", n_samples=len(y_test), n_features=x_test.shape[1]):
-        pred = clf.predict(x_test)
-        prob = clf.predict_proba(x_test)[:, 1]
-        calibrated_pred = (prob >= threshold).astype(np.int64)
-    two_class = len(np.unique(y_test)) == 2
-    test_optimal_threshold = best_f1_threshold(y_test, prob)
-    calibrated_pred_target_optimal = (prob >= test_optimal_threshold).astype(np.int64)
-    scores = {
-        "f1": float(f1_score(y_test, pred, zero_division=0)),
-        "auc": float(roc_auc_score(y_test, prob)) if two_class else float("nan"),
-        "balanced_accuracy": float(balanced_accuracy_score(y_test, pred)),
-        "calibrated_f1": float(f1_score(y_test, calibrated_pred, zero_division=0)),
-        "calibrated_balanced_accuracy": float(balanced_accuracy_score(y_test, calibrated_pred)),
-        "diagnostic_calibrated_f1_target_optimal": float(f1_score(y_test, calibrated_pred_target_optimal, zero_division=0)),
-        "diagnostic_optimal_threshold_test": float(test_optimal_threshold),
-        "ece": expected_calibration_error(y_test, prob),
-        "brier": float(brier_score_loss(y_test, prob)),
-        "nll": float(log_loss(y_test, prob, labels=[0, 1])),
-        "test_pos_rate": float(np.mean(y_test)),
-    }
-    n_classes = len(np.unique(y_test))
-    perf.log_static("probe.macs/binary", macs=x_test.shape[1] * n_classes, n_samples=len(y_test))
-    if return_per_sample:
-        per_sample = {
-            "y_true": np.asarray(y_test, dtype=np.int64),
-            "prob": prob.astype(np.float64),
-            "pred_default": np.asarray(pred, dtype=np.int64),
-            "pred_calibrated": calibrated_pred,
-        }
-        return scores, per_sample
-    return scores
-
-
-# ── Multiclass probe fitting and scoring ─────────────────────────────────────
+# ── Multiclass probe fitting ─────────────────────────────────────────────────
 
 
 def fit_probe_multiclass(
@@ -357,22 +345,37 @@ def fit_probe_multiclass(
             best = None
             for hp in grid:
                 clf_i, _, _ = _fit_probe(
-                    x_train[fit_idx], y_train[fit_idx], family=family, hp=hp, solver=LINEAR_MULTICLASS_SOLVER, seed=seed
+                    x_train[fit_idx],
+                    y_train[fit_idx],
+                    family=family,
+                    hp=hp,
+                    solver=LINEAR_MULTICLASS_SOLVER,
+                    seed=seed,
                 )
                 score = float(balanced_accuracy_score(y_train[cal_idx], clf_i.predict(x_train[cal_idx])))
                 if best is None or score > best[0]:
                     best = (score, hp)
             chosen_hp = best[1]
             clf, n_iter, convergence_warnings = _fit_probe(
-                x_train, y_train, family=family, hp=chosen_hp, solver=LINEAR_MULTICLASS_SOLVER, seed=seed
+                x_train,
+                y_train,
+                family=family,
+                hp=chosen_hp,
+                solver=LINEAR_MULTICLASS_SOLVER,
+                seed=seed,
             )
             grid_size = len(grid)
         elif use_val:
             best = None
             for hp in grid:
                 clf, n_iter, cw = _fit_probe(
-                    x_train, y_train, family=family, hp=hp, solver=LINEAR_MULTICLASS_SOLVER, seed=seed
-                )
+                    x_train,
+                    y_train,
+                    family=family,
+                    hp=hp,
+                    solver=LINEAR_MULTICLASS_SOLVER,
+                    seed=seed,
+                    )
                 val_score = float(balanced_accuracy_score(y_val, clf.predict(x_val)))
                 if best is None or val_score > best[0]:
                     best = (val_score, hp, clf, n_iter, cw)
@@ -381,7 +384,12 @@ def fit_probe_multiclass(
         else:
             chosen_hp = PROBE_DEFAULT_HP[family]
             clf, n_iter, convergence_warnings = _fit_probe(
-                x_train, y_train, family=family, hp=chosen_hp, solver=LINEAR_MULTICLASS_SOLVER, seed=seed
+                x_train,
+                y_train,
+                family=family,
+                hp=chosen_hp,
+                solver=LINEAR_MULTICLASS_SOLVER,
+                seed=seed,
             )
             grid_size = 1
     probe_meta = {
@@ -395,59 +403,6 @@ def fit_probe_multiclass(
         "probe_hp": chosen_hp,
         "probe_C": chosen_hp if family == "logistic" else float("nan"),
         "probe_grid_size": grid_size,
+        **ERM_WEIGHT_METADATA,
     }
     return clf, probe_meta
-
-
-def score_multiclass(
-    clf: Any, x_test: np.ndarray, y_test: np.ndarray, return_per_sample: bool = False
-) -> dict[str, float] | tuple[dict[str, float], dict[str, np.ndarray]]:
-    proba = None
-    with perf.measure("probe.score/multiclass", n_samples=len(y_test), n_features=x_test.shape[1]):
-        pred = clf.predict(x_test)
-        try:
-            proba = clf.predict_proba(x_test)
-            macro_auc = float(
-                roc_auc_score(y_test, proba, multi_class="ovr", average="macro", labels=clf.classes_)
-            )
-        except (ValueError, AttributeError):
-            macro_auc = float("nan")
-    n_classes = len(getattr(clf, "classes_", []))
-    perf.log_static("probe.macs/multiclass", macs=x_test.shape[1] * max(n_classes, 1), n_samples=len(y_test))
-    _vals, _counts = np.unique(y_test, return_counts=True)
-    seen = np.asarray(getattr(clf, "classes_", []))
-    seen_mask = np.isin(y_test, seen) if seen.size else np.zeros(len(y_test), dtype=bool)
-    n_unseen = int(len(set(np.unique(y_test).tolist()) - set(seen.tolist())))
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="y_pred contains classes not in y_true")
-        scores = {
-            "macro_f1": float(f1_score(y_test, pred, average="macro", zero_division=0)),
-            "weighted_f1": float(f1_score(y_test, pred, average="weighted", zero_division=0)),
-            "balanced_accuracy": float(balanced_accuracy_score(y_test, pred)),
-            "accuracy": float(accuracy_score(y_test, pred)),
-            "macro_auc": macro_auc,
-            "test_n_classes": int(len(_vals)),
-            "test_majority_rate": float(_counts.max() / len(y_test)),
-            "n_classes_seen": int(seen.size),
-            "n_classes_unseen": n_unseen,
-            "unseen_prevalence": float(1.0 - seen_mask.mean()) if len(y_test) else float("nan"),
-            "shared_macro_f1": (
-                float(f1_score(y_test[seen_mask], pred[seen_mask], average="macro", zero_division=0))
-                if seen_mask.any() else float("nan")
-            ),
-            "shared_balanced_accuracy": (
-                float(balanced_accuracy_score(y_test[seen_mask], pred[seen_mask])) if seen_mask.any() else float("nan")
-            ),
-            "shared_accuracy": (
-                float(accuracy_score(y_test[seen_mask], pred[seen_mask])) if seen_mask.any() else float("nan")
-            ),
-        }
-    if return_per_sample:
-        per_sample = {
-            "y_true": np.asarray(y_test, dtype=np.int64),
-            "pred": np.asarray(pred, dtype=np.int64),
-            "classes": np.asarray(getattr(clf, "classes_", []), dtype=np.int64),
-            "proba": np.asarray(proba, dtype=np.float64) if proba is not None else np.zeros((len(y_test), 0)),
-        }
-        return scores, per_sample
-    return scores

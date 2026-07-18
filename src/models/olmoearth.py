@@ -221,6 +221,8 @@ class OlmoEarthModel:
             Modality.SENTINEL2_L2A,
             np.random.randn(B, H, W, T, OLMOEARTH_NUM_S2_BANDS).astype(np.float32),
         )
+        # Normalizer upcasts to float64; cast back so thop's dummy matches the float32 model.
+        dummy_bands = np.asarray(dummy_bands, dtype=np.float32)
         sample = MaskedOlmoEarthSample(
             sentinel2_l2a=torch.from_numpy(dummy_bands).to(dev),
             sentinel2_l2a_mask=torch.full(

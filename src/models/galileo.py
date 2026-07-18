@@ -26,10 +26,13 @@ import torch
 import torch.nn.functional as F
 
 from utils.models.galileoutil import (
+    ERA5_BANDS,
+    LOCATION_BANDS,
     SPACE_BAND_GROUPS_IDX,
     SPACE_BANDS,
     SPACE_TIME_BANDS,
     SPACE_TIME_BANDS_GROUPS_IDX,
+    SRTM_BANDS,
     STATIC_BAND_GROUPS_IDX,
     STATIC_BANDS,
     TIME_BAND_GROUPS_IDX,
@@ -50,9 +53,12 @@ GALILEO_VARIANTS: dict[str, tuple[int, str]] = {
 }
 
 # --------------------------------------------------------------------------- #
-# Galileo pretraining normalization statistics  (z-score per tensor sub-dim).
-# Extracted from galileo/config/normalization.json.
-# Key = dimensionality of the tensor being normalized.
+# Galileo pretraining normalization statistics, extracted from
+# galileo/config/normalization.json. Galileo's eval Normalizer is a 2-sigma
+# min-max (std_multiplier=2), NOT a z-score:
+#     x_norm = (x - (mean - 2*std)) / (4*std)
+# applied per band to each modality's "std_bands"; NDVI and location are excluded
+# from std_bands and fed RAW. Key = dimensionality of the tensor being normalized.
 # --------------------------------------------------------------------------- #
 GALILEO_NORM_13_MEAN = np.array(
     [
@@ -89,6 +95,42 @@ GALILEO_NORM_13_STD = np.array(
         0.2721,
     ],
     dtype=np.float32,
+)
+
+# Galileo's eval Normalizer is a 2-sigma min-max (std_multiplier=2), not a z-score:
+#     x_norm = (x - (mean - 2*std)) / (4*std)
+# and it excludes NDVI + location from the normalized ("std") bands, feeding them
+# raw. We precompute per-band (shift, div) so a band's transform is a single affine.
+_GALILEO_STD_MULT = 2.0
+
+
+def _sigma_shift_div(
+    mean: np.ndarray, std: np.ndarray, std_mask: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-band (shift, div) for the 2-sigma min-max; identity where not a std band."""
+    shift = np.where(std_mask, mean - _GALILEO_STD_MULT * std, 0.0).astype(np.float32)
+    div = np.where(std_mask, 2.0 * _GALILEO_STD_MULT * std, 1.0).astype(np.float32)
+    return shift, div
+
+
+# SPACE_TIME (S1 + S2 + NDVI): S1/S2 use the 2-sigma min-max; NDVI is raw.
+_ST13_STD_MASK = np.array([b != "NDVI" for b in SPACE_TIME_BANDS], dtype=bool)
+_ST13_SHIFT, _ST13_DIV = _sigma_shift_div(GALILEO_NORM_13_MEAN, GALILEO_NORM_13_STD, _ST13_STD_MASK)
+
+# ERA5 (temperature_2m, total_precipitation_sum) and SRTM (elevation, slope)
+# mean/std from the same normalization.json (dims "6"[0:2], "16"[0:2]); both are in
+# std_bands, so they get the 2-sigma min-max. LOCATION (unit-sphere x, y, z) is NOT
+# a std band and is fed RAW (matching Galileo's eval Normalizer). Units match the
+# benchmark climate/latlon (Kelvin, meters, degrees) exactly as Presto assumes here.
+GALILEO_ERA5_MEAN = np.array([271.567496, 0.085543], dtype=np.float32)
+GALILEO_ERA5_STD = np.array([79.808289, 0.116695], dtype=np.float32)
+GALILEO_SRTM_MEAN = np.array([673.015282, 5.930093], dtype=np.float32)
+GALILEO_SRTM_STD = np.array([983.069730, 8.167407], dtype=np.float32)
+_ERA5_SHIFT, _ERA5_DIV = _sigma_shift_div(
+    GALILEO_ERA5_MEAN, GALILEO_ERA5_STD, np.ones(len(ERA5_BANDS), dtype=bool)
+)
+_SRTM_SHIFT, _SRTM_DIV = _sigma_shift_div(
+    GALILEO_SRTM_MEAN, GALILEO_SRTM_STD, np.ones(len(SRTM_BANDS), dtype=bool)
 )
 
 # --------------------------------------------------------------------------- #
@@ -185,19 +227,20 @@ class GalileoModel:
     def _bench_to_galileo(self, bench: Benchmark) -> tuple:
         """Convert a Benchmark to Galileo's expected inputs (numpy).
 
-        Fills S1 + S2 + NDVI bands where available; marks unavailable band groups
-        as masked so the model ignores them.
+        Fills S1 + S2 + NDVI, plus location (from latlon) and ERA5 / SRTM (from the
+        climate modality) where the benchmark provides them; unavailable band groups
+        stay masked so the model ignores them.
 
         Returns
         -------
-        s_t_x : (N, 1, 1, T, 13) float32 — S1 + S2 + NDVI, z-score normalized
-        sp_x  : (N, 1, 1, 16)     float32 — zeros
-        t_x   : (N, T, 6)         float32 — zeros
-        st_x  : (N, 18)           float32 — zeros
+        s_t_x : (N, 1, 1, T, 13) float32 — S1/S2 2-sigma min-max, NDVI raw
+        sp_x  : (N, 1, 1, 16)     float32 — SRTM (elevation, slope) filled if available, else zeros
+        t_x   : (N, T, 6)         float32 — ERA5 (temp, precip) filled if available, else zeros
+        st_x  : (N, 18)           float32 — location (x, y, z) filled if latlon available, else zeros
         s_t_m : (N, 1, 1, T, 7)   float32 — 0=available group, 1=masked (per-timestep s2/s1 mask)
-        sp_m  : (N, 1, 1, 3)      float32 — all 1 (masked)
-        t_m   : (N, T, 3)         float32 — all 1 (masked)
-        st_m  : (N, 4)            float32 — all 1 (masked)
+        sp_m  : (N, 1, 1, 3)      float32 — 0 for SRTM if filled, else 1 (masked)
+        t_m   : (N, T, 3)         float32 — 0 for ERA5 where observed if filled, else 1 (masked)
+        st_m  : (N, 4)            float32 — 0 for location if filled, else 1 (masked)
         months: (N, T)            int64   — calendar month (0-indexed) per timestep from doy
         """
         s2_vals, s2_msk, doy_arr, s2_bands = bench.monthly("s2")
@@ -216,8 +259,8 @@ class GalileoModel:
             elif bname in s1_idx:
                 x_st[:, 0, 0, :, gidx] = s1_vals[:, :, s1_idx[bname]]
 
-        # Normalize space_time_x (z-score per band)
-        x_st = (x_st - GALILEO_NORM_13_MEAN) / GALILEO_NORM_13_STD
+        # Normalize space_time_x: 2-sigma min-max for S1/S2 bands, NDVI raw.
+        x_st = (x_st - _ST13_SHIFT) / _ST13_DIV
 
         # -- masks -----------------------------------------------------------
         # s_t_m: (N, 1, 1, T, 7) — 1 = masked, 0 = available. A group is available at a timestep
@@ -231,13 +274,55 @@ class GalileoModel:
         if s1_bands:
             s_t_m[:, 0, 0, :, 0] = (s1_msk <= 0).astype(np.float32)  # S1 is the first group
 
-        # -- empty modalities (all masked) -----------------------------------
+        # -- non-S2/S1 modalities: FILL from the benchmark where it provides them
+        # (location from latlon; ERA5 temperature/precipitation and SRTM elevation/
+        # slope from the climate modality), 2-sigma-min-max with Galileo's pretrain stats.
+        # Groups the benchmark lacks stay zeroed + masked, so an S2-only benchmark
+        # gains only location and a benchmark with none of these is unchanged. This
+        # gives Galileo the same latlon/climate/SRTM inputs Presto receives here.
         sp_x = np.zeros((n, 1, 1, len(SPACE_BANDS)), dtype=np.float32)
         sp_m = np.ones((n, 1, 1, len(SPACE_BAND_GROUPS_IDX)), dtype=np.float32)
         t_x = np.zeros((n, t, len(TIME_BANDS)), dtype=np.float32)
         t_m = np.ones((n, t, len(TIME_BAND_GROUPS_IDX)), dtype=np.float32)
         st_x = np.zeros((n, len(STATIC_BANDS)), dtype=np.float32)
         st_m = np.ones((n, len(STATIC_BAND_GROUPS_IDX)), dtype=np.float32)
+
+        mods = bench.available_modalities()
+        if "climate" in mods:
+            clim_vals, clim_msk, _, clim_bands = bench.monthly("climate")
+            clim_idx = {b: i for i, b in enumerate(clim_bands)}
+            era5_gid = list(TIME_BAND_GROUPS_IDX).index("ERA5")
+            for bench_band, era5_band in (("temperature", "temperature_2m"),
+                                          ("precipitation", "total_precipitation_sum")):
+                if bench_band in clim_idx:
+                    pos = ERA5_BANDS.index(era5_band)
+                    t_x[:, :, TIME_BANDS.index(era5_band)] = (
+                        clim_vals[:, :, clim_idx[bench_band]] - _ERA5_SHIFT[pos]
+                    ) / _ERA5_DIV[pos]
+                    t_m[:, :, era5_gid] = (clim_msk <= 0).astype(np.float32)  # 0=available
+            srtm_gid = list(SPACE_BAND_GROUPS_IDX).index("SRTM")
+            for bench_band in ("elevation", "slope"):  # SRTM is static -> take month 0
+                if bench_band in clim_idx:
+                    pos = SRTM_BANDS.index(bench_band)
+                    sp_x[:, 0, 0, SPACE_BANDS.index(bench_band)] = (
+                        clim_vals[:, 0, clim_idx[bench_band]] - _SRTM_SHIFT[pos]
+                    ) / _SRTM_DIV[pos]
+                    sp_m[:, 0, 0, srtm_gid] = 0.0
+
+        if "latlon" in mods:
+            ll = np.asarray(bench.latlon, dtype=np.float64)
+            finite = np.isfinite(ll).all(axis=1)
+            lat = np.radians(np.clip(ll[:, 0], -90.0, 90.0))
+            lon = np.radians(ll[:, 1])
+            xyz = np.stack([np.cos(lat) * np.cos(lon),
+                            np.cos(lat) * np.sin(lon),
+                            np.sin(lat)], axis=1)  # unit-sphere (x, y, z)
+            for k, lband in enumerate(LOCATION_BANDS):  # ["x", "y", "z"]
+                col = STATIC_BANDS.index(lband)
+                # location is not a std band in Galileo's eval Normalizer -> fed RAW
+                st_x[finite, col] = xyz[finite, k].astype(np.float32)
+            if finite.any():
+                st_m[finite, list(STATIC_BAND_GROUPS_IDX).index("location")] = 0.0
 
         # -- months ----------------------------------------------------------
         # Real calendar month (0-indexed) per timestep from the monthly view's day-of-year.
@@ -357,6 +442,13 @@ class GalileoModel:
         # empty months are masked. This reproduces the pre-native-refactor monthly tile bit-for-bit.
         s2_m, s2_mask = _monthly_patch(tile.s2, tile.s2_months)  # (12, 10, H, W), (12,)
         s1_m, s1_mask = _monthly_patch(tile.s1, tile.s1_months)
+        if getattr(tile, "s2_only", False):
+            # Common-input S2-only: S1 is structurally absent. Zero the availability mask so the
+            # S1 group stays MISSING for every timestep (identical to a tile with no S1 acquisitions)
+            # --- _monthly_patch derives the mask from s1_months, so we must override it here rather
+            # than relying on zeroed S1 data (which the model would still attend to as "present").
+            s1_m = np.zeros_like(s1_m)
+            s1_mask = np.zeros_like(s1_mask)
         height, width, timesteps = tile.height, tile.width, s2_m.shape[0]
         x = np.zeros((1, height, width, timesteps, len(SPACE_TIME_BANDS)), dtype=np.float32)
         sources = {
@@ -368,7 +460,7 @@ class GalileoModel:
         for band, target_index in _BENCH_TO_GALILEO_ST_IDX.items():
             if band in sources:
                 x[0, :, :, :, target_index] = sources[band].transpose(1, 2, 0)
-        x = (x - GALILEO_NORM_13_MEAN) / GALILEO_NORM_13_STD
+        x = (x - _ST13_SHIFT) / _ST13_DIV
 
         spatial = np.zeros((1, height, width, len(SPACE_BANDS)), dtype=np.float32)
         temporal = np.zeros((1, timesteps, len(TIME_BANDS)), dtype=np.float32)

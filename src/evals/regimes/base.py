@@ -46,16 +46,32 @@ class DenseSplit:
     group_kind: str = "geography"
 
 
-def geography_domains(bench) -> np.ndarray:
-    """Default domain assignment: the benchmark's native region/source groups."""
+def geography_domains(bench, holdouts: Any = None) -> np.ndarray:
+    """Default domain assignment: the benchmark's native region/source groups.
+
+    Takes ``holdouts`` because every regime's ``assign_domains`` is called with the split
+    strategy (some regimes must pick their domain basis from it -- see
+    geographic_ood.assign_domains). This one has a single basis and ignores it. ``random_id``
+    and ``official`` alias this function directly, so the signature is part of that contract.
+    """
+    del holdouts
     return np.asarray(bench.groups, dtype=object)
 
 
 REGIME_PROBLEMS: list[tuple[str, str, str]] = []
 
+#: Per-domain eligibility rows accumulated by leave-one-domain-out regimes, written out as
+#: ``domain_census.json`` so that every domain the run considered -- including the ones it
+#: excluded, and why -- is auditable from the artifact rather than only from the logs.
+DOMAIN_CENSUS: list[dict[str, Any]] = []
+
 
 def clear_regime_problems() -> None:
     REGIME_PROBLEMS.clear()
+
+
+def clear_domain_census() -> None:
+    DOMAIN_CENSUS.clear()
 
 
 def load_regime(regime_name: str):
@@ -118,7 +134,9 @@ def iter_splits(
     regime = load_regime(split_regime)
     bench_name = getattr(bench, "name", "?")
     try:
-        domains = np.asarray(regime.assign_domains(bench), dtype=object)
+        # `holdouts` carries the split strategy, and some regimes must pick their domain basis
+        # from it (see geographic_ood.assign_domains); regimes with a single basis ignore it.
+        domains = np.asarray(regime.assign_domains(bench, holdouts), dtype=object)
     except Exception as exc:
         regime_problem(
             bench_name,
@@ -150,6 +168,8 @@ def iter_splits(
             regime.HAS_TARGET if split.has_target is None else split.has_target,
             regime.GROUP_KIND, split.source_val, split.source_test,
         )
+    expected_fn = getattr(regime, "expected_domains", None)
+    expected = expected_fn(y, domains, holdouts) if expected_fn is not None else None
     if n_splits == 0:
         labels = sorted({str(d) for d in domains})
         shown = labels[:8] + (["..."] if len(labels) > 8 else [])
@@ -159,6 +179,17 @@ def iter_splits(
             f"produced 0 splits (domain labels seen: {shown})",
             strict_mode=strict_mode,
         )
+    elif expected is not None:
+        # The regime declared, from the census, exactly which domains it would evaluate. A
+        # declared-valid domain that produced no fold is a hard failure, not a missing table row.
+        missing = sorted({str(d) for d in expected} - yielded_domains)
+        if missing:
+            regime_problem(
+                bench_name,
+                split_regime,
+                f"declared-valid domain(s) produced no split: {missing}",
+                strict_mode=strict_mode,
+            )
     elif getattr(regime, "USES_CURATED_HOLDOUTS", False) and not isinstance(holdouts, dict):
         missing = [str(h) for h in (holdouts or []) if str(h) not in yielded_labels]
         if missing:
@@ -197,27 +228,46 @@ def _dense_split_from_tuple(regime, item) -> DenseSplit:
 def segmentation_fold_configs(
     bench_mod, regimes, *, seed: int, emb_dir, strict_mode: bool = False, overwrite_mode: bool | None = None, bench=None
 ):
-    """Yield dense fold configs for segmentation regimes."""
+    """Yield dense fold configs for segmentation regimes.
+
+    Every declared regime must yield at least one config. The dense path previously had no such
+    check -- unlike the tabular ``iter_splits`` above, which has four -- so a regime whose split
+    construction raised (spatial_cluster_ood wraps its whole build in a try/except that prints and
+    returns) simply produced nothing, was never recorded as a problem, and vanished from the
+    results table behind one line of stdout in a multi-hour log. That is how PASTIS lost
+    spatial_cluster_ood.
+    """
     if overwrite_mode is not None:
         strict_mode = bool(overwrite_mode)
+    benchmark = getattr(bench_mod, "BENCHMARK", "?")
     for regime_name in regimes:
         regime = load_regime(regime_name)
         dense_iter = getattr(regime, "iter_dense_splits", None)
         fold_iter = getattr(regime, "iter_fold_splits", None)
+        n_yielded = 0
         if dense_iter is not None:
             for item in dense_iter(bench_mod, emb_dir=emb_dir, seed=seed, bench=bench):
+                n_yielded += 1
                 yield regime_name, _dense_split_from_tuple(regime, item)
-            continue
-        if fold_iter is None:
+        elif fold_iter is None:
             regime_problem(
-                getattr(bench_mod, "BENCHMARK", "?"),
+                benchmark,
                 regime_name,
                 "no dense (segmentation) realization -- regime exposes no iter_fold_splits",
                 strict_mode=strict_mode,
             )
             continue
-        for item in fold_iter(bench_mod):
-            yield regime_name, _dense_split_from_tuple(regime, item)
+        else:
+            for item in fold_iter(bench_mod):
+                n_yielded += 1
+                yield regime_name, _dense_split_from_tuple(regime, item)
+        if n_yielded == 0:
+            regime_problem(
+                benchmark,
+                regime_name,
+                "produced 0 dense fold configs (declared but not evaluated)",
+                strict_mode=strict_mode,
+            )
 
 
 def _append_prediction_rows(
@@ -487,3 +537,37 @@ def _segmentation_split_manifest_entry(
 def _write_split_manifest(results_dir, rows: list[dict[str, Any]]) -> None:
     """Write the split audit artifact beside the probe outputs."""
     IOU.write_json(results_dir / "split_manifest.json", {"splits": rows})
+
+
+def _write_domain_census(results_dir, benchmark: str | None = None) -> None:
+    """Write the domain eligibility census beside the probe outputs.
+
+    The census is a property of the data, so it is identical across seeds; rows are deduplicated
+    on (benchmark, regime, domain). Regimes that do not do leave-one-domain-out contribute
+    nothing and no file is produced.
+
+    ``benchmark`` filters to the pair being written. DOMAIN_CENSUS is a process-global
+    accumulator, so without this a run covering several benchmarks would write the first
+    benchmark's domains into the next benchmark's results directory -- an artifact describing
+    data the directory does not contain.
+    """
+    if not DOMAIN_CENSUS:
+        return
+    rows: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in DOMAIN_CENSUS:
+        if benchmark is not None and str(row["benchmark"]) != str(benchmark):
+            continue
+        rows[(str(row["benchmark"]), str(row["regime"]), str(row["domain"]))] = row
+    if not rows:
+        return
+    ordered = [rows[k] for k in sorted(rows)]
+    IOU.write_json(
+        results_dir / "domain_census.json",
+        {
+            "domains": ordered,
+            "n_domains": len(ordered),
+            "n_valid_targets": sum(1 for r in ordered if r.get("valid_target")),
+            "n_one_class": sum(1 for r in ordered if r.get("one_class")),
+            "excluded": [r["domain"] for r in ordered if not r.get("valid_target")],
+        },
+    )

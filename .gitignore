@@ -3,5 +3,11 @@ __pycache__
 *.egg-info/
 data/input/
 data/cache/
+data/output/collated/
+data/output/machines/
 .env
-.ipynb_checkpoints/
+
+# viz/data is a ~79 MB vendored snapshot of probe_results.jsonl pulled off the boxes so the
+# figure scripts run without SSH. It is reproducible from the canonical run trees (see
+# viz/README.md) and must never enter git history -- `git add -A` would commit it permanently.
+viz/data/

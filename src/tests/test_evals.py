@@ -4,8 +4,7 @@ import numpy as np
 import pytest
 
 from evals import evals as EV
-from evals.confounds import score_segmentation, score_segmentation_streamed
-from evals.probes import expected_calibration_error
+from evals.metrics import expected_calibration_error, score_segmentation, score_segmentation_streamed
 from evals.regimes import base as regime_base
 from evals.regimes import geographic_ood, official
 from evals.regimes.geographic_ood import make_strict_holdout_splits
@@ -441,7 +440,7 @@ def test_streamed_segmentation_rejects_invalid_labels() -> None:
 def test_score_multiclass_reports_shared_and_unseen_class_decomposition() -> None:
     """#7: a source-only probe can't predict target-only classes, so report shared-class metrics +
     the unseen-class prevalence separately from the full-label metrics."""
-    from evals.probes import score_multiclass
+    from evals.metrics import score_multiclass
 
     class _Clf:
         classes_ = np.array([0, 1, 2])  # trained only on classes 0,1,2

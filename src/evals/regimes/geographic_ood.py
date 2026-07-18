@@ -10,13 +10,14 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import BallTree
 
-from evals.regimes.base import DenseSplit, Split, geography_domains
+from evals.regimes.base import DOMAIN_CENSUS, DenseSplit, Split, geography_domains
 from utils import cacheutils
 
 NAME = "geographic_ood"
 GROUP_KIND = "geography"
 HAS_TARGET = True
 USES_CURATED_HOLDOUTS = True
+LEAVE_ONE_DOMAIN_OUT = True
 EARTH_RADIUS_KM = 6371.0088
 
 
@@ -27,8 +28,26 @@ def _bench_mod(bench):
         return None
 
 
-def assign_domains(bench) -> np.ndarray:
+def assign_domains(bench, holdouts: Any = None) -> np.ndarray:
+    """Domain basis for this regime, SELECTED BY THE SPLIT STRATEGY.
+
+    The basis and the strategy are not independent. ``spatial_blocks`` assembles val/test by
+    hash-ranking domains until a sample-count target is met, which only reconstructs the
+    historical ``spatial_block_2deg_purge50km`` partition when the domains are 2-degree blocks;
+    run it over canonical provenance domains and it silently emits the historical label over a
+    different split. Leave-one-domain-out needs the opposite -- the named canonical domains.
+    Hence the strategy has to be known BEFORE domains are assigned, not after.
+    """
     mod = _bench_mod(bench)
+    if isinstance(holdouts, dict) and holdouts.get("strategy") == "spatial_blocks":
+        fn = getattr(mod, "spatial_block_domains", None) if mod is not None else None
+        if fn is None:
+            raise ValueError(
+                f"{getattr(bench, 'name', '?')}: the spatial_blocks strategy requires a "
+                f"spatial_block_domains() basis; refusing to fall back to another basis, which "
+                f"would emit a historical split label over a different partition"
+            )
+        return np.asarray(fn(bench), dtype=object)
     fn = getattr(mod, "geographic_domains", None) if mod is not None else None
     if fn is not None:
         return np.asarray(fn(bench), dtype=object)
@@ -44,14 +63,31 @@ def _idx_for(groups: np.ndarray, domains: set[str]) -> np.ndarray:
     return np.flatnonzero(np.isin(groups_s, list(domains)))
 
 
-def _check_split(y: np.ndarray, train: np.ndarray, val: np.ndarray, test: np.ndarray, label: str) -> None:
+def _check_split(
+    y: np.ndarray,
+    train: np.ndarray,
+    val: np.ndarray,
+    test: np.ndarray,
+    label: str,
+    *,
+    allow_one_class_test: bool = False,
+) -> None:
+    """Reject partitions that cannot support probe training, threshold calibration, or scoring.
+
+    ``allow_one_class_test`` keeps a one-class TARGET: several canonical domains genuinely
+    contain a single class, and dropping them would silently shrink the evaluated universe. Only
+    train and val are structurally required to be two-class -- train to fit the probe at all, val
+    to calibrate a decision threshold. A one-class target still scores accuracy, balanced
+    accuracy, calibration and test_pos_rate; the metrics that need both classes (auc) already
+    come back as nan from score_binary.
+    """
     if len(train) == 0 or len(val) == 0 or len(test) == 0:
         raise ValueError(f"{label}: empty train/val/test partition")
     if len(np.unique(y[train])) < 2:
         raise ValueError(f"{label}: training partition is one-class")
     if len(np.unique(y[val])) < 2:
         raise ValueError(f"{label}: validation partition is one-class")
-    if len(np.unique(y[test])) < 2:
+    if not allow_one_class_test and len(np.unique(y[test])) < 2:
         raise ValueError(f"{label}: test partition is one-class")
 
 
@@ -62,6 +98,57 @@ def _domain_size(groups: np.ndarray, domains: set[str]) -> int:
 def _domain_classes(y: np.ndarray, groups: np.ndarray, domains: set[str]) -> int:
     idx = _idx_for(groups, domains)
     return int(len(np.unique(y[idx]))) if len(idx) else 0
+
+
+def _is_lodo(holdouts: Any) -> bool:
+    return isinstance(holdouts, dict) and holdouts.get("strategy") == "leave_one_domain_out"
+
+
+def domain_census(y: np.ndarray, groups: np.ndarray, holdouts: Any) -> list[dict[str, Any]]:
+    """Eligibility census over every canonical domain present in the data.
+
+    Computed BEFORE any model runs, so validity is a declared property of the dataset rather than
+    a side effect of whichever folds happened to survive. One row per domain, including the ones
+    that are excluded and why -- an excluded domain must be visible in the artifact, never a
+    silent gap in the results table.
+    """
+    if not _is_lodo(holdouts):
+        return []
+    min_n = int(holdouts.get("min_target_n", 10))
+    allow_one_class = bool(holdouts.get("allow_one_class_target", True))
+    rows: list[dict[str, Any]] = []
+    for domain in _valid_domains(groups):
+        n = _domain_size(groups, {domain})
+        n_classes = _domain_classes(y, groups, {domain})
+        excluded: list[str] = []
+        if n < min_n:
+            excluded.append(f"n<{min_n}")
+        if n_classes < 2 and not allow_one_class:
+            excluded.append("one_class")
+        rows.append({
+            "domain": domain,
+            "n": n,
+            "n_classes": n_classes,
+            "one_class": n_classes < 2,
+            "valid_target": not excluded,
+            # a one-class domain cannot calibrate a decision threshold, so it cannot be the
+            # validation region even when it is a perfectly valid target
+            "valid_val": n_classes >= 2 and n >= min_n,
+            "excluded_because": excluded,
+            "metrics_excluded": ["auc"] if n_classes < 2 else [],
+        })
+    return rows
+
+
+def expected_domains(y: np.ndarray, groups: np.ndarray, holdouts: Any) -> list[str] | None:
+    """Domains this regime DECLARES it will produce a fold for (None => check not applicable).
+
+    Compared against what actually got yielded, so a declared-valid domain that vanishes is a
+    hard failure rather than a missing row someone notices later.
+    """
+    if not _is_lodo(holdouts):
+        return None
+    return [r["domain"] for r in domain_census(y, groups, holdouts) if r["valid_target"]]
 
 
 def _source_diag_indices(y: np.ndarray, train: np.ndarray, seed: int):
@@ -170,6 +257,9 @@ def make_strict_holdout_splits(
     seed: int,
     val_group: str | None = None,
     require_domain_val: bool = False,
+    *,
+    allow_one_class_test: bool = False,
+    val_pool: list[str] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     idx = np.arange(len(y))
     groups_s = np.asarray(groups).astype(str)
@@ -177,24 +267,33 @@ def make_strict_holdout_splits(
     test = idx[groups_s == heldout_group]
     if len(test) == 0:
         raise ValueError(f"No samples found for strict holdout group: {heldout_group}")
-    if len(np.unique(y[test])) < 2:
+    if not allow_one_class_test and len(np.unique(y[test])) < 2:
         raise ValueError(f"Strict holdout group is one-class: {heldout_group}")
     if val_group is not None and np.any(groups_s == str(val_group)) and str(val_group) != heldout_group:
         val_group = str(val_group)
         val = idx[groups_s == val_group]
         train = idx[(groups_s != heldout_group) & (groups_s != val_group)]
         train_val = idx[groups_s != heldout_group]
-        _check_split(y, train, val, test, f"{val_group}->{heldout_group}")
+        _check_split(
+            y, train, val, test, f"{val_group}->{heldout_group}", allow_one_class_test=allow_one_class_test
+        )
         return np.sort(train), np.sort(val), np.sort(test), np.sort(train_val)
     if require_domain_val:
         domains = _valid_domains(groups_s)
         start = domains.index(heldout_group)
-        candidates = domains[start + 1:] + domains[:start]
+        # Deterministic alphabetical rotation: the validation region is a property of the split,
+        # not of the seed, so every seed and model sees the identical fold.
+        rotated = domains[start + 1:] + domains[:start]
+        allowed = set(val_pool) if val_pool is not None else set(domains)
+        candidates = [d for d in rotated if d in allowed and d != heldout_group]
         for candidate in candidates:
             val = idx[groups_s == candidate]
             train = idx[(groups_s != heldout_group) & (groups_s != candidate)]
             try:
-                _check_split(y, train, val, test, f"{candidate}->{heldout_group}")
+                _check_split(
+                    y, train, val, test, f"{candidate}->{heldout_group}",
+                    allow_one_class_test=allow_one_class_test,
+                )
             except ValueError:
                 continue
             train_val = idx[groups_s != heldout_group]
@@ -210,10 +309,57 @@ def make_strict_holdout_splits(
     return np.sort(train), np.sort(val), np.sort(test), np.sort(train_val)
 
 
+def _iter_lodo_splits(y, groups, *, seed, holdouts, bench, purge_km):
+    """Leave-one-domain-out over the full canonical domain census.
+
+    One fold per declared-valid domain: that domain is the target, one different valid whole
+    domain is the validation region, and every remaining domain is the source training pool.
+    Each fold is isolated -- a fold that cannot be built is reported and skipped here, and the
+    completeness check in regimes.base then fails the run because the domain was declared valid.
+    """
+    purge_km = float(holdouts.get("purge_km", purge_km))
+    allow_one_class = bool(holdouts.get("allow_one_class_target", True))
+    census = domain_census(y, groups, holdouts)
+    bench_name = str(getattr(bench, "name", "?"))
+    seen = {(r["benchmark"], r["domain"]) for r in DOMAIN_CENSUS if r["regime"] == NAME}
+    for row in census:
+        if (bench_name, row["domain"]) not in seen:
+            DOMAIN_CENSUS.append({"benchmark": bench_name, "regime": NAME, **row})
+
+    val_pool = [r["domain"] for r in census if r["valid_val"]]
+    for row in census:
+        domain = row["domain"]
+        if not row["valid_target"]:
+            print(
+                f"   !! geographic_ood: domain {domain!r} (n={row['n']}, "
+                f"{row['n_classes']} class(es)) is not an eligible target: "
+                f"{row['excluded_because']}",
+                flush=True,
+            )
+            continue
+        try:
+            train, val, test, _train_val = make_strict_holdout_splits(
+                y, groups, domain, seed,
+                require_domain_val=True,
+                allow_one_class_test=allow_one_class,
+                val_pool=val_pool,
+            )
+            train = _purge_train_near_ood(train, val, test, bench, purge_km)
+            _check_split(y, train, val, test, str(domain), allow_one_class_test=allow_one_class)
+            train, source_val, source_test = _source_diag_indices(y, train, seed)
+        except ValueError as exc:
+            print(f"   !! geographic_ood: LODO fold {domain!r} dropped ({exc})", flush=True)
+            continue
+        yield Split(str(domain), train, np.sort(test), np.sort(val), source_val, source_test, domain=str(domain))
+
+
 def iter_splits(y, groups, *, seed, holdouts, n_folds=None, val_group=None, bench=None, **_):
     del n_folds, val_group
     mod = _bench_mod(bench) if bench is not None else None
     purge_km = float(getattr(mod, "GEOGRAPHIC_PURGE_KM", 0.0)) if mod is not None else 0.0
+    if _is_lodo(holdouts):
+        yield from _iter_lodo_splits(y, groups, seed=seed, holdouts=holdouts, bench=bench, purge_km=purge_km)
+        return
     try:
         if isinstance(holdouts, dict) and holdouts.get("strategy") == "spatial_blocks":
             purge_km = float(holdouts.get("purge_km", purge_km))

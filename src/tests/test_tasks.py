@@ -26,7 +26,7 @@ def test_bin_crop_class_targets() -> None:
     np.testing.assert_array_equal(groups, bench.groups)
 
 
-def test_prune_partial_budgets_uses_unique_temp_paths(tmp_path, monkeypatch):
+def test_prune_partial_budgets_prunes_rows_and_preds_without_collision(tmp_path):
     from utils import runstate
 
     rows_path = tmp_path / "probe_results.jsonl"
@@ -36,17 +36,18 @@ def test_prune_partial_budgets_uses_unique_temp_paths(tmp_path, monkeypatch):
         "probe_family": "logistic", "budget_type": "source", "label_budget": 1.0,
         "evaluation_split": "test",
     }
-    IOU.append_jsonl(rows_path, [row])
-    IOU.append_jsonl(preds_path, [row])
-    made = []
+    other = {**row, "seed": 1}  # different budget key -> must be KEPT
+    IOU.append_jsonl(rows_path, [row, other])
+    IOU.append_jsonl(preds_path, [row, other])
 
-    def fake_tmp(path):
-        made.append(path.with_name(f".{path.name}.{len(made)}.tmp"))
-        return made[-1]
+    kept = runstate.prune_partial_budgets([row, other], rows_path, preds_path, {runstate.budget_row_key(row)})
 
-    monkeypatch.setattr(cacheutils, "_atomic_tmp", fake_tmp)
-    runstate.prune_partial_budgets([row], rows_path, preds_path, {runstate.budget_row_key(row)})
-    assert len(made) == 2 and made[0] != made[1]
+    # the matching (seed 0) entry is pruned from BOTH files; the non-matching (seed 1) survives;
+    # rows and preds are rewritten independently (no temp-path collision) and no temp files remain.
+    assert [r["seed"] for r in kept] == [1]
+    assert [r["seed"] for r in IOU.read_jsonl(rows_path)] == [1]
+    assert [p["seed"] for p in IOU.read_jsonl(preds_path)] == [1]
+    assert not list(tmp_path.glob("*.tmp")) and not list(tmp_path.glob("*.prune.tmp"))
 
 
 def test_read_jsonl_only_tolerates_unterminated_final_row(tmp_path) -> None:
@@ -79,15 +80,50 @@ def test_cropharvest_geo_group_collapses_dataset_aliases() -> None:
     assert cropharvest._ch_geo_group("lem-brazil") == "lem-brazil"
 
 
-def test_cropharvest_geographic_domains_use_spatial_blocks() -> None:
-    bench = SimpleNamespace(latlon=np.array([[0.0, 0.0], [0.5, 0.5], [5.0, 5.0], [np.nan, 0.0]]))
+def test_cropharvest_geographic_domains_are_canonical_source_domains() -> None:
+    """geographic_ood must leave out canonical domains, not 2-degree coordinate blocks.
+
+    The block basis silently redefined the holdout universe: it produced hundreds of anonymous
+    `block_*` labels instead of the 18 named domains the benchmark actually carries.
+    """
+    bench = SimpleNamespace(
+        groups=np.array(["kenya", "kenya", "togo", "geowiki-landcover-2017"], dtype=object),
+        latlon=np.array([[0.0, 0.0], [0.5, 0.5], [5.0, 5.0], [np.nan, 0.0]]),
+    )
 
     domains = cropharvest.geographic_domains(bench)
 
-    assert domains[0] == domains[1]
+    assert list(domains) == ["kenya", "kenya", "togo", "geowiki-landcover-2017"]
+    assert not any(str(d).startswith("block_") for d in domains)
+
+
+def test_cropharvest_geographic_split_is_leave_one_domain_out() -> None:
+    """The curated five-region subset must not define the geographic_ood universe."""
+    spec = cropharvest.GEOGRAPHIC_SPLIT
+
+    assert spec["strategy"] == "leave_one_domain_out"
+    assert spec["purge_km"] == 50.0
+    # one-class domains are real regions and are evaluated, not discarded
+    assert spec["allow_one_class_target"] is True
+    assert not hasattr(cropharvest, "GEOGRAPHIC_HOLDOUTS")
+
+
+def test_cropharvest_retains_the_block_basis_for_historical_artifacts() -> None:
+    """The pre-LODO basis still exists and still handles missing coordinates.
+
+    Exact reproduction of the canonical `spatial_block_2deg_purge50km` split -- all 2,496 block
+    names and the final per-sample partitions -- is pinned in test_golden_spatial_block_split.py
+    against the real artifact; this only covers the no-coordinate edge case that has no canonical
+    counterpart (unlocatable samples never appear in the manifest's domain lists).
+    """
+    bench = SimpleNamespace(latlon=np.array([[0.0, 0.0], [np.nan, 0.0], [1.0, np.nan]]))
+
+    domains = cropharvest.spatial_block_domains(bench)
+
+    assert cropharvest.GEOGRAPHIC_BLOCK_DEGREES == 2.0
     assert domains[0].startswith("block_")
-    assert domains[2] != domains[0]
-    assert domains[3] == "unknown"
+    assert domains[1] == "unknown"
+    assert domains[2] == "unknown"
 
 
 def test_spatial_cluster_ood_uses_coordinate_clusters() -> None:

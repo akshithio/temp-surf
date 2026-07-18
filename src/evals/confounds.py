@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import warnings
 from typing import Any
 
 import numpy as np
-from sklearn.metrics import accuracy_score, f1_score
 
-from utils import perfutils as perf
 from utils.ioutils import (
     _LOWER_BETTER,
     _chance,
@@ -74,153 +71,6 @@ def domain_confound_report(axes: dict[str, np.ndarray | None]) -> dict:
         for j in range(i + 1, len(usable)):
             report["pairs"][f"{usable[i]}__vs__{usable[j]}"] = confound_pair(axes[usable[i]], axes[usable[j]])
     return report
-
-
-def _apply_transform(transform: Any | None, x: np.ndarray) -> np.ndarray:
-    return x if transform is None else transform.transform(x)
-
-
-def per_class_iou(y_true: np.ndarray, y_pred: np.ndarray, classes: np.ndarray) -> dict[int, float]:
-    """IoU per class from flattened per-pixel labels. NaN for classes absent from ``y_true``."""
-    y_true = np.asarray(y_true)
-    y_pred = np.asarray(y_pred)
-    out: dict[int, float] = {}
-    for c in classes:
-        c = int(c)
-        t = y_true == c
-        if not t.any():
-            out[c] = float("nan")  # class not present in this test region -> excluded from mIoU
-            continue
-        p = y_pred == c
-        union = int(np.logical_or(t, p).sum())
-        out[c] = float(int(np.logical_and(t, p).sum()) / union) if union > 0 else 0.0
-    return out
-
-
-def score_segmentation(
-    clf: Any,
-    x_test: np.ndarray,
-    y_test: np.ndarray,
-    *,
-    eval_classes: np.ndarray | None = None,
-    return_per_sample: bool = False,
-) -> dict[str, float] | tuple[dict[str, float], dict[str, np.ndarray]]:
-    """Per-pixel multiclass segmentation scores."""
-    with perf.measure("probe.score/segmentation", n_samples=len(y_test), n_features=x_test.shape[1]):
-        pred = clf.predict(x_test)
-    classes = np.asarray(eval_classes if eval_classes is not None else getattr(clf, "classes_", np.unique(y_test)))
-    ious = per_class_iou(y_test, pred, classes)
-    present = [v for v in ious.values() if not np.isnan(v)]
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="y_pred contains classes not in y_true")
-        scores = {
-            "miou": float(np.mean(present)) if present else float("nan"),
-            "pixel_accuracy": float(accuracy_score(y_test, pred)),
-            "macro_f1": float(f1_score(y_test, pred, average="macro", zero_division=0)),
-            "weighted_f1": float(f1_score(y_test, pred, average="weighted", zero_division=0)),
-            "n_eval_classes": int(len(classes)),
-            "n_present_classes": int(len(present)),
-        }
-    if return_per_sample:
-        per_sample = {
-            "y_true": np.asarray(y_test, dtype=np.int64),
-            "pred": np.asarray(pred, dtype=np.int64),
-            "classes": classes.astype(np.int64),
-        }
-        return scores, per_sample
-    return scores
-
-
-def _miou_from_confusion(conf: np.ndarray) -> float:
-    """mIoU over classes present in y_true (rows), from a confusion matrix; NaN if none present."""
-    conf = conf.astype(np.float64)
-    tp = np.diag(conf)
-    row, col = conf.sum(1), conf.sum(0)  # true support, predicted count
-    present = row > 0
-    union = row + col - tp
-    iou = np.divide(tp, union, out=np.zeros_like(tp), where=union > 0)
-    return float(iou[present].mean()) if present.any() else float("nan")
-
-
-def _as_eval_indices(values: np.ndarray, classes: np.ndarray, name: str) -> np.ndarray:
-    values = np.asarray(values, dtype=np.int64)
-    classes = np.asarray(classes, dtype=np.int64)
-    if classes.size == 0:
-        raise ValueError("eval_classes is empty")
-    if np.array_equal(classes, np.arange(classes.size)):
-        bad = (values < 0) | (values >= classes.size)
-        if bad.any():
-            raise ValueError(f"{name} contains values outside eval_classes: {np.unique(values[bad])[:10].tolist()}")
-        return values
-    order = np.argsort(classes)
-    sorted_classes = classes[order]
-    pos = np.searchsorted(sorted_classes, values)
-    valid = pos < len(sorted_classes)
-    safe_pos = np.minimum(pos, len(sorted_classes) - 1)
-    valid &= sorted_classes[safe_pos] == values
-    if not valid.all():
-        raise ValueError(f"{name} contains values outside eval_classes: {np.unique(values[~valid])[:10].tolist()}")
-    return order[pos]
-
-
-def _segmentation_metrics_from_confusion(conf: np.ndarray, tile_mious: list[float]) -> dict[str, float]:
-    """Segmentation metrics from an accumulated confusion matrix."""
-    c = conf.astype(np.float64)
-    tp = np.diag(c)
-    row, col, total = c.sum(1), c.sum(0), c.sum()
-    present = row > 0
-    union = row + col - tp
-    iou = np.divide(tp, union, out=np.zeros_like(tp), where=union > 0)
-    prec = np.divide(tp, col, out=np.zeros_like(tp), where=col > 0)
-    rec = np.divide(tp, row, out=np.zeros_like(tp), where=row > 0)
-    f1 = np.divide(2 * prec * rec, prec + rec, out=np.zeros_like(tp), where=(prec + rec) > 0)
-    labelset = (row > 0) | (col > 0)  # classes present in y_true OR y_pred (sklearn macro default)
-    out = {
-        "miou": float(iou[present].mean()) if present.any() else float("nan"),
-        "pixel_accuracy": float(tp.sum() / total) if total > 0 else float("nan"),
-        "macro_f1": float(f1[labelset].mean()) if labelset.any() else 0.0,
-        "weighted_f1": float((row * f1).sum() / row.sum()) if row.sum() > 0 else 0.0,
-        "n_eval_classes": int(conf.shape[0]),
-        "n_present_classes": int(present.sum()),
-    }
-    if tile_mious:
-        arr = np.asarray(tile_mious)
-        out.update(
-            {
-                "mean_per_tile_miou": float(arr.mean()),
-                "worst_tile_miou": float(arr.min()),
-                "n_tiles_scored": len(arr),
-            }
-        )
-    else:
-        out.update({"mean_per_tile_miou": float("nan"), "worst_tile_miou": float("nan"), "n_tiles_scored": 0})
-    return out
-
-
-def score_segmentation_streamed(clf, tiles, eval_classes: np.ndarray, transform: Any | None = None) -> dict[str, float]:
-    """Exact full-fold segmentation scoring by streaming dense tiles."""
-    k = len(eval_classes)
-    conf = np.zeros((k, k), dtype=np.int64)
-    tile_mious: list[float] = []
-    n_pixels = 0
-    with perf.measure("probe.score/segmentation_streamed", n_features=-1):
-        for features, labels in tiles:
-            labels = np.asarray(labels)
-            if labels.size == 0:
-                continue
-            features = _apply_transform(transform, np.asarray(features, dtype=np.float32))
-            pred = np.asarray(clf.predict(features))
-            lab = _as_eval_indices(labels, eval_classes, "segmentation labels")
-            prd = _as_eval_indices(pred, eval_classes, "segmentation predictions")
-            tile_conf = np.bincount(lab * k + prd, minlength=k * k).reshape(k, k)
-            conf += tile_conf
-            miou_t = _miou_from_confusion(tile_conf)
-            if not np.isnan(miou_t):
-                tile_mious.append(miou_t)
-            n_pixels += int(labels.size)
-    metrics = _segmentation_metrics_from_confusion(conf, tile_mious)
-    metrics["n_test"] = n_pixels
-    return metrics
 
 
 def compute_deltas(

@@ -18,13 +18,8 @@ from typing import Any  # noqa: E402
 
 import numpy as np  # noqa: E402
 
-from evals.probes import (  # noqa: E402
-    FeatureTransform,
-    fit_probe_multiclass,
-    fit_probe_with_calibration,
-    score_binary,
-    score_multiclass,
-)
+from evals.metrics import score_binary, score_multiclass  # noqa: E402
+from evals.probes import fit_probe_multiclass, fit_probe_with_calibration  # noqa: E402
 from evals.regimes import base as regime_base  # noqa: E402
 from utils import perfutils as perf  # noqa: E402
 
@@ -40,6 +35,7 @@ _split_manifest_entry = regime_base._split_manifest_entry
 _dense_fold_stats = regime_base._dense_fold_stats
 _segmentation_split_manifest_entry = regime_base._segmentation_split_manifest_entry
 _write_split_manifest = regime_base._write_split_manifest
+_write_domain_census = regime_base._write_domain_census
 
 
 def _validate_source_budgets(budgets: list[float | int]) -> None:
@@ -96,6 +92,14 @@ METRICS_MULTICLASS_BASE: list[str] = [
     "balanced_accuracy",
     "accuracy",
     "macro_auc",
+    # Calibration. `nll` is +inf and `brier` is union-space whenever a target-only class has no
+    # probability column -- see evals.metrics.multiclass_calibration for why the full-label
+    # scores are degenerate there and the shared_* columns carry the real signal.
+    "ece",
+    "top_label_ece_all",
+    "nll",
+    "brier",
+    "union_brier",
 ]
 METRICS_MULTICLASS_WORST_GROUP: list[str] = [
     "worst_group_macro_f1",
@@ -108,6 +112,9 @@ METRICS_MULTICLASS_SHARED: list[str] = [
     "shared_macro_f1",
     "shared_balanced_accuracy",
     "shared_accuracy",
+    "shared_ece",
+    "shared_nll",
+    "shared_brier",
     "unseen_prevalence",
     "n_classes_unseen",
     "n_classes_seen",
@@ -118,6 +125,8 @@ METRICS_MULTICLASS: list[str] = [
 METRICS_SEGMENTATION: list[str] = [
     "miou", "pixel_accuracy", "macro_f1", "weighted_f1",
     "mean_per_tile_miou", "worst_tile_miou", "n_tiles_scored",
+    "ece", "top_label_ece_all", "nll", "brier", "union_brier",
+    "shared_ece", "shared_nll", "shared_brier", "unseen_prevalence",
 ]
 METRIC_ROLES: dict[str, dict[str, list[str]]] = {
     "binary": {
@@ -138,11 +147,17 @@ METRIC_ROLES: dict[str, dict[str, list[str]]] = {
             "weighted_f1", "accuracy", "macro_auc",
             "shared_macro_f1", "shared_balanced_accuracy", "shared_accuracy",
             "unseen_prevalence", "n_classes_unseen", "n_classes_seen",
+            "ece", "top_label_ece_all", "nll", "brier", "union_brier",
+            "shared_ece", "shared_nll", "shared_brier",
         ],
     },
     "segmentation": {
         "deployment": ["miou", "mean_per_tile_miou", "worst_tile_miou"],
-        "diagnostic": ["pixel_accuracy", "macro_f1", "weighted_f1", "n_tiles_scored"],
+        "diagnostic": [
+            "pixel_accuracy", "macro_f1", "weighted_f1", "n_tiles_scored",
+            "ece", "top_label_ece_all", "nll", "brier", "union_brier",
+            "shared_ece", "shared_nll", "shared_brier", "unseen_prevalence",
+        ],
     },
 }
 
@@ -154,7 +169,6 @@ def run_probes(
     y_test: np.ndarray,
     seed: int,
     *,
-    transform: FeatureTransform | None = None,
     budgets: list[float] = SOURCE_BUDGETS,
     meta: dict[str, Any] | None = None,
     groups_train: np.ndarray | None = None,
@@ -169,9 +183,12 @@ def run_probes(
     """Run binary source-budget probes."""
     _validate_source_budgets(budgets)
 
-    def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False):
+    def fit_score(
+        x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False
+    ):
         clf, threshold, n_fit, n_cal, probe_meta = fit_probe_with_calibration(
-            x_tr, y_tr, probe_seed, x_cal=x_cal, y_cal=y_cal, family=family, tune_internal=tune_internal
+            x_tr, y_tr, probe_seed, x_cal=x_cal, y_cal=y_cal, family=family,
+            tune_internal=tune_internal,
         )
         extra = {
             "n_probe_fit": n_fit,
@@ -181,8 +198,6 @@ def run_probes(
             **probe_meta,
         }
         def score_fitted(x_eval, y_eval):
-            if transform is not None and hasattr(transform, "adapt_test_features"):
-                x_eval = transform.adapt_test_features(clf, x_eval)
             return score_binary(clf, threshold, x_eval, y_eval, return_per_sample=True)
 
         scores, per_sample = score_fitted(x_te, y_te)
@@ -190,9 +205,10 @@ def run_probes(
 
     _sweep_budgets(
         rows, x_train, x_test, y_train, y_test, seed, fit_score,
-        transform=transform, budgets=budgets, meta=meta, stratify=True, groups_train=groups_train,
+        budgets=budgets, meta=meta, stratify=True, groups_train=groups_train,
         predictions=predictions, sample_ids_test=sample_ids_test, groups_test=groups_test,
         x_val=x_val, y_val=y_val, extra_evals=extra_evals,
+        family=family,
     )
 
 
@@ -204,7 +220,6 @@ def run_probes_target(
     y_target_full: np.ndarray,
     seed: int,
     *,
-    transform: FeatureTransform | None = None,
     budgets: list[int | float] = ALL_TARGET_BUDGETS,
     meta: dict[str, Any] | None = None,
     groups_source: np.ndarray | None = None,
@@ -217,9 +232,12 @@ def run_probes_target(
 ) -> None:
     """Run binary target-budget probes."""
 
-    def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False):
+    def fit_score(
+        x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False
+    ):
         clf, threshold, n_fit, n_cal, probe_meta = fit_probe_with_calibration(
-            x_tr, y_tr, probe_seed, x_cal=x_cal, y_cal=y_cal, family=family, tune_internal=tune_internal
+            x_tr, y_tr, probe_seed, x_cal=x_cal, y_cal=y_cal, family=family,
+            tune_internal=tune_internal,
         )
         extra = {
             "n_probe_fit": n_fit,
@@ -228,10 +246,7 @@ def run_probes_target(
             "threshold": threshold,
             **probe_meta,
         }
-
         def score_fitted(x_eval, y_eval):
-            if transform is not None and hasattr(transform, "adapt_test_features"):
-                x_eval = transform.adapt_test_features(clf, x_eval)
             return score_binary(clf, threshold, x_eval, y_eval, return_per_sample=True)
 
         scores, per_sample = score_fitted(x_te, y_te)
@@ -239,9 +254,10 @@ def run_probes_target(
 
     _sweep_target_budgets(
         rows, x_source, x_target_full, y_source, y_target_full, seed, fit_score,
-        transform=transform, budgets=budgets, meta=meta, stratify=True, groups_source=groups_source,
+        budgets=budgets, meta=meta, stratify=True, groups_source=groups_source,
         predictions=predictions, sample_ids_target=sample_ids_target, groups_target=groups_target,
         x_val=x_val, y_val=y_val, target_id_budget=TARGET_ID_UPPER_BOUND,
+        family=family,
     )
 
 
@@ -253,7 +269,6 @@ def run_probes_multiclass(
     y_test: np.ndarray,
     seed: int,
     *,
-    transform: FeatureTransform | None = None,
     budgets: list[float] = SOURCE_BUDGETS,
     meta: dict[str, Any] | None = None,
     groups_train: np.ndarray | None = None,
@@ -268,13 +283,14 @@ def run_probes_multiclass(
     """Run multiclass source-budget probes."""
     _validate_source_budgets(budgets)
 
-    def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False):
+    def fit_score(
+        x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False
+    ):
         clf, probe_meta = fit_probe_multiclass(
-            x_tr, y_tr, probe_seed, x_val=x_cal, y_val=y_cal, family=family, tune_internal=tune_internal
+            x_tr, y_tr, probe_seed, x_val=x_cal, y_val=y_cal, family=family,
+            tune_internal=tune_internal,
         )
         def score_fitted(x_eval, y_eval):
-            if transform is not None and hasattr(transform, "adapt_test_features"):
-                x_eval = transform.adapt_test_features(clf, x_eval)
             return score_multiclass(clf, x_eval, y_eval, return_per_sample=True)
 
         scores, per_sample = score_fitted(x_te, y_te)
@@ -282,9 +298,10 @@ def run_probes_multiclass(
 
     _sweep_budgets(
         rows, x_train, x_test, y_train, y_test, seed, fit_score,
-        transform=transform, budgets=budgets, meta=meta, stratify=True, groups_train=groups_train,
+        budgets=budgets, meta=meta, stratify=True, groups_train=groups_train,
         predictions=predictions, sample_ids_test=sample_ids_test, groups_test=groups_test,
         x_val=x_val, y_val=y_val, extra_evals=extra_evals,
+        family=family,
     )
 
 
@@ -296,7 +313,6 @@ def run_probes_multiclass_target(
     y_target_full: np.ndarray,
     seed: int,
     *,
-    transform: FeatureTransform | None = None,
     budgets: list[int | float] = ALL_TARGET_BUDGETS,
     meta: dict[str, Any] | None = None,
     groups_source: np.ndarray | None = None,
@@ -309,14 +325,15 @@ def run_probes_multiclass_target(
 ) -> None:
     """Run multiclass target-budget probes."""
 
-    def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False):
+    def fit_score(
+        x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False
+    ):
         clf, probe_meta = fit_probe_multiclass(
-            x_tr, y_tr, probe_seed, x_val=x_cal, y_val=y_cal, family=family, tune_internal=tune_internal
+            x_tr, y_tr, probe_seed, x_val=x_cal, y_val=y_cal, family=family,
+            tune_internal=tune_internal,
         )
 
         def score_fitted(x_eval, y_eval):
-            if transform is not None and hasattr(transform, "adapt_test_features"):
-                x_eval = transform.adapt_test_features(clf, x_eval)
             return score_multiclass(clf, x_eval, y_eval, return_per_sample=True)
 
         scores, per_sample = score_fitted(x_te, y_te)
@@ -324,9 +341,10 @@ def run_probes_multiclass_target(
 
     _sweep_target_budgets(
         rows, x_source, x_target_full, y_source, y_target_full, seed, fit_score,
-        transform=transform, budgets=budgets, meta=meta, stratify=True, groups_source=groups_source,
+        budgets=budgets, meta=meta, stratify=True, groups_source=groups_source,
         predictions=predictions, sample_ids_target=sample_ids_target, groups_target=groups_target,
         x_val=x_val, y_val=y_val, target_id_budget=TARGET_ID_UPPER_BOUND,
+        family=family,
     )
 
 
@@ -339,15 +357,15 @@ def run_probes_segmentation(
     seed: int,
     *,
     eval_streams: dict[str, Any],
-    transform: FeatureTransform | None = None,
     budgets: list[float] = SOURCE_BUDGETS,
     meta: dict[str, Any] | None = None,
+    groups_train: np.ndarray | None = None,
     family: str = "logistic",
 ) -> None:
     bench = load_benchmark("pastis")
     bench.run_probes_segmentation(
-        rows, x_train, x_val, y_train, y_val, seed, eval_streams=eval_streams, transform=transform,
-        budgets=budgets, meta=meta, family=family,
+        rows, x_train, x_val, y_train, y_val, seed, eval_streams=eval_streams,
+        budgets=budgets, meta=meta, groups_train=groups_train, family=family,
     )
 
 
@@ -362,16 +380,17 @@ def run_probes_segmentation_target(
     stream_target: Any,
     x_val: np.ndarray,
     y_val: np.ndarray,
-    transform: FeatureTransform | None = None,
     budgets: list[int | float] = ALL_TARGET_BUDGETS,
     meta: dict[str, Any] | None = None,
     family: str = "logistic",
+    groups_source: np.ndarray | None = None,
 ) -> None:
     bench = load_benchmark("pastis")
     bench.run_probes_segmentation_target(
         rows, x_source, y_source, seed, target_patches=target_patches, sample_target=sample_target,
-        stream_target=stream_target, x_val=x_val, y_val=y_val, transform=transform, budgets=budgets,
-        meta=meta, family=family, target_id_budget=TARGET_ID_UPPER_BOUND,
+        stream_target=stream_target, x_val=x_val, y_val=y_val, budgets=budgets,
+        meta=meta, family=family, groups_source=groups_source,
+        target_id_budget=TARGET_ID_UPPER_BOUND,
     )
 
 # Pair-level execution
@@ -380,9 +399,30 @@ def load_benchmark(benchmark_name: str):
     return importlib.import_module(f"evals.benchmarks.{benchmark_name}")
 
 
-def build_methods(label_kind: str, seed: int):
-    """Return enabled adaptation methods."""
-    return {"erm": (None, {})}
+#: The harness is ERM-only by construction: it fits ordinary probes on frozen embeddings and
+#: never adapts them post hoc. `method` survives as the literal "erm" on every row and in every
+#: resume key because 14,773 canonical rows carry it, `CELL_KEY_FIELDS` includes it, and
+#: `confounds.py` groups on it -- the column is part of the artifact contract even though the
+#: machinery behind it is gone.
+ERM_METHOD = "erm"
+
+#: Constant per-row metadata for ERM. Values are the exact ones the registry emitted for the
+#: `cls=None` sentinel, so rows written now stay byte-compatible with the canonical run's.
+ERM_METADATA: dict[str, Any] = {
+    "method_class": "erm",
+    "method_module": "",
+    "method_kwargs": "{}",
+    "method_uses_target": 0,
+    "method_requires_coords": 0,
+    "method_subset_only": 0,
+    "method_fit_source_only": 0,
+    "method_has_sample_weight": 0,
+}
+
+
+def erm_metadata() -> dict[str, Any]:
+    """Constant ERM metadata for a result row."""
+    return dict(ERM_METADATA)
 
 
 def _id_source_budget(source_budgets: list[float | int]) -> float | int:

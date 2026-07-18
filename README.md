@@ -1,15 +1,15 @@
-# Post-Hoc Robustness for Agricultural Earth Observation Foundation Models
+# Geographic Robustness for Agricultural Earth Observation Foundation Models
 
-Given an existing Earth-observation foundation model, how do you make it reliably
-deployable in a new agricultural region, with few or zero target-region labels,
-without retraining model weights? This repository treats EO models as frozen:
-the model is run once, embeddings are cached, and every adaptation
-method or probe operates on those cached matrices.
+Given an existing Earth-observation foundation model, how well does it actually
+deploy in a new agricultural region, and how much of the transfer gap is
+recoverable with target labels? This repository treats EO models as frozen: the
+model is run once, embeddings are cached, and every probe operates on those
+cached matrices.
 
 > **Central contribution.** Establish a deployment-realistic evaluation framework
-> for geographic robustness in frozen agricultural EO models, then measure
-> whether post-hoc adaptation recovers a meaningful fraction of the transfer gap
-> without modifying model weights.
+> for geographic robustness in frozen agricultural EO models, then decompose the
+> transfer gap into what target labels can recover and what they cannot, without
+> modifying model weights.
 
 ---
 
@@ -19,7 +19,7 @@ method or probe operates on those cached matrices.
 - **Benchmarks:** binary crop/non-crop (CropHarvest), multiclass crop-type
   (EuroCropsML, BreizhCrops), and semantic segmentation (PASTIS-R).
 - **Models:** Presto, OlmoEarth v1.1-Base, Galileo v1 Base, AgriFM, and TESSERA v1.1.
-- **Adaptation:** ERM baseline plus optional post-hoc feature transforms.
+- **Probing:** ERM only -- ordinary probes fitted on the frozen embeddings.
 
 Success for this pass means clean, reproducible domain-holdout baselines with
 cached frozen embeddings and complete probe outputs. Additional models,
@@ -31,8 +31,8 @@ explicitly designed and tested.
 ## Evaluation Protocol
 
 Every experiment cell is defined by the cross product of model, benchmark, seed,
-split regime (which determines the number of actual train/test splits), method,
-and label budget. Each split produces one probe fit per budget level.
+split regime (which determines the number of actual train/test splits), probe
+family, and label budget. Each split produces one probe fit per budget level.
 
 **Models**
 
@@ -160,13 +160,18 @@ the row reports the worst test domain rather than only the average.
 
 ---
 
-## Post-Hoc Methods
+## Probing
 
-Out of scope for now: the pipeline runs the plain **ERM** probe on the frozen embeddings
-(no post-hoc adaptation). The generic `transform` hook in `evals` is retained (always
-`None`), so a fitted-feature-transform method axis (e.g. GRIT/DFR/TENT) can be reintroduced
-once the baseline failures are characterized — targeting observed failure modes rather than
-adding decorative comparisons.
+The pipeline fits ordinary probes (logistic by default; `mlp` / `knn` via
+`RB_ACTIVE_PROBES`) on the frozen embeddings. There is no post-hoc adaptation:
+the probe sees the cached features exactly as the encoder produced them, and each
+label-budget cell uses only the labels available to that row. Result rows carry a
+constant `method="erm"` column, which the canonical artifacts and the resume keys
+depend on.
+
+Set `RB_PROBE_TUNING=1` to restore the full probe hyperparameter grid (collapsed
+to a single value by default for tractability on 706k-row EuroCropsML); it is
+recorded in the run signature when enabled.
 
 ---
 
@@ -175,12 +180,12 @@ adding decorative comparisons.
 ```text
 .
 ├── src/
-│   ├── main.py              # orchestrator: benchmark -> encode/cache -> probe (ERM) -> tables
+│   ├── main.py              # orchestrator: benchmark -> encode/cache -> probes -> tables
 │   ├── dataio/get_input.py  # Benchmark loader + shared degradation protocol
 │   ├── models/              # active frozen model wrappers
 │   ├── evals/
 │   │   ├── evals.py         # budget sweeps and shared protocol constants
-│   │   ├── probes/          # probe implementations and scoring
+│   │   ├── probes.py        # probe implementations and scoring
 │   │   ├── compat.py        # model × benchmark matrix -> which models run per benchmark
 │   │   ├── regimes/         # one file per regime; each owns domain assignment + splitting
 │   │   └── benchmarks/      # per-benchmark label + metric specs
@@ -196,7 +201,6 @@ adding decorative comparisons.
 │   │   └── embeddings/      # cached frozen-embedding .npy per (bench, model, signature)
 │   └── output/
 │       └── results/         # probe results, predictions, summaries per <model>/<benchmark>/
-└── notebooks/
 ```
 
 ### Expected Data Layout
@@ -234,7 +238,7 @@ The project uses a conda + uv split:
   Use `uv pip install ...` inside the activated conda environment rather than
   installing project dependencies directly with pip.
 - **`pyproject.toml`** is the single source of truth for package metadata,
-  runtime dependencies, optional dev/notebook extras, and ruff configuration.
+  runtime dependencies, optional dev/viz extras, and ruff configuration.
 - **`uv.lock`** is checked in so both local and remote installs resolve the same
   Python dependency graph.
 - **ruff** is the lint/import-format tool. Its config lives under `[tool.ruff]`
@@ -257,7 +261,7 @@ To build the environment, use the same conda environment name:
 ```bash
 conda env create -f environment.yml
 conda activate robustness
-uv pip install -e ".[dev,notebooks]"
+uv sync --locked --all-extras
 uv pip install --no-deps "git+https://github.com/nasaharvest/presto.git@11e207a668a34336ced1d8e492a1bd5849b96c4a"
 ```
 
@@ -267,9 +271,23 @@ sync the project dependencies through uv:
 ```bash
 conda env update -n robustness -f environment.yml --prune
 conda activate robustness
-uv pip install -e ".[dev,notebooks]"
+uv sync --locked --all-extras
 uv pip install --no-deps "git+https://github.com/nasaharvest/presto.git@11e207a668a34336ced1d8e492a1bd5849b96c4a"
 ```
+
+`uv sync --locked` installs the exact graph in `uv.lock` and fails if `pyproject.toml` and the
+lock have drifted apart, so every machine resolves identically. Do **not** substitute
+`uv pip install -e .`: it ignores `uv.lock` and re-resolves, which is how the dev machine ended
+up on scikit-learn 1.7.2 / scipy 1.15.3 while every box that produced results ran 1.9.0 / 1.17.1.
+`--all-extras` is required because extras are not installed by default. Presto follows
+separately and `--no-deps` is deliberate — upstream pins `torch==2.0` / `numpy==1.23.5` and would
+drag the pinned numerical core backwards; the flag is what keeps `uv sync`'s result intact.
+
+The numerical core (`numpy`, `scipy`, `scikit-learn`, `torch`) is pinned to exact versions for
+**comparability with the canonical `output-erm-full-20260711` run**, not for currency. scikit-learn
+drives probe numerics and is not part of the run signature, so changing it silently changes
+published numbers. Relaxing any of those pins means recomputing the canonical probing results
+under the new versions.
 
 Run checks from the activated environment:
 
@@ -361,8 +379,9 @@ Everything is cache-backed and resumable:
 - Assembled benchmarks are pickle-cached under `data/cache/benchmark/`.
 - Model embeddings are cached per `(benchmark, model, benchmark signature)`
   with atomic writes.
-- Probe results append to `probe_results.jsonl`; per-sample predictions append to
-  `predictions.jsonl` for every probe cell.
+- Probe results append to `probe_results.jsonl`.
+- Per-sample predictions append to `predictions.jsonl` only when
+  `WRITE_PREDICTIONS=True`.
 - Restarting with `OVERWRITE_MODE=False` skips finished cells and regenerates derived
   tables from the JSONL logs.
 

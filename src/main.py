@@ -20,7 +20,7 @@ from joblib import Parallel, delayed  # noqa: E402
 from evals import compat  # noqa: E402
 from evals import evals as EV  # noqa: E402
 from evals.regimes import base as regime_base  # noqa: E402
-from utils import cacheutils, gputils, runstate  # noqa: E402
+from utils import artifacts, cacheutils, gputils, runstate  # noqa: E402
 from utils import ioutils as IOU  # noqa: E402
 from utils import perfutils as perf  # noqa: E402
 
@@ -35,12 +35,75 @@ BUDGET_REGIMES = {
 }
 MAX_SAMPLES = None
 MAX_DENSE_PIXELS = 50_000  # sampled pixels per PASTIS fold partition
-OVERWRITE_MODE = True
+OVERWRITE_MODE = False
 STRICT_MODE = False
+WRITE_PREDICTIONS = True
 LAUNCH_GPU_SHARDS = True
 GPU_SHARDS = None
-SEEDS = [0]
+SEEDS = [0, 1, 2]
 # =============================================================================
+
+# --- Per-machine benchmark placement (the only value that differs across
+# machines; everything else above is uniform and synced identically). ---
+_rb_benchmarks = os.environ.get("RB_BENCHMARKS", "").strip()
+if _rb_benchmarks:
+    _requested = [b.strip() for b in _rb_benchmarks.split(",") if b.strip()]
+    _unknown = [b for b in _requested if b not in BENCHMARKS]
+    if _unknown:
+        raise ValueError(
+            f"RB_BENCHMARKS has unknown benchmark(s) {_unknown}; valid: {BENCHMARKS}"
+        )
+    BENCHMARKS = _requested
+
+# --- Per-machine model restriction. Empty/unset = all eligible models for the
+# selected benchmarks (the normal case). Used only when splitting one
+# benchmark's models across machines (e.g. pastis presto/raw on one box, the
+# heavy encoders on another). Validated against eligibility in main(). ---
+_rb_models = os.environ.get("RB_MODELS", "").strip()
+RB_MODELS = [m.strip() for m in _rb_models.split(",") if m.strip()] if _rb_models else None
+
+# --- Per-machine seed restriction. Empty/unset = all seeds (the normal case).
+# Used only when splitting one (model, benchmark) cell's seeds across machines
+# to parallelize a slow probe; results merge cleanly at collation since the
+# embedding cache is content-addressed and rows are keyed by seed. ---
+_rb_seeds = os.environ.get("RB_SEEDS", "").strip()
+if _rb_seeds:
+    _requested_seeds = [int(s.strip()) for s in _rb_seeds.split(",") if s.strip()]
+    _unknown_seeds = [s for s in _requested_seeds if s not in SEEDS]
+    if _unknown_seeds:
+        raise ValueError(
+            f"RB_SEEDS has seed(s) {_unknown_seeds} not in {SEEDS}"
+        )
+    SEEDS = _requested_seeds
+
+# --- Probe-family override. Unset = ACTIVE_PROBES above (logistic, the headline
+# probe). Used for the probe-capacity robustness check: re-probe cached
+# embeddings with the MLP family into a fresh RB_OUTPUT_DIR, then compare the
+# decomposition to the logistic run. Validated against the known families. ---
+_rb_probes = os.environ.get("RB_ACTIVE_PROBES", "").strip()
+if _rb_probes:
+    _requested_probes = [p.strip() for p in _rb_probes.split(",") if p.strip()]
+    _unknown_probes = [p for p in _requested_probes if p not in ("logistic", "mlp", "knn")]
+    if _unknown_probes:
+        raise ValueError(
+            f"RB_ACTIVE_PROBES has unknown probe(s) {_unknown_probes}; known: logistic, mlp, knn"
+        )
+    ACTIVE_PROBES = _requested_probes
+
+# --- Split-regime restriction. Unset = SPLIT_REGIMES above (all regimes, the
+# normal case). Used for the probe-capacity cap-sensitivity check, which targets
+# a single regime (geographic_ood) so the decomposition verdict can be compared
+# across caps without recomputing every regime. Per-benchmark unsupported regimes
+# are still filtered downstream; this only narrows the global set. ---
+_rb_regimes = os.environ.get("RB_SPLIT_REGIMES", "").strip()
+if _rb_regimes:
+    _requested_regimes = [r.strip() for r in _rb_regimes.split(",") if r.strip()]
+    _unknown_regimes = [r for r in _requested_regimes if r not in SPLIT_REGIMES]
+    if _unknown_regimes:
+        raise ValueError(
+            f"RB_SPLIT_REGIMES has unknown regime(s) {_unknown_regimes}; valid: {SPLIT_REGIMES}"
+        )
+    SPLIT_REGIMES = _requested_regimes
 
 os.environ["STRICT_MODE"] = "1" if STRICT_MODE else ""
 
@@ -89,6 +152,7 @@ def _run_tabular_pair(
     overwrite_mode,
     strict_mode,
     enc_kwargs,
+    write_predictions=True,
 ) -> None:
     stages = runstate.validate_run_stages(run_stages)
     gen_embeddings = "gen_embeddings" in stages
@@ -145,6 +209,7 @@ def _run_tabular_pair(
         budget_regimes=budget_regimes,
         max_samples=max_samples,
         max_dense_pixels=max_dense_pixels,
+        write_predictions=write_predictions,
     )
     runstate.check_run_signature(results_dir, signature, overwrite_mode=overwrite_mode)
     rows_path = results_dir / "probe_results.jsonl"
@@ -160,10 +225,20 @@ def _run_tabular_pair(
             results_dir / "data_quality.json",
             results_dir / "split_manifest.json",
             results_dir / "run_signature.txt",
+            results_dir / artifacts.ENVIRONMENT_FILE,
+            results_dir / artifacts.RUN_COMPLETE_FILE,
         ]:
             if p.exists():
                 p.unlink()
+    # ORDER MATTERS. Every check that can REFUSE this resume runs before anything is mutated:
+    # check_run_signature above, then the environment gate here. Only once the resume is known to
+    # be allowed do we invalidate the completion marker -- otherwise a refused resume would
+    # destroy the valid marker of the finished run it just declined to touch.
+    artifacts.write_environment(results_dir, overwrite_mode=overwrite_mode)
     runstate.publish_run_signature(results_dir, signature)
+    # This pair is about to be made incomplete again, so any completion marker from a previous
+    # run must not survive it: a stale marker asserts a finished state that is being undone.
+    artifacts.invalidate_run_complete(results_dir)
     if data_quality:
         IOU.write_json(results_dir / "data_quality.json", data_quality)
 
@@ -184,9 +259,6 @@ def _run_tabular_pair(
 
     jobs = []
 
-    def uses_target_flag(cls):
-        return getattr(cls, "USES_TARGET", False)
-
     def _scopes(budget_type, b, source_diag=False):
         if budget_type == "target":
             return ("full", "held_out") if b == 0 else ("held_out",)
@@ -201,6 +273,14 @@ def _run_tabular_pair(
     rerun_keys: set = set()
     split_specs: list[tuple] = []
     split_manifest: list[dict[str, Any]] = []
+    # DOMAIN_CENSUS is a process-global accumulator; reset it per (model, benchmark) pair so a
+    # pair's census artifact describes only that pair's data.
+    regime_base.clear_domain_census()
+    # REGIME_PROBLEMS accumulates across every pair in the shard, so slice from here to attribute
+    # problems to THIS pair -- a pair must not be blocked by another pair's dropped regime, nor
+    # excused by having been the first.
+    regime_problems_before = len(regime_base.REGIME_PROBLEMS)
+    cell_failures_before = len(perf.CELL_FAILURES)
 
     for seed in seeds:
         for split_regime in split_regimes:
@@ -236,28 +316,52 @@ def _run_tabular_pair(
                     )
                 )
     EV._write_split_manifest(results_dir, split_manifest)
+    EV._write_domain_census(results_dir, benchmark_name)
 
+    # The complete set of cells this pair is supposed to produce, built from the config and the
+    # REALIZED splits -- independently of whatever happens to be on disk. Compared against the
+    # parsed rows at the end: a planned cell that produced no row (crashed, skipped, dropped
+    # regime) otherwise leaves a table that reads as finished.
+    expected_keys: set[tuple] = set()
+
+    # ERM is the only execution path: ordinary probes on the frozen embeddings, no adaptation.
+    # `mname` stays a literal so rows and resume keys keep the method="erm" column the canonical
+    # artifacts and CELL_KEY_FIELDS depend on.
+    mname = EV.ERM_METHOD
+    method_meta = EV.erm_metadata()
     for seed in seeds:
         seed_split_specs = [spec for spec in split_specs if spec[0] == seed]
-        for mname, (cls, kwargs) in EV.build_methods(bench_mod.LABEL_KIND, seed).items():
-            for spec in seed_split_specs:
-                _, split_regime, split_label, train, val, test, groups, has_target, domain_basis, source_val, source_test = spec
-                for family in active_probes:
-                    meta = {
-                        "model": model_name,
-                        "benchmark": bench_mod.BENCHMARK,
-                        "method": mname,
-                        "split_regime": split_regime,
-                        "domain_basis": domain_basis,
-                        "holdout": split_label,
-                        "probe_family": family,
-                    }
-                    base = (seed, split_regime, split_label, mname, family)
-                    has_source_diag = len(source_val) > 0 and len(source_test) > 0
-                    if has_target:
-                        todo = _missing(base, "target", target_budgets)
-                        if todo:
-                            rerun_keys.update((*base, "target", b, sc) for b in todo for sc in _scopes("target", b))
+        for spec in seed_split_specs:
+            _, split_regime, split_label, train, val, test, groups, has_target, domain_basis, source_val, source_test = spec
+            for family in active_probes:
+                meta = {
+                    "model": model_name,
+                    "benchmark": bench_mod.BENCHMARK,
+                    "method": mname,
+                    **method_meta,
+                    "split_regime": split_regime,
+                    "domain_basis": domain_basis,
+                    "holdout": split_label,
+                    "probe_family": family,
+                }
+                base = (seed, split_regime, split_label, mname, family)
+                has_source_diag = len(source_val) > 0 and len(source_test) > 0
+                # Same key shape as `done` / `rerun_keys`: every scope of every budget this
+                # cell is planned to emit.
+                if has_target:
+                    expected_keys.update(
+                        (*base, "target", b, sc)
+                        for b in target_budgets for sc in _scopes("target", b)
+                    )
+                expected_keys.update(
+                    (*base, "source", b, sc)
+                    for b in source_budgets for sc in _scopes("source", b, has_source_diag)
+                )
+                if has_target:
+                    todo = _missing(base, "target", target_budgets)
+                    if todo:
+                        rerun_keys.update((*base, "target", b, sc) for b in todo for sc in _scopes("target", b))
+                        for budget in todo:
                             jobs.append(
                                 delayed(runstate._probe_cell_target)(
                                     probe_fn_tgt,
@@ -267,18 +371,17 @@ def _run_tabular_pair(
                                     test,
                                     y,
                                     groups,
-                                    cls,
-                                    kwargs,
-                                    uses_target_flag(cls),
                                     {**meta, "budget_type": "target"},
                                     seed,
                                     family,
-                                    todo,
+                                    [budget],
+                                    write_predictions=write_predictions,
                                 )
                             )
-                    todo_src = _missing(base, "source", source_budgets, has_source_diag)
-                    if todo_src:
-                        rerun_keys.update((*base, "source", b, sc) for b in todo_src for sc in _scopes("source", b, has_source_diag))
+                todo_src = _missing(base, "source", source_budgets, has_source_diag)
+                if todo_src:
+                    rerun_keys.update((*base, "source", b, sc) for b in todo_src for sc in _scopes("source", b, has_source_diag))
+                    for budget in todo_src:
                         jobs.append(
                             delayed(runstate._probe_cell)(
                                 probe_fn_src,
@@ -288,25 +391,23 @@ def _run_tabular_pair(
                                 test,
                                 y,
                                 groups,
-                                cls,
-                                kwargs,
-                                uses_target_flag(cls),
                                 {**meta, "budget_type": "source"},
                                 seed,
                                 family,
-                                todo_src,
+                                [budget],
                                 source_val,
                                 source_test,
+                                write_predictions=write_predictions,
                             )
                         )
 
-    rows = runstate.prune_partial_budgets(rows, rows_path, preds_path, rerun_keys)
+    rows = runstate.prune_partial_budgets(rows, rows_path, preds_path if write_predictions else None, rerun_keys)
 
     if jobs:
         n_jobs = perf._effective_n_jobs(emb)
         print(f"  probe jobs={len(jobs)} n_jobs={n_jobs}", flush=True)
         for cell_rows, cell_preds in Parallel(n_jobs=n_jobs, return_as="generator", prefer="threads")(jobs):
-            if cell_preds:
+            if write_predictions and cell_preds:
                 IOU.append_jsonl(preds_path, cell_preds)
             IOU.append_jsonl(rows_path, cell_rows)
             rows.extend(cell_rows)
@@ -332,7 +433,9 @@ def _run_tabular_pair(
     deltas = IOU.compute_deltas(
         rows,
         metrics,
-        predictions=IOU.read_jsonl(preds_path),
+        # Only the binary per-sample bootstrap CI consumes predictions; the multiclass
+        # predictions.jsonl is tens of GB and unused here, so never slurp it (OOM guard).
+        predictions=IOU.read_jsonl(preds_path) if (write_predictions and bench_mod.LABEL_KIND == "binary") else None,
         id_source_budget=EV._id_source_budget(source_budgets),
         ood_target_budget=0,
         target_id_budget=EV.TARGET_ID_UPPER_BOUND if EV.TARGET_ID_UPPER_BOUND in target_budgets else None,
@@ -366,6 +469,26 @@ def _run_tabular_pair(
     n_events = perf.write_log(perf_path)
     print(f"  perf: {n_events} events logged to {perf_path}", flush=True)
 
+    # LAST write of the pair. Everything above -- probe_results.{jsonl,csv}, summary.csv,
+    # deltas.csv -- is now final, which is exactly what this marker certifies: without it,
+    # run_signature.txt only says the pair STARTED, and a pair killed mid-probe-loop leaves stale
+    # derived CSVs beside a newer probe_results.jsonl with nothing to say they disagree.
+    #
+    # Validated against the PARSED rows on disk, not the in-memory list: the point is to certify
+    # what a later reader will actually find. Raises IncompleteRunError on any shortfall, which
+    # run_pair records as a pair failure -> non-zero shard exit.
+    artifacts.write_run_complete(
+        results_dir,
+        signature=signature,
+        expected_keys=expected_keys,
+        # Absent file -> [] so write_run_complete reports it as a missing REQUIRED
+        # artifact, rather than the caller dying here on FileNotFoundError.
+        rows=artifacts.parse_jsonl_rows(rows_path) if rows_path.exists() else [],
+        regime_problems=regime_base.REGIME_PROBLEMS[regime_problems_before:],
+        cell_failures=perf.CELL_FAILURES[cell_failures_before:],
+        extra={"model": model_name, "benchmark": benchmark_name},
+    )
+
 
 def run_pair(
     *,
@@ -380,6 +503,7 @@ def run_pair(
     budget_regimes,
     overwrite_mode,
     strict_mode,
+    write_predictions,
     enc_kwargs,
 ) -> None:
     """Run one configured model/benchmark pair."""
@@ -397,6 +521,7 @@ def run_pair(
             budget_regimes,
             overwrite_mode,
             strict_mode,
+            write_predictions,
             enc_kwargs,
         )
         return
@@ -413,7 +538,19 @@ def run_pair(
         overwrite_mode,
         strict_mode,
         enc_kwargs,
+        write_predictions,
     )
+
+
+def shard_exit_code(failures, regime_problems) -> int:
+    """Non-zero if the shard's results table is incomplete for ANY reason.
+
+    A dropped regime is not a lesser failure than a crashed pair -- it is a worse one, because the
+    table it leaves behind looks finished. Every downstream consumer reads a dropped regime as
+    "this regime simply wasn't evaluated" rather than "this run is unusable", and the exit code is
+    what a launcher or collation step actually gates on; a banner in a multi-hour log is not.
+    """
+    return 1 if (failures or regime_problems) else 0
 
 
 def main() -> int:
@@ -423,6 +560,16 @@ def main() -> int:
     enc_kwargs = {"device": gputils.device()}
 
     all_pairs = [(mod, bm) for bm in BENCHMARKS for mod in compat.eligible_models(bm)]
+    if RB_MODELS is not None:
+        _eligible = {mod for mod, _ in all_pairs}
+        _unknown = [m for m in RB_MODELS if m not in _eligible]
+        if _unknown:
+            raise ValueError(
+                f"RB_MODELS has model(s) {_unknown} not eligible for "
+                f"BENCHMARKS={BENCHMARKS}; eligible: {sorted(_eligible)}"
+            )
+        all_pairs = [(mod, bm) for mod, bm in all_pairs if mod in RB_MODELS]
+        print(f"[main] RB_MODELS filter active -> {sorted(set(m for m, _ in all_pairs))}", flush=True)
     work = gputils.take_shard(all_pairs)
     shard, nshards = gputils.shard_indices()
     failures: list[tuple[str, str, str]] = []
@@ -444,6 +591,7 @@ def main() -> int:
                 budget_regimes=BUDGET_REGIMES,
                 overwrite_mode=OVERWRITE_MODE,
                 strict_mode=STRICT_MODE,
+                write_predictions=WRITE_PREDICTIONS,
                 enc_kwargs=enc_kwargs,
             )
         except NotImplementedError as exc:
@@ -471,8 +619,13 @@ def main() -> int:
         for mod, bm, reason in failures:
             print(f"  - {mod}/{bm}: {reason}", flush=True)
         print(f"{bar}", flush=True)
-        return 1
-    return 0
+    if regime_base.REGIME_PROBLEMS:
+        print(
+            f"[shard {shard}/{nshards}] exiting non-zero: {len(regime_base.REGIME_PROBLEMS)} "
+            f"declared regime(s) did not run (results are incomplete)",
+            flush=True,
+        )
+    return shard_exit_code(failures, regime_base.REGIME_PROBLEMS)
 
 
 if __name__ == "__main__":

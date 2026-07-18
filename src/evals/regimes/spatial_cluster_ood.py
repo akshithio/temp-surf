@@ -72,7 +72,9 @@ def _sphere_features(latlon: np.ndarray) -> np.ndarray:
     ])
 
 
-def assign_domains(bench) -> np.ndarray:
+def assign_domains(bench, holdouts: Any = None) -> np.ndarray:
+    """Coordinate clusters. This regime has a single basis, so the strategy is not consulted."""
+    del holdouts
     latlon, valid = _valid_latlon(bench)
     spec = _spec(bench)
     n_clusters = min(int(spec.get("n_clusters", DEFAULT_SPLIT["n_clusters"])), int(valid.sum()))

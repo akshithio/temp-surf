@@ -58,6 +58,16 @@ def test_pastis_is_lazy_and_yields_64_pixel_tiles(tmp_path) -> None:
     assert np.isclose(pixels.latlon[:, 0].mean(), 46.005)
     assert 19 not in tiles[0][3]
 
+    cache_root = tmp_path / "cache"
+    fold = cache_root / "fold_1"
+    fold.mkdir(parents=True)
+    for tile_id in ("10000_0_0", "10000_0_1", "10000_1_0", "10000_1_1"):
+        np.save(fold / f"{tile_id}.npy", np.zeros((1, 2), dtype=np.float32))
+        np.save(fold / f"{tile_id}.labels.npy", np.zeros(1, dtype=np.uint8))
+    (base / "DATA_S2" / "S2_10000.npy").unlink()
+
+    assert list(bench.iter_tiles(cache_root=cache_root, overwrite=False)) == []
+
 
 def test_summarize_rows_ignores_legacy_rows_missing_grouping_keys() -> None:
     rows = [
@@ -92,6 +102,27 @@ def test_load_cached_embeddings_reads_existing_matrix(tmp_path, monkeypatch) -> 
     actual = cacheutils.load_cached_embeddings(bench, "cropharvest", "presto", "tag")
 
     np.testing.assert_array_equal(actual, expected.astype(np.float32))
+
+
+def test_dense_cache_skips_tiles_without_valid_pixels(tmp_path, monkeypatch) -> None:
+    class EmptyDenseBench:
+        n_samples = 1
+        tile_size = 64
+        patches = ()
+
+        def iter_tiles(self, cache_root=None, overwrite=False):
+            yield "empty", 1, object(), np.array([], dtype=np.uint8)
+
+    def fail_build_model(*_args, **_kwargs):
+        raise AssertionError("all-void dense tiles should not build a model")
+
+    monkeypatch.setattr(cacheutils, "dense_embedding_cache_dir", lambda *_args, **_kwargs: tmp_path / "dense")
+    monkeypatch.setattr(cacheutils, "build_model", fail_build_model)
+
+    root = cacheutils.extract_dense_and_cache(EmptyDenseBench(), "pastis", "raw", "full")
+
+    assert root == tmp_path / "dense"
+    assert list(root.rglob("*.npy")) == []
 
 
 def test_cropharvest_geo_group_collapses_rwanda_aliases() -> None:
@@ -185,3 +216,67 @@ def test_input_footprint_and_s2_only_common_input_view() -> None:
     assert "latlon" in compat.input_modalities("presto")
     assert "s1" not in compat.input_modalities("olmoearth")
     assert compat.input_modalities("agrifm") == ("s2",)
+
+
+def test_pastis_s2_only_structural_contract() -> None:
+    """PASTIS ``s2_only`` must make S1 a *structurally absent* modality (not a zero-valued
+    "present" one) and zero coordinates for the pixel path (Presto/TESSERA/raw), matching the
+    tabular ``Benchmark.s2_only`` contract --- enforced even though the tile still holds real S1
+    data. Guards the S2-only-control correctness bug (v4)."""
+    from evals.benchmarks.pastis import PastisTile
+
+    rng = np.random.default_rng(0)
+    t = 24
+    months = np.repeat(np.arange(12), 2).astype(np.int64)
+    common = dict(
+        s2=rng.random((t, 10, 4, 4)).astype(np.float32),
+        s1=rng.random((t, 3, 4, 4)).astype(np.float32),  # REAL S1 present in the tile
+        s2_months=months, s1_months=months,
+        s2_mask=np.ones(t, np.float32), s1_mask=np.ones(t, np.float32),
+        labels=np.zeros((4, 4), np.int64), valid=np.ones((4, 4), bool),
+        fold=1, latlon=(46.0, -1.0),
+    )
+    full = PastisTile(**common)                  # default s2_only=False
+    s2o = PastisTile(**common, s2_only=True)
+    assert full.s2_only is False and s2o.s2_only is True
+
+    fb = full.pixel_benchmark()
+    assert "s1" in fb.available_modalities() and "latlon" in fb.available_modalities()
+    assert not np.all(fb.latlon == 0.0)
+
+    sb = s2o.pixel_benchmark()
+    assert "s1" not in sb.available_modalities(), "S1 must be structurally absent under s2_only"
+    assert "latlon" not in sb.available_modalities(), "coordinates must be dropped under s2_only"
+    assert sb.native.s1.bands == [] and sb.monthly("s1")[0].shape[2] == 0
+    assert np.all(sb.latlon == 0.0)
+    # S2 itself is untouched.
+    assert "s2" in sb.available_modalities() and sb.monthly("s2")[0].shape[2] > 0
+
+
+def test_pastis_s2_only_galileo_dense_masks_s1() -> None:
+    """Galileo's dense path recomputes the S1 availability mask from ``s1_months`` (not
+    ``tile.s1_mask``), so ``s2_only`` must override it to all-MISSING. This replicates the exact
+    mask-construction from ``galileo.encode_dense`` on a synthetic tile (no weights needed) and
+    asserts the S1 token group is MISSING for every timestep under s2_only, while S2 is unaffected."""
+    from evals.benchmarks.pastis import PastisTile, _monthly_patch
+
+    rng = np.random.default_rng(1)
+    t = 24
+    months = np.repeat(np.arange(12), 2).astype(np.int64)
+    tile = PastisTile(
+        s2=rng.random((t, 10, 3, 3)).astype(np.float32),
+        s1=rng.random((t, 3, 3, 3)).astype(np.float32),
+        s2_months=months, s1_months=months,
+        s2_mask=np.ones(t, np.float32), s1_mask=np.ones(t, np.float32),
+        labels=np.zeros((3, 3), np.int64), valid=np.ones((3, 3), bool),
+        fold=1, latlon=(46.0, -1.0), s2_only=True,
+    )
+    # Mirror galileo.encode_dense's mask logic.
+    _s2m, s2_mask = _monthly_patch(tile.s2, tile.s2_months)
+    s1_m, s1_mask = _monthly_patch(tile.s1, tile.s1_months)
+    assert s1_mask.max() == 1.0, "sanity: without the fix, s1_months would mark S1 present"
+    if getattr(tile, "s2_only", False):
+        s1_m = np.zeros_like(s1_m)
+        s1_mask = np.zeros_like(s1_mask)
+    assert s1_mask.max() == 0.0, "S1 must be MISSING for every timestep under s2_only"
+    assert s2_mask.max() == 1.0, "S2 availability must be untouched"

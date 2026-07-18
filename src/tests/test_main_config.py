@@ -5,7 +5,7 @@ import pytest
 
 import main
 from dataio.get_input import Benchmark, ModalitySeries, NativeSeries
-from utils import runstate
+from utils import artifacts, runstate
 
 
 def test_run_stage_set_accepts_embedding_and_probe_stages() -> None:
@@ -108,20 +108,25 @@ def test_s2_only_uses_original_coordinates_for_split_regimes(monkeypatch, tmp_pa
     monkeypatch.setattr(main.cacheutils, "load_cached_embeddings", load_embeddings)
     monkeypatch.setattr(main.regime_base, "iter_splits", iter_splits)
 
-    main._run_tabular_pair(
-        "fake",
-        "raw",
-        [0],
-        None,
-        0,
-        ["spatial_cluster_ood"],
-        ["probing"],
-        ["logistic"],
-        {"source": [1.0], "target": [0]},
-        True,
-        False,
-        {},
-    )
+    # The stub yields no splits, so this pair evaluates nothing and cannot be certified
+    # complete -- which is the correct verdict, not an artifact of the test. The coordinate
+    # invariants under test are established during embedding/regime setup, well before
+    # finalization, so they are still asserted below.
+    with pytest.raises(artifacts.IncompleteRunError):
+        main._run_tabular_pair(
+            "fake",
+            "raw",
+            [0],
+            None,
+            0,
+            ["spatial_cluster_ood"],
+            ["probing"],
+            ["logistic"],
+            {"source": [1.0], "target": [0]},
+            True,
+            False,
+            {},
+        )
 
     assert np.all(seen["embedding_latlon"] == 0.0)
     assert "latlon" not in seen["embedding_modalities"]

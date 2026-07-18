@@ -16,10 +16,19 @@ dependencies = [
     "hurry-filesize",
     "joblib",
     "mmengine",
-    "numpy>=1.26,<2",
+    # NUMERICAL CORE -- pinned exactly, not for currency but for COMPARABILITY. Every probe number
+    # in the canonical output-erm-full-20260711 run was produced under these versions on all five
+    # participating boxes (dewberry was explicitly upgraded off scikit-learn 1.7.2 before it ran).
+    # scikit-learn drives LogisticRegression/MLPClassifier numerics and is NOT part of the run
+    # signature, so a drift here silently changes published results with nothing to catch it.
+    # Loosening any of these means recomputing the canonical probing results under the new
+    # versions -- never just re-resolving. scipy was previously undeclared and arrived transitively
+    # via scikit-learn, which is how the dev machine ended up on 1.15.3 against the boxes' 1.17.1.
+    "numpy==1.26.4",
+    "scipy==1.17.1",
+    "scikit-learn==1.9.0",
     "olmoearth-pretrain",
     "openmapflow",
-    "scikit-learn",
     "thop",
     "timm",
     "torch==2.7.1",
@@ -37,9 +46,7 @@ dev = [
     "pytest",
     "ruff",
 ]
-notebooks = [
-    "ipykernel",
-    "jupyter",
+viz = [
     "matplotlib",
 ]
 
@@ -50,13 +57,14 @@ where = ["src"]
 line-length = 120
 target-version = "py311"
 src = ["src"]
-extend-exclude = [
-    "notebooks",
-]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["src/tests"]
+python_files = ["test_*.py"]
 
 [tool.uv]
 package = true

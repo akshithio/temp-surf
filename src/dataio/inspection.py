@@ -1,4 +1,4 @@
-"""Notebook-facing benchmark inspection helpers."""
+"""Benchmark inspection helpers."""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ def _row(field: str, scope: str, dtype_or_type: str, coverage: str, preview: str
 
 
 def benchmark_metadata_table(bench: Any) -> pd.DataFrame:
-    """Return non-sensor benchmark metadata available to notebooks and evaluators.
+    """Return non-sensor benchmark metadata available to evaluators.
 
     The table intentionally separates split/evaluation/context metadata from the model input
     contract. Some fields, such as coordinates or time, may be consumed by specific models; the

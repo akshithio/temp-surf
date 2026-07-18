@@ -3,8 +3,9 @@ from __future__ import annotations
 import os
 
 import numpy as np
+from joblib import Parallel, delayed
 
-from utils import cacheutils
+from utils import artifacts, cacheutils
 from utils import ioutils as IOU
 from utils import perfutils as perf
 
@@ -32,6 +33,7 @@ def run_signature(
     budget_regimes,
     max_samples,
     max_dense_pixels,
+    write_predictions: bool = True,
 ) -> str:
     src = cacheutils.REPO / "src"
     code = cacheutils._hash_files(
@@ -40,6 +42,7 @@ def run_signature(
         *sorted((src / "evals" / "probes").glob("*.py")),
         src / "evals" / "evals.py",
         src / "evals" / "confounds.py",
+        src / "evals" / "metrics.py",
         src / "evals" / "regimes" / "base.py",
         src / "utils" / "ioutils.py",
         src / "utils" / "cacheutils.py",
@@ -53,14 +56,23 @@ def run_signature(
         f"tag={tag}",
         f"ckpt={cacheutils._checkpoint_fingerprint(model_name, enc_kwargs.get('weights_path'))}",
         f"probes={active_probes}",
+        # Literal: the harness is ERM-only by construction. Kept in the parts list so the
+        # signature string keeps its shape and self-documents that these rows are ERM.
+        "methods=['erm']",
         f"budgets={budget_regimes}",
         f"seeds={list(seeds)}",
         f"regimes={sorted(split_regimes)}",
         f"max_samples={max_samples}",
         f"max_dense_pixels={max_dense_pixels}",
+        f"write_predictions={write_predictions}",
         f"enc={enc}",
         f"code={code}",
     ]
+    # Env knobs that change the numbers but are invisible to `code=` (they are read into
+    # module-level constants at import, so the file bytes never move). Empty for the semantic
+    # default, which keeps every previously-computed signature byte-identical and every existing
+    # results directory resumable -- see artifacts.result_defining_env_parts.
+    parts.extend(artifacts.result_defining_env_parts())
     return cacheutils._hash_str("|".join(map(str, parts)))
 
 
@@ -121,20 +133,29 @@ def prune_partial_budgets(rows, rows_path, preds_path, rerun_keys):
         else:
             tmp_rows.touch()
         os.replace(tmp_rows, rows_path)
-    preds = IOU.read_jsonl(preds_path)
-    kept_preds = [p for p in preds if budget_row_key(p) not in rerun_keys]
-    if len(kept_preds) != len(preds):
-        tmp_preds = cacheutils._atomic_tmp(preds_path)
-        tmp_preds.unlink(missing_ok=True)
-        if kept_preds:
-            IOU.append_jsonl(tmp_preds, kept_preds)
-        else:
-            tmp_preds.touch()
-        os.replace(tmp_preds, preds_path)
+    if preds_path is not None:
+        # Stream-filter (bounded memory): multiclass predictions.jsonl can be tens of GB, so we
+        # must never materialize the whole file here (would OOM on crash-resume).
+        IOU.rewrite_jsonl_dropping(preds_path, lambda p: budget_row_key(p) in rerun_keys)
     return kept
 
 
-def _probe_cell(probe_fn, emb, train, val, test, y, groups, cls, kwargs, uses_target, meta, seed, family="logistic", budgets=None, source_val=None, source_test=None) -> tuple[list[dict], list[dict]]:
+def _probe_cell(
+    probe_fn,
+    emb,
+    train,
+    val,
+    test,
+    y,
+    groups,
+    meta,
+    seed,
+    family="logistic",
+    budgets=None,
+    source_val=None,
+    source_test=None,
+    write_predictions: bool = True,
+) -> tuple[list[dict], list[dict]]:
     x_tr, x_cond_te = emb[train], emb[test]
     y_tr, y_te, g_tr = y[train], y[test], groups[train]
     x_val = emb[val] if len(val) else None
@@ -145,12 +166,6 @@ def _probe_cell(probe_fn, emb, train, val, test, y, groups, cls, kwargs, uses_ta
             extra_evals[label] = (emb[idx], y[idx], np.asarray(idx), np.asarray(groups)[idx])
     mname = meta.get("method", "?")
     identity = {k: meta[k] for k in ("seed", "holdout", "method") if k in meta}
-    transform = None
-    if cls is not None:
-        x_paired = x_cond_te if uses_target else None
-        transform = cls(**kwargs)
-        with perf.measure(f"method.fit/{mname}", identity=identity, n_samples=len(train), n_features=x_tr.shape[1]):
-            transform.fit(x_tr, y_tr, g_tr, x_paired=x_paired)
     rows: list[dict] = []
     perf.set_identity(identity)
     with perf.measure(
@@ -167,10 +182,9 @@ def _probe_cell(probe_fn, emb, train, val, test, y, groups, cls, kwargs, uses_ta
             y_tr,
             y_te,
             seed,
-            transform=transform,
             meta=meta,
             groups_train=g_tr,
-            predictions=preds,
+            predictions=preds if write_predictions else None,
             sample_ids_test=np.asarray(test),
             groups_test=np.asarray(groups)[test],
             x_val=x_val,
@@ -180,10 +194,23 @@ def _probe_cell(probe_fn, emb, train, val, test, y, groups, cls, kwargs, uses_ta
             **({} if budgets is None else {"budgets": budgets}),
         )
     perf.set_identity(None)
-    return rows, preds
+    return rows, preds if write_predictions else []
 
 
-def _probe_cell_target(probe_fn, emb, train, val, test, y, groups, cls, kwargs, uses_target, meta, seed, family="logistic", budgets=None) -> tuple[list[dict], list[dict]]:
+def _probe_cell_target(
+    probe_fn,
+    emb,
+    train,
+    val,
+    test,
+    y,
+    groups,
+    meta,
+    seed,
+    family="logistic",
+    budgets=None,
+    write_predictions: bool = True,
+) -> tuple[list[dict], list[dict]]:
     x_source_tr, x_target_full = emb[train], emb[test]
     y_source_tr, y_target_full = y[train], y[test]
     g_source_tr = groups[train]
@@ -191,14 +218,6 @@ def _probe_cell_target(probe_fn, emb, train, val, test, y, groups, cls, kwargs, 
     y_val = y[val] if len(val) else None
     mname = meta.get("method", "?")
     identity = {k: meta[k] for k in ("seed", "holdout", "method") if k in meta}
-    transform = None
-    if cls is not None:
-        x_paired = x_target_full if uses_target else None
-        transform = cls(**kwargs)
-        with perf.measure(
-            f"method.fit/{mname}", identity=identity, n_samples=len(train), n_features=x_source_tr.shape[1]
-        ):
-            transform.fit(x_source_tr, y_source_tr, g_source_tr, x_paired=x_paired)
     rows: list[dict] = []
     perf.set_identity(identity)
     with perf.measure(
@@ -215,10 +234,9 @@ def _probe_cell_target(probe_fn, emb, train, val, test, y, groups, cls, kwargs, 
             y_source_tr,
             y_target_full,
             seed,
-            transform=transform,
             meta=meta,
             groups_source=g_source_tr,
-            predictions=preds,
+            predictions=preds if write_predictions else None,
             sample_ids_target=np.asarray(test),
             groups_target=np.asarray(groups)[test],
             x_val=x_val,
@@ -227,7 +245,81 @@ def _probe_cell_target(probe_fn, emb, train, val, test, y, groups, cls, kwargs, 
             **({} if budgets is None else {"budgets": budgets}),
         )
     perf.set_identity(None)
-    return rows, preds
+    return rows, preds if write_predictions else []
+
+
+def _run_segmentation_cell(
+    bench_mod,
+    emb_dir,
+    cfg,
+    seed,
+    family,
+    source_budgets,
+    target_budgets,
+    max_dense_pixels,
+    meta,
+) -> list[dict]:
+    from evals import evals as EV
+
+    def sample_dense(folds, sample_seed, patch_ids=None):
+        return cacheutils.load_dense_samples(
+            emb_dir,
+            folds,
+            max_dense_pixels,
+            sample_seed,
+            patch_ids=patch_ids,
+        )
+
+    def stream_dense(folds, patch_ids=None):
+        return cacheutils.iter_dense_tiles(emb_dir, folds, patch_ids=patch_ids)
+
+    x_train, y_train, groups_train, _, _ = cacheutils.load_dense_samples(
+        emb_dir,
+        cfg.train_folds,
+        max_dense_pixels,
+        seed,
+        patch_ids=cfg.train_patches,
+    )
+    x_val, y_val, _, _, _ = sample_dense(cfg.val_folds, seed + 10_000, cfg.val_patches)
+    eval_streams = {
+        "validation": lambda vf=cfg.val_folds, vp=cfg.val_patches: stream_dense(vf, vp),
+        "test": lambda tf=cfg.test_folds, tp=cfg.test_patches: stream_dense(tf, tp),
+    }
+    if cfg.source_val_patches and cfg.source_test_patches:
+        eval_streams["source_validation"] = lambda tf=cfg.train_folds, p=cfg.source_val_patches: stream_dense(tf, p)
+        eval_streams["source_test"] = lambda tf=cfg.train_folds, p=cfg.source_test_patches: stream_dense(tf, p)
+    rows: list[dict] = []
+    EV.run_probes_segmentation(
+        rows,
+        x_train,
+        x_val,
+        y_train,
+        y_val,
+        seed,
+        eval_streams=eval_streams,
+        budgets=source_budgets,
+        meta=meta,
+        groups_train=groups_train,
+        family=family,
+    )
+    if cfg.has_target:
+        target_patch_ids = cfg.test_patches or set(cacheutils.dense_fold_patches(emb_dir, cfg.test_folds))
+        EV.run_probes_segmentation_target(
+            rows,
+            x_train,
+            y_train,
+            seed,
+            target_patches=target_patch_ids,
+            sample_target=lambda pids, sd, tf=cfg.test_folds: sample_dense(tf, sd, pids),
+            stream_target=lambda pids, tf=cfg.test_folds: stream_dense(tf, pids),
+            x_val=x_val,
+            y_val=y_val,
+            budgets=target_budgets,
+            meta=meta,
+            family=family,
+            groups_source=groups_train,
+        )
+    return rows
 
 
 def _run_segmentation_pair(
@@ -242,6 +334,7 @@ def _run_segmentation_pair(
     budget_regimes,
     overwrite_mode,
     strict_mode,
+    write_predictions,
     enc_kwargs,
 ) -> None:
     from evals import compat, evals as EV  # noqa: I001
@@ -255,21 +348,28 @@ def _run_segmentation_pair(
     tag = cacheutils.bench_tag(bench_mod.BENCHMARK, bench_kwargs)
     perf.reset()
     bench = cacheutils.cached_bench(bench_mod.BENCHMARK, tag, **bench_kwargs)
+    # S2-only common-input mode (mirrors _run_tabular_pair): restrict every model to the shared
+    # Sentinel-2 (+ temporal) input so cross-model differences can't be a modality effect. The
+    # __s2only suffix isolates the dense cache and results dir from the native run.
+    s2_only = os.environ.get("RB_S2_ONLY", "").strip().lower() not in ("", "0", "false", "no")
+    suffix = "__s2only" if s2_only else ""
+    emb_tag = tag + suffix
+    bench_for_emb = bench.s2_only() if s2_only else bench
     if gen_embeddings:
         cacheutils.extract_dense_and_cache(
-            bench,
+            bench_for_emb,
             bench_mod.BENCHMARK,
             model_name,
-            tag,
+            emb_tag,
             overwrite=overwrite_mode,
             **enc_kwargs,
         )
     emb_dir = (
-        cacheutils.require_dense_cache(bench, bench_mod.BENCHMARK, model_name, tag, enc_kwargs.get("weights_path"))
+        cacheutils.require_dense_cache(bench_for_emb, bench_mod.BENCHMARK, model_name, emb_tag, enc_kwargs.get("weights_path"))
         if probing
-        else cacheutils.dense_embedding_cache_dir(bench, bench_mod.BENCHMARK, model_name, tag, enc_kwargs.get("weights_path"))
+        else cacheutils.dense_embedding_cache_dir(bench_for_emb, bench_mod.BENCHMARK, model_name, emb_tag, enc_kwargs.get("weights_path"))
     )
-    results_dir = cacheutils.OUTPUT_DIR / "results" / model_name / benchmark_name
+    results_dir = cacheutils.OUTPUT_DIR / "results" / model_name / (benchmark_name + suffix)
     if not probing:
         n_events = perf.write_log(results_dir / "perf.jsonl")
         print(f"  embedding stage complete; perf: {n_events} events logged", flush=True)
@@ -284,6 +384,7 @@ def _run_segmentation_pair(
         budget_regimes=budget_regimes,
         max_samples=max_samples,
         max_dense_pixels=max_dense_pixels,
+        write_predictions=write_predictions,
     )
     check_run_signature(results_dir, signature, overwrite_mode=overwrite_mode)
     rows_path = results_dir / "probe_results.jsonl"
@@ -296,10 +397,20 @@ def _run_segmentation_pair(
             results_dir / "data_quality.json",
             results_dir / "split_manifest.json",
             results_dir / "run_signature.txt",
+            results_dir / artifacts.ENVIRONMENT_FILE,
+            results_dir / artifacts.RUN_COMPLETE_FILE,
         ):
             if path.exists():
                 path.unlink()
+    # ORDER MATTERS -- see main.py: every check that can REFUSE this resume runs before anything
+    # is mutated, so a refused resume leaves an existing valid completion marker untouched.
+    artifacts.write_environment(results_dir, overwrite_mode=overwrite_mode)
     publish_run_signature(results_dir, signature)
+    # See main.py: a resume is about to make this directory incomplete again.
+    artifacts.invalidate_run_complete(results_dir)
+    # Attribute regime problems / skipped cells to THIS pair (both accumulators are shard-global).
+    regime_problems_before = len(regime_base.REGIME_PROBLEMS)
+    cell_failures_before = len(perf.CELL_FAILURES)
     if data_quality := getattr(bench, "data_quality", None):
         IOU.write_json(results_dir / "data_quality.json", data_quality)
     rows = IOU.read_jsonl(rows_path)
@@ -379,90 +490,57 @@ def _run_segmentation_pair(
             for regime, cfg in fold_configs_by_seed[seed]
         ],
     )
+    # Every cell this pair is supposed to produce, from the config and the REALIZED fold configs.
+    # `_expected` already encodes the per-family scope rules (source budgets x {validation,test}
+    # plus source diagnostics, and the target sweep on non-random_id regimes); reuse it so the
+    # completeness check and the resume logic cannot disagree about what a complete pair is.
+    expected_keys: set[tuple] = set()
+    jobs = []
+    # ERM only -- see main.py. The literal keeps method="erm" on every dense row.
+    method_name = EV.ERM_METHOD
+    method_meta = EV.erm_metadata()
     for seed in seeds:
-        for method_name, (cls, kwargs) in EV.build_methods(bench_mod.LABEL_KIND, seed).items():
-            for split_regime, cfg in fold_configs_by_seed[seed]:
-                holdout = cfg.label
-                families_to_run = [
-                    f for f in active_probes
-                    if (seed, method_name, split_regime, holdout, f) not in done_families
-                ]
-                if not families_to_run:
-                    continue
-                x_train, y_train, groups_train, _, _ = cacheutils.load_dense_samples(
-                    emb_dir, cfg.train_folds, max_dense_pixels, seed, patch_ids=cfg.train_patches
-                )
-                x_val, y_val, _, _, _ = cacheutils.load_dense_samples(
-                    emb_dir, cfg.val_folds, max_dense_pixels, seed + 10_000, patch_ids=cfg.val_patches
-                )
-                transform = None
-                if cls is not None:
-                    transform = cls(**kwargs)
-                    transform.fit(x_train, y_train, groups_train, x_paired=None)
-                for family in families_to_run:
-                    cell_rows: list[dict] = []
-                    seg_meta = {
-                        "model": model_name,
-                        "benchmark": bench_mod.BENCHMARK,
-                        "method": method_name,
-                        "split_regime": split_regime,
-                        "domain_basis": cfg.group_kind,
-                        "holdout": holdout,
-                        "probe_family": family,
-                    }
-                    eval_streams = {
-                        "validation": lambda vf=cfg.val_folds, vp=cfg.val_patches: cacheutils.iter_dense_tiles(
-                            emb_dir, vf, patch_ids=vp
-                        ),
-                        "test": lambda tf=cfg.test_folds, tp=cfg.test_patches: cacheutils.iter_dense_tiles(
-                            emb_dir, tf, patch_ids=tp
-                        ),
-                    }
-                    if cfg.source_val_patches and cfg.source_test_patches:
-                        eval_streams["source_validation"] = lambda tf=cfg.train_folds, p=cfg.source_val_patches: cacheutils.iter_dense_tiles(
-                            emb_dir, tf, patch_ids=p
-                        )
-                        eval_streams["source_test"] = lambda tf=cfg.train_folds, p=cfg.source_test_patches: cacheutils.iter_dense_tiles(
-                            emb_dir, tf, patch_ids=p
-                        )
-                    EV.run_probes_segmentation(
-                        cell_rows,
-                        x_train,
-                        x_val,
-                        y_train,
-                        y_val,
+        for split_regime, cfg in fold_configs_by_seed[seed]:
+            holdout = cfg.label
+            for f in active_probes:
+                for bt, lb, es in _expected((seed, method_name, split_regime, holdout, f)):
+                    # artifacts.CELL_KEY_FIELDS order
+                    expected_keys.add((seed, split_regime, holdout, method_name, f, bt, lb, es))
+            families_to_run = [
+                f for f in active_probes
+                if (seed, method_name, split_regime, holdout, f) not in done_families
+            ]
+            for family in families_to_run:
+                seg_meta = {
+                    "model": model_name,
+                    "benchmark": bench_mod.BENCHMARK,
+                    "method": method_name,
+                    **method_meta,
+                    "split_regime": split_regime,
+                    "domain_basis": cfg.group_kind,
+                    "holdout": holdout,
+                    "probe_family": family,
+                }
+                jobs.append(
+                    delayed(_run_segmentation_cell)(
+                        bench_mod,
+                        emb_dir,
+                        cfg,
                         seed,
-                        eval_streams=eval_streams,
-                        transform=transform,
-                        budgets=source_budgets,
-                        meta=seg_meta,
-                        family=family,
+                        family,
+                        source_budgets,
+                        target_budgets,
+                        max_dense_pixels,
+                        seg_meta,
                     )
-                    if cfg.has_target:
-                        target_patch_ids = cfg.test_patches or set(
-                            cacheutils.dense_fold_patches(emb_dir, cfg.test_folds)
-                        )
-                        EV.run_probes_segmentation_target(
-                            cell_rows,
-                            x_train,
-                            y_train,
-                            seed,
-                            target_patches=target_patch_ids,
-                            sample_target=lambda pids, sd, tf=cfg.test_folds: cacheutils.load_dense_samples(
-                                emb_dir, tf, max_dense_pixels, sd, patch_ids=pids
-                            ),
-                            stream_target=lambda pids, tf=cfg.test_folds: cacheutils.iter_dense_tiles(
-                                emb_dir, tf, patch_ids=pids
-                            ),
-                            x_val=x_val,
-                            y_val=y_val,
-                            transform=transform,
-                            budgets=target_budgets,
-                            meta=seg_meta,
-                            family=family,
-                        )
-                    IOU.append_jsonl(rows_path, cell_rows)
-                    rows.extend(cell_rows)
+                )
+    if jobs:
+        n_features_guess = int(os.environ.get("PASTIS_PROBE_FEATURE_GUESS", "4096"))
+        n_jobs = perf._effective_n_jobs(job_bytes=max_dense_pixels * n_features_guess * 4)
+        print(f"  segmentation probe jobs={len(jobs)} n_jobs={n_jobs}", flush=True)
+        for cell_rows in Parallel(n_jobs=n_jobs, return_as="generator", prefer="threads")(jobs):
+            IOU.append_jsonl(rows_path, cell_rows)
+            rows.extend(cell_rows)
     IOU.write_csv(results_dir / "probe_results.csv", rows)
     summary = IOU.summarize_rows(
         rows,
@@ -490,10 +568,25 @@ def _run_segmentation_pair(
     IOU.write_csv(results_dir / "deltas.csv", deltas)
     declared, available = set(compat.input_modalities(model_name)), {"s2", "s1", "time"}
     IOU.write_json(results_dir / "model_inputs.json", {
-        "model": model_name, "benchmark": benchmark_name, "s2_only_mode": False,
+        "model": model_name, "benchmark": benchmark_name, "s2_only_mode": s2_only,
         "compatibility_rank": compat.rank(benchmark_name, model_name),
         "adaptation_severity": compat.adaptation_severity(benchmark_name, model_name),
         "declared_modalities": sorted(declared), "available_modalities": sorted(available),
         "effective_modalities": sorted(declared & available),
     })
     perf.write_log(results_dir / "perf.jsonl")
+
+    # LAST write of the dense pair -- deltas.csv above is the final derived artifact. The dense
+    # path finalizes separately from the tabular one, so it needs its own marker or PASTIS would
+    # be the only benchmark whose directories can never be validated.
+    artifacts.write_run_complete(
+        results_dir,
+        signature=signature,
+        expected_keys=expected_keys,
+        # Absent file -> [] so write_run_complete reports it as a missing REQUIRED
+        # artifact, rather than the caller dying here on FileNotFoundError.
+        rows=artifacts.parse_jsonl_rows(rows_path) if rows_path.exists() else [],
+        regime_problems=regime_base.REGIME_PROBLEMS[regime_problems_before:],
+        cell_failures=perf.CELL_FAILURES[cell_failures_before:],
+        extra={"model": model_name, "benchmark": benchmark_name, "dense": True},
+    )

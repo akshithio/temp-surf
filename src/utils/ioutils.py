@@ -80,6 +80,77 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def rewrite_jsonl_dropping(path: Path, should_drop: Any) -> int:
+    """Stream-filter a JSONL file in place, dropping rows where ``should_drop(parsed_row)`` is
+    True. Bounded memory (one line at a time) so it is safe on the multi-GB multiclass
+    ``predictions.jsonl`` that would OOM a whole-file ``read_jsonl``. Returns the number dropped;
+    only rewrites the file if at least one row was dropped."""
+    path = Path(path)
+    if not path.exists():
+        return 0
+    tmp = path.parent / (path.name + ".prune.tmp")
+    tmp.unlink(missing_ok=True)
+    dropped = 0
+    with path.open("r", encoding="utf-8") as fin, tmp.open("w", encoding="utf-8") as fout:
+        for line in fin:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                row = json.loads(s)
+            except json.JSONDecodeError:
+                continue  # drop corrupt / unterminated trailing line
+            if should_drop(row):
+                dropped += 1
+                continue
+            fout.write(line if line.endswith("\n") else line + "\n")
+    if dropped:
+        os.replace(tmp, path)
+    else:
+        tmp.unlink(missing_ok=True)
+    return dropped
+
+
+def repair_jsonl_tail(path: Path) -> int:
+    """Truncate an unterminated final line, returning the bytes removed.
+
+    ``read_jsonl`` drops a torn tail in memory but leaves it on disk. That is a latent brick: the
+    next append glues its first row onto the torn bytes, turning a droppable trailing fragment
+    into a corrupt INTERIOR row, and every subsequent ``read_jsonl`` then raises for good --
+    recoverable only by discarding the whole directory. Repairing before the append keeps the
+    damage confined to the row that was already lost.
+
+    Scans backwards for the last newline rather than reading the file, which routinely reaches
+    ~20 GB for predictions.jsonl.
+    """
+    path = Path(path)
+    if not path.exists():
+        return 0
+    size = path.stat().st_size
+    if size == 0:
+        return 0
+    with path.open("rb+") as f:
+        f.seek(size - 1)
+        if f.read(1) == b"\n":
+            return 0  # cleanly terminated
+        chunk = 1 << 16
+        pos, last_newline = size, -1
+        while pos > 0:
+            start = max(0, pos - chunk)
+            f.seek(start)
+            buf = f.read(pos - start)
+            idx = buf.rfind(b"\n")
+            if idx != -1:
+                last_newline = start + idx
+                break
+            pos = start
+        keep = last_newline + 1  # 0 when the file is one unterminated row
+        f.truncate(keep)
+        f.flush()
+        os.fsync(f.fileno())
+    return size - keep
+
+
 def append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     """Append rows to a JSON-lines log (creates parents). Used for crash-resumable results.
 
@@ -87,11 +158,20 @@ def append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     crash cannot persist a partial subset of one caller's rows (which would make a resumed run
     treat an interrupted sweep as finished). Pass one logical unit (one cell/family) per call
     so that batch is the atomic resume granularity.
+
+    A torn tail left by a previous hard crash is truncated first -- see ``repair_jsonl_tail``.
     """
     if not rows:
         return
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    removed = repair_jsonl_tail(path)
+    if removed:
+        print(
+            f"   !! {path}: truncated {removed} bytes of an unterminated final row before "
+            f"appending (a previous run was killed mid-write)",
+            flush=True,
+        )
     payload = "".join(json.dumps(row, default=_json_default) + "\n" for row in rows)
     with path.open("a", encoding="utf-8") as f:
         f.write(payload)

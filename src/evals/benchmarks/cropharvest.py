@@ -31,14 +31,25 @@ BENCHMARK = "cropharvest"
 LABEL_KIND = "binary"
 HOLDOUTS = ["kenya", "togo", "ethiopia", "lem-brazil", "rwanda"]
 OFFICIAL_HOLDOUTS = ["kenya", "lem-brazil", "togo"]
-GEOGRAPHIC_HOLDOUTS = HOLDOUTS
+#: Basis for the retired ``spatial_blocks`` strategy only -- see spatial_block_domains().
 GEOGRAPHIC_BLOCK_DEGREES = 2.0
 GEOGRAPHIC_SPLIT = {
-    "strategy": "spatial_blocks",
-    "label": "spatial_block_2deg_purge50km",
-    "val_fraction": 0.10,
-    "test_fraction": 0.20,
+    # Leave-one-domain-out over the FULL canonical domain census (18 domains), not a curated
+    # subset: `HOLDOUTS` above covers only 10,405 of 67,693 samples (15%) and omits the five
+    # largest domains entirely, so it cannot support a claim about geographic robustness.
+    "strategy": "leave_one_domain_out",
+    "label": "lodo_canonical_purge50km",
     "purge_km": 50.0,
+    # Validity is declared HERE, before any model runs (see geographic_ood.domain_census):
+    #   target -- any domain with >= min_target_n samples. One-class domains are REAL deployment
+    #     regions (central-asia, mali, mali-non-crop, tanzania, uganda, zimbabwe) and are kept;
+    #     they are excluded only from metrics that mathematically require both classes, which
+    #     score_binary already handles by returning auc=nan while accuracy / balanced_accuracy /
+    #     calibration and the test_pos_rate class-conditional diagnostic stay well defined.
+    #   validation -- must carry BOTH classes, because the binary probe's decision threshold is
+    #     calibrated on it; a one-class validation region cannot select a threshold.
+    "min_target_n": 10,
+    "allow_one_class_target": True,
 }
 SPATIAL_CLUSTER_SPLIT = {
     "label": "spatial_cluster_purge50km",
@@ -108,7 +119,18 @@ def _ch_geo_group(dataset: str) -> str:
     return name
 
 
-def geographic_domains(bench) -> np.ndarray:
+def spatial_block_domains(bench) -> np.ndarray:
+    """The PRE-LODO domain basis: 2-degree lat/lon blocks.
+
+    Retained solely so the ``spatial_block_2deg_purge50km`` artifacts stay reproducible: 20
+    result files across five runs were produced on this basis, four of them in the canonical
+    ``output-erm-full-20260711`` tree the paper currently cites. The ``spatial_blocks`` strategy
+    is meaningless on any other basis -- it hash-ranks domains to assemble val/test partitions
+    by sample fraction, which only reconstructs the historical split when the domains are these
+    blocks. ``geographic_ood.assign_domains`` therefore selects the basis FROM THE STRATEGY;
+    never let a ``spatial_blocks`` split read canonical domains, or it will emit the historical
+    label over a different partition.
+    """
     latlon = np.asarray(bench.latlon, dtype=float)
     out = np.full(len(latlon), "unknown", dtype=object)
     if latlon.ndim != 2 or latlon.shape[1] != 2:
@@ -119,6 +141,20 @@ def geographic_domains(bench) -> np.ndarray:
     lon_bin = np.floor((latlon[valid, 1] + 180.0) / block).astype(int)
     out[valid] = [f"block_{lat}_{lon}" for lat, lon in zip(lat_bin, lon_bin, strict=True)]
     return out
+
+
+def geographic_domains(bench) -> np.ndarray:
+    """Canonical CropHarvest domains: the source collection each sample was gathered in.
+
+    This is the universe ``geographic_ood`` leaves out one at a time. It is a PROVENANCE label,
+    not a polygon, and two of the 18 domains are globally distributed collections rather than
+    regions: ``geowiki-landcover-2017`` spans ~35,000 km (24,761 samples, 37% of the benchmark)
+    and ``croplands`` ~30,000 km. Their points are interleaved with every other domain, so on the
+    other folds they contribute samples that sit inside the held-out target region. The 50 km
+    purge in GEOGRAPHIC_SPLIT is what removes those, and is therefore load-bearing for the
+    holdout's meaning rather than cosmetic -- it bounds, but does not eliminate, that leakage.
+    """
+    return np.asarray(bench.groups, dtype=object)
 
 
 def load_benchmark(

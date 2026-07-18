@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +16,8 @@ from dataio.get_input import (
     NativeSeries,
     _synthetic_month_doy,
 )
-from evals.confounds import score_segmentation_streamed
-from evals.probes import FeatureTransform, _apply, fit_probe_multiclass
+from evals.metrics import score_segmentation_streamed
+from evals.probes import fit_probe_multiclass
 from utils import perfutils as perf
 
 BENCHMARK = "pastis"
@@ -74,6 +74,7 @@ class PastisTile:
     valid: np.ndarray
     fold: int
     latlon: tuple[float, float]
+    s2_only: bool = False
 
     @property
     def height(self) -> int:
@@ -84,7 +85,7 @@ class PastisTile:
         return int(self.labels.shape[1])
 
     def pixel_benchmark(self) -> Benchmark:
-        return _pastis_pixel_benchmark(
+        bench = _pastis_pixel_benchmark(
             self.s2,
             self.s1,
             self.s2_months,
@@ -94,6 +95,10 @@ class PastisTile:
             self.fold,
             self.latlon,
         )
+        # S2-only view for pixel models (Presto, TESSERA, raw): route through the tabular
+        # ``Benchmark.s2_only`` contract, which makes S1 a *structurally absent* modality and zeroes
+        # coordinates --- not a zero-valued "present" S1. Matches EuroCropsML/BreizhCrops exactly.
+        return bench.s2_only() if self.s2_only else bench
 
 
 @dataclass(frozen=True)
@@ -106,6 +111,17 @@ class PastisBenchmark:
     tile_size: int = 64
     ignore_index: int = IGNORE_INDEX
     data_quality: dict[str, Any] = field(default_factory=dict)
+    s2_only_mode: bool = False
+
+    def s2_only(self) -> PastisBenchmark:
+        """Common-input S2-only view: make Sentinel-1 a *structurally absent* modality (not a
+        zero-valued "present" one) on every tile, and zero coordinates, so cross-model differences
+        can't be attributed to S1/coordinate access. Enforced per model, not by munging data:
+        dense S1+S2 fusers (Galileo) mask the S1 group ``MISSING`` for every timestep, and pixel
+        models (Presto/TESSERA/raw) route ``pixel_benchmark`` through :meth:`Benchmark.s2_only`.
+        Dense S2-only encoders (OlmoEarth, AgriFM) already ignore S1, so this is a no-op for them.
+        The caller isolates its cache/results via a ``__s2only`` tag."""
+        return replace(self, s2_only_mode=True)
 
     @property
     def n_samples(self) -> int:
@@ -126,37 +142,54 @@ class PastisBenchmark:
         tiles_per_patch = (128 // self.tile_size) ** 2
         return np.repeat([patch.latlon for patch in self.patches], tiles_per_patch, axis=0).astype(np.float32)
 
-    def iter_tiles(self, folds: set[int] | None = None):
+    def iter_tiles(self, folds: set[int] | None = None, cache_root: Path | None = None, overwrite: bool = False):
         """Yield native-cadence tiles."""
         for patch in self.patches:
             if folds is not None and patch.fold not in folds:
                 continue
+            tile_coords = [
+                (row, col)
+                for row in range(0, 128, self.tile_size)
+                for col in range(0, 128, self.tile_size)
+            ]
+            if cache_root is not None and not overwrite:
+                fold_dir = cache_root / f"fold_{patch.fold}"
+                tile_coords = [
+                    (row, col)
+                    for row, col in tile_coords
+                    if not (
+                        (fold_dir / f"{patch.patch_id}_{row // self.tile_size}_{col // self.tile_size}.npy").exists()
+                        and (fold_dir / f"{patch.patch_id}_{row // self.tile_size}_{col // self.tile_size}.labels.npy").exists()
+                    )
+                ]
+                if not tile_coords:
+                    continue
             s2 = np.load(patch.s2_path, mmap_mode="r")  # (T_s2, 10, 128, 128) native cadence
             s1 = np.load(patch.s1_path, mmap_mode="r")  # (T_s1, 3, 128, 128)
             target = np.load(patch.target_path, mmap_mode="r")[0]
             s2_ones = np.ones(s2.shape[0], dtype=np.float32)
             s1_ones = np.ones(s1.shape[0], dtype=np.float32)
 
-            for row in range(0, target.shape[0], self.tile_size):
-                for col in range(0, target.shape[1], self.tile_size):
-                    ys = slice(row, row + self.tile_size)
-                    xs = slice(col, col + self.tile_size)
-                    labels = np.asarray(target[ys, xs], dtype=np.int64)
-                    valid = labels != self.ignore_index
-                    tile_id = f"{patch.patch_id}_{row // self.tile_size}_{col // self.tile_size}"
-                    tile = PastisTile(
-                        s2=np.asarray(s2[:, :, ys, xs], dtype=np.float32),
-                        s1=np.asarray(s1[:, :, ys, xs], dtype=np.float32),
-                        s2_months=patch.s2_months,
-                        s1_months=patch.s1_months,
-                        s2_mask=s2_ones,
-                        s1_mask=s1_ones,
-                        labels=labels,
-                        valid=valid,
-                        fold=patch.fold,
-                        latlon=patch.latlon,
-                    )
-                    yield tile_id, patch.fold, tile, labels[valid]
+            for row, col in tile_coords:
+                ys = slice(row, row + self.tile_size)
+                xs = slice(col, col + self.tile_size)
+                labels = np.asarray(target[ys, xs], dtype=np.int64)
+                valid = labels != self.ignore_index
+                tile_id = f"{patch.patch_id}_{row // self.tile_size}_{col // self.tile_size}"
+                tile = PastisTile(
+                    s2=np.asarray(s2[:, :, ys, xs], dtype=np.float32),
+                    s1=np.asarray(s1[:, :, ys, xs], dtype=np.float32),
+                    s2_months=patch.s2_months,
+                    s1_months=patch.s1_months,
+                    s2_mask=s2_ones,
+                    s1_mask=s1_ones,
+                    labels=labels,
+                    valid=valid,
+                    fold=patch.fold,
+                    latlon=patch.latlon,
+                    s2_only=self.s2_only_mode,
+                )
+                yield tile_id, patch.fold, tile, labels[valid]
 
 
 # --------------------------------------------------------------------------- #
@@ -350,22 +383,26 @@ def run_probes_segmentation(
     seed: int,
     *,
     eval_streams: dict[str, Any],
-    transform: FeatureTransform | None = None,
     budgets: list[float],
     meta: dict[str, Any] | None = None,
+    groups_train: np.ndarray | None = None,
     family: str = "logistic",
 ) -> None:
-    """PASTIS source-fraction sweep, scored on every valid pixel in each evaluation fold."""
     _validate_source_budgets(budgets)
     meta = dict(meta or {})
-    x_train = _apply(transform, x_train)
-    x_val = _apply(transform, x_val)
     eval_classes = np.arange(19, dtype=np.int64)
     for budget in budgets:
         sub_seed = perf._budget_seed(seed, budget)
-        sub = perf.subset_indices(y_train, float(budget), sub_seed, stratify=True)
+        sub = perf.subset_indices(y_train, budget, sub_seed, stratify=True)
+        # ERM: the dense probe fits the cached features as they are.
+        x_train_t, x_val_t = x_train, x_val
         clf, probe_meta = fit_probe_multiclass(
-            x_train[sub], y_train[sub], sub_seed, x_val=x_val, y_val=y_val, family=family
+            x_train_t[sub],
+            y_train[sub],
+            sub_seed,
+            x_val=x_val_t,
+            y_val=y_val,
+            family=family,
         )
         for split_name, tiles in eval_streams.items():
             rows.append({
@@ -376,7 +413,7 @@ def run_probes_segmentation(
                 "seed": seed,
                 "n_train_sub": int(len(sub)),
                 **probe_meta,
-                **score_segmentation_streamed(clf, tiles(), eval_classes, transform=transform),
+                **score_segmentation_streamed(clf, tiles(), eval_classes),
             })
 
 
@@ -391,15 +428,13 @@ def run_probes_segmentation_target(
     stream_target: Any,
     x_val: np.ndarray,
     y_val: np.ndarray,
-    transform: FeatureTransform | None = None,
     budgets: list[int | float],
     meta: dict[str, Any] | None = None,
     family: str = "logistic",
+    groups_source: np.ndarray | None = None,
     target_id_budget: float | int = -1,
 ) -> None:
-    """Patch-level dense few-shot / oracle curve with a full-target zero-shot anchor."""
     meta = dict(meta or {})
-    x_source = _apply(transform, x_source)
     eval_classes = np.arange(19, dtype=np.int64)
     patches = np.array(sorted({int(p) for p in target_patches}))
     all_patches = set(patches.tolist())
@@ -414,23 +449,33 @@ def run_probes_segmentation_target(
         if budget != 0 and (degenerate or not pool_order):
             continue
         sub_seed = perf._budget_seed(seed, budget)
-        cal_x, cal_y, tune_internal = x_val, y_val, False
+        cal_x_raw, cal_y, tune_internal = x_val, y_val, False
         if budget == 0:
-            x_tr, y_tr = x_source, y_source
+            x_tr_raw, y_tr = x_source, y_source
             n_patch_train = 0
         elif budget == target_id_budget:
-            xo, yo = sample_target(set(pool_order), sub_seed)[:2]
-            x_tr, y_tr = _apply(transform, xo), yo
-            cal_x, cal_y, tune_internal = None, None, True
+            sampled = sample_target(set(pool_order), sub_seed)
+            x_tr_raw, y_tr = sampled[:2]
+            cal_x_raw, cal_y, tune_internal = None, None, True
             n_patch_train = len(pool_order)
         else:
             k = min(len(pool_order), perf._target_budget_count(budget, len(pool_order)))
-            xf, yf = sample_target(set(pool_order[:k]), sub_seed)[:2]
-            x_tr = np.concatenate([x_source, _apply(transform, xf)])
+            sampled = sample_target(set(pool_order[:k]), sub_seed)
+            xf, yf = sampled[:2]
+            x_tr_raw = np.concatenate([x_source, xf])
             y_tr = np.concatenate([y_source, yf])
             n_patch_train = k
+
+        x_tr = x_tr_raw
+        cal_x = cal_x_raw if cal_x_raw is not None and len(cal_x_raw) else None
         clf, probe_meta = fit_probe_multiclass(
-            x_tr, y_tr, sub_seed, x_val=cal_x, y_val=cal_y, family=family, tune_internal=tune_internal
+            x_tr,
+            y_tr,
+            sub_seed,
+            x_val=cal_x,
+            y_val=cal_y,
+            family=family,
+            tune_internal=tune_internal,
         )
         rows.append({
             **meta,
@@ -443,7 +488,7 @@ def run_probes_segmentation_target(
             "seed": seed,
             "n_train_sub": int(len(y_tr)),
             **probe_meta,
-            **score_segmentation_streamed(clf, stream_target(test_patches), eval_classes, transform=transform),
+            **score_segmentation_streamed(clf, stream_target(test_patches), eval_classes),
         })
         if budget == 0:
             rows.append({
@@ -457,5 +502,5 @@ def run_probes_segmentation_target(
                 "seed": seed,
                 "n_train_sub": int(len(y_tr)),
                 **probe_meta,
-                **score_segmentation_streamed(clf, stream_target(all_patches), eval_classes, transform=transform),
+                **score_segmentation_streamed(clf, stream_target(all_patches), eval_classes),
             })
