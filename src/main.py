@@ -105,6 +105,21 @@ if _rb_regimes:
         )
     SPLIT_REGIMES = _requested_regimes
 
+# --- Run-stage restriction. Unset = RUN_STAGES above (gen_embeddings + probing,
+# the normal case). Set to run embeddings-only (populate the content-addressed
+# cache on a GPU box and defer probing) or probing-only (re-probe an existing
+# cache on CPU) without editing this file. Validated against VALID_RUN_STAGES. ---
+_rb_stages = os.environ.get("RB_RUN_STAGES", "").strip()
+if _rb_stages:
+    _requested_stages = [s.strip() for s in _rb_stages.split(",") if s.strip()]
+    _unknown_stages = [s for s in _requested_stages if s not in runstate.VALID_RUN_STAGES]
+    if _unknown_stages:
+        raise ValueError(
+            f"RB_RUN_STAGES has unknown stage(s) {_unknown_stages}; "
+            f"valid: {sorted(runstate.VALID_RUN_STAGES)}"
+        )
+    RUN_STAGES = _requested_stages
+
 os.environ["STRICT_MODE"] = "1" if STRICT_MODE else ""
 
 
