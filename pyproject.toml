@@ -29,6 +29,9 @@ dependencies = [
     "scikit-learn==1.9.0",
     "olmoearth-pretrain",
     "openmapflow",
+    # pyproj is imported DIRECTLY by evals.benchmarks.pastis to transform PASTIS EPSG:2154
+    # (Lambert-93) patch coordinates to EPSG:4326; declared here rather than relied on transitively.
+    "pyproj",
     "thop",
     "timm",
     "torch==2.7.1",

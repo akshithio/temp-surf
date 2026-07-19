@@ -1,80 +1,84 @@
-"""In-distribution random split regime."""
+"""In-distribution random split regime (schema v2).
+
+The within-population reference: no target region, so the whole eligible population is split into the
+exact-size source partitions (source_train/source_val/source_test = 80/10/10) with deterministic
+constrained stratification and NO fallback. Target partitions are empty; ``has_target`` and
+``supports_target_labels`` are both False.
+"""
 
 from __future__ import annotations
 
-import numpy as np
-from sklearn.model_selection import train_test_split
+from collections.abc import Iterator
 
-from evals.regimes.base import DenseSplit, Split, emit_split_audit_event, geography_domains
-from utils import cacheutils
+import numpy as np
+
+from evals import partition, split_spec
+from evals.regimes.base import DenseSourceTargetSplit, SourceTargetSplit
 
 NAME = "random_id"
 GROUP_KIND = "geography"
 HAS_TARGET = False  # train and test share regions -> no target region to sweep
-assign_domains = geography_domains
+SUPPORTS_TARGET_LABELS = False  # source-only: no target region, so no target-label routes
 
 
-def make_splits(y: np.ndarray, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """80/10/10 stratified train/val/test on the full pool."""
-    idx = np.arange(len(y))
-    try:
-        train_val, test = train_test_split(idx, test_size=0.10, random_state=seed, stratify=y)
-    except ValueError:
-        # Behavior-preserving: the existing silent unstratified fallback. We ONLY record that it
-        # happened (membership is unchanged); we do not fix or suppress it in this phase.
-        emit_split_audit_event("stratification_fallback", regime="random_id", stage="trainval_vs_test")
-        train_val, test = train_test_split(idx, test_size=0.10, random_state=seed, stratify=None)
-    try:
-        train, val = train_test_split(
-            train_val,
-            test_size=0.1111111111,
-            random_state=seed + 1,
-            stratify=y[train_val],
-        )
-    except ValueError:
-        emit_split_audit_event("stratification_fallback", regime="random_id", stage="train_vs_val")
-        train, val = train_test_split(
-            train_val,
-            test_size=0.1111111111,
-            random_state=seed + 1,
-            stratify=None,
-        )
-    return np.sort(train), np.sort(val), np.sort(test)
+def _source_sizes(n: int) -> list[tuple[str, int]]:
+    train, val, test = split_spec.source_partition_sizes(n)
+    return [("source_train", train), ("source_val", val), ("source_test", test)]
 
 
-def iter_splits(y, groups, *, seed, holdouts=None, n_folds=None, **_):
-    """Yield one in-distribution split."""
-    del groups, holdouts, n_folds
-    train, val, test = make_splits(y, seed)
-    yield Split("random_id", train, test, val)
-
-
-def make_patch_splits(patches: np.ndarray, seed: int) -> tuple[set[int], set[int], set[int]]:
-    train_val, test = train_test_split(patches, test_size=0.10, random_state=seed)
-    train, val = train_test_split(train_val, test_size=0.1111111111, random_state=seed + 1)
-    return set(map(int, train)), set(map(int, val)), set(map(int, test))
-
-
-def iter_dense_splits(bench_mod, *, emb_dir, seed, bench=None):
-    all_folds = sorted(set(bench_mod.TRAIN_FOLDS) | set(bench_mod.VAL_FOLDS) | set(bench_mod.TEST_FOLDS))
-    # Cache-free seam (split preprocessing): with emb_dir=None the patch universe comes from the
-    # benchmark descriptor instead of the embedding cache. Runtime always passes a real emb_dir, so
-    # its behavior is unchanged.
-    if emb_dir is None:
-        if bench is None:
-            raise ValueError("cache-free dense split needs the benchmark object (bench=...)")
-        patches = np.asarray(bench.patch_ids(set(all_folds)), dtype=np.int64)
-    else:
-        patches = np.asarray(cacheutils.dense_fold_patches(emb_dir, set(all_folds)), dtype=np.int64)
-    train, val, test = make_patch_splits(patches, seed)
-    yield DenseSplit(
-        "random_patch",
-        set(all_folds),
-        set(all_folds),
-        set(all_folds),
-        train_patches=train,
-        val_patches=val,
-        test_patches=test,
-        has_target=HAS_TARGET,
-        group_kind=GROUP_KIND,
+# --------------------------------------------------------------------------- #
+# Tabular
+# --------------------------------------------------------------------------- #
+def iter_source_target_splits(bench, bench_mod, seed: int) -> Iterator[SourceTargetSplit]:
+    """One in-distribution split: the whole population is the source, partitioned exactly 80/10/10 by
+    class and region (constrained stratification, no fallback). No target partitions."""
+    y, groups = bench_mod.make_targets(bench)
+    assign = partition.partition_source(
+        [str(c) for c in np.asarray(y).tolist()],
+        [str(r) for r in np.asarray(groups).tolist()],
+        _source_sizes(len(y)),
+        int(seed),
     )
+    yield SourceTargetSplit(
+        label="random_id",
+        source_train=assign["source_train"], source_val=assign["source_val"], source_test=assign["source_test"],
+        has_target=False, supports_target_labels=False, group_kind=GROUP_KIND,
+    )
+
+
+def sample_domains(bench, bench_mod) -> np.ndarray:
+    """Per-sample domain basis (the native region groups) recorded for worst-group scoring."""
+    _y, groups = bench_mod.make_targets(bench)
+    return np.asarray(groups, dtype=object)
+
+
+# --------------------------------------------------------------------------- #
+# Dense (PASTIS) -- patch-level iterative multilabel over class-presence vectors
+# --------------------------------------------------------------------------- #
+def iter_dense_source_target_splits(bench, bench_mod, seed: int) -> Iterator[DenseSourceTargetSplit]:
+    del bench_mod
+    patches = [int(p) for p in bench.patch_ids(None)]
+    class_sets = bench.patch_class_sets(patches)
+    label_sets = [sorted(class_sets.get(p, set())) for p in patches]
+    assign = partition.multilabel_assign(label_sets, _source_sizes(len(patches)), int(seed))
+
+    def pset(name: str) -> frozenset[int]:
+        return frozenset(patches[i] for i in assign[name].tolist())
+
+    yield DenseSourceTargetSplit(
+        label="random_patch",
+        source_train_patches=pset("source_train"), source_val_patches=pset("source_val"),
+        source_test_patches=pset("source_test"),
+        has_target=False, supports_target_labels=False, group_kind=GROUP_KIND,
+    )
+
+
+def patch_domains(bench, bench_mod) -> dict[int, str]:
+    """Per-patch domain basis: the patch's canonical Sentinel TILE (group_kind='geography').
+
+    The tile is PASTIS's geographic unit -- the same basis geographic_ood holds out -- so worst-group
+    scoring and the recorded per-patch domains are by tile even though random_id never sweeps one out.
+    It is NOT the published fold (a cache-layout / cross-validation artifact that spans all tiles).
+    """
+    del bench_mod
+    return {int(pid): str(tile) for pid, tile in bench.patch_tiles.items()}

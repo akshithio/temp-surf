@@ -8,8 +8,6 @@ import pytest
 from evals import evals as EV
 from evals import probes
 from evals.benchmarks import breizhcrops, cropharvest, eurocropsml, pastis
-from evals.regimes import base as regime_base
-from evals.regimes import spatial_cluster_ood
 from utils import cacheutils, gputils
 from utils import ioutils as IOU
 
@@ -126,19 +124,8 @@ def test_cropharvest_retains_the_block_basis_for_historical_artifacts() -> None:
     assert domains[2] == "unknown"
 
 
-def test_spatial_cluster_ood_uses_coordinate_clusters() -> None:
-    centers = np.array([[0.0, 0.0], [0.0, 5.0], [5.0, 0.0], [5.0, 5.0], [10.0, 0.0], [10.0, 5.0]])
-    latlon = np.vstack([c + 0.01 * np.array([i, -i]) for c in centers for i in range(6)])
-    bench = SimpleNamespace(name="unknown_bench", latlon=latlon)
-    y = np.array([0, 1] * (len(latlon) // 2), dtype=np.int64)
-
-    domains = spatial_cluster_ood.assign_domains(bench)
-    [split] = list(spatial_cluster_ood.iter_splits(y, domains, seed=0, bench=bench))
-
-    assert len(set(domains.astype(str)) - {"unknown"}) >= 3
-    assert set(split.train).isdisjoint(split.val)
-    assert set(split.train).isdisjoint(split.test)
-    assert set(split.val).isdisjoint(split.test)
+# The spatial_cluster_ood construction contract (coordinate-only cells, five rotations, purge,
+# partition exactness, artifact round-trip, fail-closed coords) is pinned in test_regime_spatial.py.
 
 
 def test_spatial_cluster_regime_is_available_for_located_benchmarks() -> None:
@@ -219,37 +206,6 @@ def test_source_budget_probe_scores_source_diagnostics() -> None:
 
     assert {r["evaluation_split"] for r in rows} == {"test", "source_validation", "source_test"}
     assert {p["evaluation_split"] for p in preds} == {"test", "source_validation", "source_test"}
-
-
-def test_spatial_cluster_pastis_split_is_patch_level(tmp_path) -> None:
-    patch_latlon: dict[int, tuple[float, float]] = {}
-    for i in range(15):
-        fold = (i % 5) + 1
-        patch = 10_000 + i
-        fold_dir = tmp_path / f"fold_{fold}"
-        fold_dir.mkdir(exist_ok=True)
-        np.save(fold_dir / f"{patch}_0_0.labels.npy", np.array([0, 1], dtype=np.int64))
-        patch_latlon[patch] = (40.0 + i, -5.0 + (i % 3))
-    bench = SimpleNamespace(name="pastis", patch_latlon=patch_latlon)
-
-    [(regime, cfg)] = list(
-        regime_base.segmentation_fold_configs(
-            pastis,
-            ["spatial_cluster_ood"],
-            seed=0,
-            emb_dir=tmp_path,
-            strict_mode=True,
-            bench=bench,
-        )
-    )
-
-    assert regime == "spatial_cluster_ood"
-    assert cfg.label == "spatial_cluster_purge2km"
-    assert cfg.train_patches and cfg.val_patches and cfg.test_patches
-    assert cfg.train_patches.isdisjoint(cfg.val_patches)
-    assert cfg.train_patches.isdisjoint(cfg.test_patches)
-    assert cfg.val_patches.isdisjoint(cfg.test_patches)
-    assert cfg.has_target is True
 
 
 def test_crop_class() -> None:

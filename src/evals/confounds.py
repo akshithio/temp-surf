@@ -4,6 +4,7 @@ from typing import Any
 
 import numpy as np
 
+from evals.regimes.base import TARGET_ROLE_HEADLINE, TARGET_ROLE_SUPPLEMENTARY_STRESS
 from utils.ioutils import (
     _LOWER_BETTER,
     _chance,
@@ -108,6 +109,9 @@ def compute_deltas(
             and _close(r.get("label_budget"), budget)
             and metric in r
             and r[metric] is not None
+            # headline equal-region aggregation NEVER includes supplementary stress targets
+            # (CropHarvest one-class regions); they stay visible as source-only stress results elsewhere.
+            and r.get("target_role", TARGET_ROLE_HEADLINE) != TARGET_ROLE_SUPPLEMENTARY_STRESS
             and all(r.get(k) == combo[i] for i, k in enumerate(keys))
         )
 
@@ -243,6 +247,8 @@ def compute_deltas(
                         and metric in r
                         and r[metric] is not None
                         and (r.get("evaluation_split") or "held_out") == want
+                        # worst-region NEVER includes a supplementary stress target
+                        and r.get("target_role", TARGET_ROLE_HEADLINE) != TARGET_ROLE_SUPPLEMENTARY_STRESS
                         and all(r.get(k) == combo[i] for i, k in enumerate(keys))
                     ):
                         s = r.get("seed")

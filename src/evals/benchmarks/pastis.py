@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from pyproj import Transformer  # projected PASTIS coordinates require a real CRS transform (declared directly)
 
 from dataio.get_input import (
     Benchmark,
@@ -30,13 +32,8 @@ HOLDOUTS = [5]
 OFFICIAL_HOLDOUTS = [5]
 GEOGRAPHIC_HOLDOUTS = [1, 2, 3, 4, 5]
 SPLIT_REGIMES = ["random_id", "official", "geographic_ood", "spatial_cluster_ood"]
-SPATIAL_CLUSTER_SPLIT = {
-    "label": "spatial_cluster_purge2km",
-    "n_clusters": 12,
-    "val_fraction": 0.10,
-    "test_fraction": 0.20,
-    "purge_km": 2.0,
-}
+# spatial_cluster_ood: coordinate-only spherical-K-means cells over patch centroids (5 cells,
+# purge_km from split_spec); no benchmark-specific override -- see evals.regimes.spatial_cluster_ood.
 IGNORE_INDEX = 19
 
 # ANNOTATIONS/TARGET_<id>.npy (20 classes: 0=background, 1-18 crops, 19=void).
@@ -59,6 +56,9 @@ class PastisPatch:
     s2_months: np.ndarray
     s1_months: np.ndarray
     latlon: tuple[float, float]
+    #: Sentinel-2 granule tile (canonical ``T##XXX``), the geographic unit for tile-LODO. ``None``
+    #: only if the metadata carries no ``TILE`` property.
+    tile: str | None = None
 
 
 @dataclass(frozen=True)
@@ -139,6 +139,15 @@ class PastisBenchmark:
         return {patch.patch_id: patch.latlon for patch in self.patches}
 
     @property
+    def patch_tiles(self) -> dict[int, str | None]:
+        """Patch id -> canonical Sentinel tile (``T##XXX``). The geographic unit for tile-LODO."""
+        return {patch.patch_id: patch.tile for patch in self.patches}
+
+    def tiles(self) -> list[str]:
+        """Sorted distinct Sentinel tiles present (excluding patches with no tile metadata)."""
+        return sorted({p.tile for p in self.patches if p.tile is not None})
+
+    @property
     def latlon(self) -> np.ndarray:
         tiles_per_patch = (128 // self.tile_size) ** 2
         return np.repeat([patch.latlon for patch in self.patches], tiles_per_patch, axis=0).astype(np.float32)
@@ -159,10 +168,10 @@ class PastisBenchmark:
     def patch_class_sets(self, patch_ids: Iterable[int] | None = None) -> dict[int, set[int]]:
         """Cache-free per-patch class sets from the raw ANNOTATIONS/TARGET arrays.
 
-        Mirrors ``spatial_cluster_ood._patch_class_sets`` (which reads the cached label tiles): the
-        set of non-ignore class labels present in each patch. A patch's cached label tiles store
+        The set of non-ignore class labels present in each patch. A patch's cached label tiles store
         exactly ``labels[labels != ignore_index]`` per tile, so the union over its tiles equals the
-        unique non-ignore labels of the whole target here -- identical to the complete-cache result.
+        unique non-ignore labels of the whole target here -- identical to the complete-cache result
+        (pinned by test_split_parity.test_pastis_class_sets_are_cache_free_and_matches_complete_cache).
         """
         want = None if patch_ids is None else {int(p) for p in patch_ids}
         out: dict[int, set[int]] = {}
@@ -237,21 +246,29 @@ def _pastis_months(dates_field) -> np.ndarray:
     return np.array([((int(v) // 100) % 100) - 1 for _, v in items], dtype=np.int64)
 
 
+#: EPSG:2154 (Lambert-93) -> EPSG:4326 (WGS84) transformer, built lazily (the transformer object is
+#: heavy to construct, though pyproj itself is imported directly at module top).
+_L93_TO_WGS84: Transformer | None = None
+
+
+def _l93_to_wgs84() -> Transformer:
+    global _L93_TO_WGS84
+    if _L93_TO_WGS84 is None:
+        # always_xy: input (easting, northing) -> output (lon, lat)
+        _L93_TO_WGS84 = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
+    return _L93_TO_WGS84
+
+
 def _geometry_latlon(geometry: dict[str, Any] | None) -> tuple[float, float]:
-    def valid(lat: float, lon: float) -> bool:
-        return -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0
+    """Patch representative point as ``(lat, lon)`` in EPSG:4326.
 
-    if geometry:
-        try:
-            from shapely.geometry import shape
-
-            point = shape(geometry).centroid
-            lat, lon = float(point.y), float(point.x)
-            if valid(lat, lon):
-                return (lat, lon)
-        except Exception:
-            pass
-
+    PASTIS metadata geometries are EPSG:2154 (Lambert-93) easting/northing. The previous loader
+    treated them as lon/lat, so every real patch fell outside ``[-180,180]x[-90,90]`` and became
+    ``NaN``. Here the projected centroid is transformed to WGS84 first. Coordinates already in valid
+    lon/lat (e.g. synthetic fixtures) are kept as-is. A geometry with no coordinates returns
+    ``(nan, nan)`` (a MISSING coordinate, hard-failed later by :func:`assert_geographic_ready`); a
+    transform that fails or yields out-of-range lat/lon is a hard error here, never a silent NaN.
+    """
     coords: list[tuple[float, float]] = []
 
     def walk(value) -> None:
@@ -265,12 +282,102 @@ def _geometry_latlon(geometry: dict[str, Any] | None) -> tuple[float, float]:
 
     walk((geometry or {}).get("coordinates", []))
     if not coords:
-        return (np.nan, np.nan)
-    lon = float(np.mean([c[0] for c in coords]))
-    lat = float(np.mean([c[1] for c in coords]))
-    if valid(lat, lon):
-        return (lat, lon)
-    return (np.nan, np.nan)
+        return (np.nan, np.nan)  # missing geometry -- caught by assert_geographic_ready, not silent
+    # Bounding-box center: an unbiased representative point (a polygon ring repeats its first vertex,
+    # which would skew a plain mean). For PASTIS's square patches this is the exact center.
+    xs = [c[0] for c in coords]
+    ys = [c[1] for c in coords]
+    x = (min(xs) + max(xs)) / 2.0  # easting or lon
+    y = (min(ys) + max(ys)) / 2.0  # northing or lat
+    # Already WGS84 lon/lat (synthetic fixtures declare geometries directly in degrees).
+    if -180.0 <= x <= 180.0 and -90.0 <= y <= 90.0:
+        return (y, x)
+    # Otherwise Lambert-93 easting/northing -> transform the projected centroid to lon/lat. A failed
+    # or out-of-range transform is a hard error (unusable projected coordinate), never a silent NaN.
+    try:
+        lon, lat = _l93_to_wgs84().transform(x, y)
+    except Exception as exc:
+        raise ValueError(f"PASTIS EPSG:2154->4326 transform failed for easting/northing ({x}, {y}): {exc}") from exc
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        raise ValueError(f"PASTIS transform produced out-of-range lat/lon ({lat}, {lon}) from ({x}, {y})")
+    return (float(lat), float(lon))
+
+
+_TILE_RE = re.compile(r"^T\d{2}[A-Z]{3}$")  # canonical Sentinel-2 granule tile, e.g. T31TFM
+
+
+def _canonical_tile(raw: Any) -> str | None:
+    """Normalize a metadata ``TILE`` value to canonical ``T##XXX`` (e.g. ``30UXV`` -> ``T30UXV``).
+
+    Returns ``None`` for an absent/blank value (a MISSING tile, hard-failed later by
+    :func:`assert_geographic_ready`). A present-but-malformed value raises -- it is invalid metadata,
+    not a geographic-ready state.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip().upper()
+    if not s:
+        return None
+    if not s.startswith("T"):
+        s = "T" + s
+    if not _TILE_RE.match(s):
+        raise ValueError(f"PASTIS tile {raw!r} is not a canonical Sentinel granule tile (T##XXX)")
+    return s
+
+
+def assert_geographic_ready(bench: PastisBenchmark) -> None:
+    """Hard-fail if any patch lacks a valid Sentinel tile or a finite coordinate.
+
+    Tile-LODO geographic split generation MUST call this: a patch with missing/invalid tile or
+    coordinate metadata cannot be placed in a geographic unit and must never be silently dropped.
+    """
+    no_tile = [p.patch_id for p in bench.patches if p.tile is None]
+    bad_coord = [
+        p.patch_id for p in bench.patches
+        if not np.all(np.isfinite(np.asarray(p.latlon, dtype=float)))
+    ]
+    problems: list[str] = []
+    if no_tile:
+        problems.append(f"{len(no_tile)} patch(es) have no Sentinel tile (e.g. {no_tile[:5]})")
+    if bad_coord:
+        problems.append(f"{len(bad_coord)} patch(es) have non-finite coordinates (e.g. {bad_coord[:5]})")
+    if problems:
+        raise ValueError("PASTIS is not geographic-ready: " + "; ".join(problems))
+
+
+def assert_frozen_tile_universe(bench: PastisBenchmark, expected: dict[str, int] | None = None) -> None:
+    """Validate tile assignments against the FROZEN tile universe + counts before geographic/spatial
+    split construction. Rejects missing (``None``), unexpected (out-of-universe), duplicated patch
+    IDs, and per-tile counts that differ from the expected frozen counts (default
+    :data:`split_spec.PASTIS_TILE_PATCHES`). Any mismatch is a hard error, never a silent drop.
+    """
+    from collections import Counter
+
+    from evals.split_spec import PASTIS_TILE_PATCHES
+
+    expected = dict(PASTIS_TILE_PATCHES if expected is None else expected)
+    problems: list[str] = []
+
+    id_counts = Counter(int(p.patch_id) for p in bench.patches)
+    dups = sorted(i for i, c in id_counts.items() if c > 1)
+    if dups:
+        problems.append(f"duplicate patch id(s): {dups[:5]}")
+
+    no_tile = [p.patch_id for p in bench.patches if p.tile is None]
+    if no_tile:
+        problems.append(f"{len(no_tile)} patch(es) with no tile (e.g. {no_tile[:5]})")
+
+    actual = Counter(p.tile for p in bench.patches if p.tile is not None)
+    unexpected = sorted(set(actual) - set(expected))
+    if unexpected:
+        problems.append(f"unexpected tile(s) outside the frozen universe: {unexpected}")
+    for tile, exp_n in sorted(expected.items()):
+        got = actual.get(tile, 0)
+        if got != exp_n:
+            problems.append(f"tile {tile}: {got} patch(es) != expected {exp_n}")
+
+    if problems:
+        raise ValueError("PASTIS frozen tile universe invalid: " + "; ".join(problems))
 
 
 def _monthly_patch(values: np.ndarray, months: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -376,6 +483,7 @@ def load_benchmark(
                 s2_months=_pastis_months(r["dates-S2"]),
                 s1_months=_pastis_months(r["dates-S1A"]),
                 latlon=r["_latlon"],
+                tile=_canonical_tile(r.get("TILE")),
             )
         )
 
@@ -466,17 +574,28 @@ def run_probes_segmentation_target(
     family: str = "logistic",
     groups_source: np.ndarray | None = None,
     target_id_budget: float | int = -1,
+    pool_patches: Any = None,
+    target_test_patches: Any = None,
 ) -> None:
     meta = dict(meta or {})
     eval_classes = np.arange(19, dtype=np.int64)
-    patches = np.array(sorted({int(p) for p in target_patches}))
-    all_patches = set(patches.tolist())
-    degenerate = len(patches) < 2
-    split_rng = np.random.default_rng(perf._budget_seed(seed, 0.5))
-    perm = split_rng.permutation(patches)
-    n_test_patches = max(1, int(round(0.2 * len(patches)))) if not degenerate else len(patches)
-    test_patches = set(perm[:n_test_patches].tolist())
-    pool_order = [int(p) for p in perm.tolist() if p not in test_patches]
+    split_seed = perf._budget_seed(seed, 0.5)
+    if pool_patches is not None and target_test_patches is not None:
+        # schema v2: the FROZEN target_label_pool / target_test patch sets from the artifact -- few-shot
+        # patches are drawn ONLY from the pool and every budget is scored on the fixed target_test.
+        test_patches = {int(p) for p in target_test_patches}
+        pool_sorted = sorted(int(p) for p in pool_patches)
+        pool_order = [int(p) for p in np.random.default_rng(split_seed).permutation(pool_sorted).tolist()]
+        all_patches = test_patches | set(pool_sorted)
+        degenerate = len(pool_order) == 0 or len(test_patches) == 0
+    else:
+        patches = np.array(sorted({int(p) for p in target_patches}))
+        all_patches = set(patches.tolist())
+        degenerate = len(patches) < 2
+        perm = np.random.default_rng(split_seed).permutation(patches)
+        n_test_patches = max(1, int(round(0.2 * len(patches)))) if not degenerate else len(patches)
+        test_patches = set(perm[:n_test_patches].tolist())
+        pool_order = [int(p) for p in perm.tolist() if p not in test_patches]
 
     for budget in budgets:
         if budget != 0 and (degenerate or not pool_order):

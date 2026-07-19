@@ -135,18 +135,26 @@ def test_append_jsonl_roundtrips_batch(tmp_path):
     assert [r["a"] for r in IOU.read_jsonl(p)] == [1, 2, 3]
 
 
-def test_dropped_curated_holdout_is_surfaced_and_strict_raises():
+def test_geographic_absent_target_is_recorded_as_dropped_not_silently_missing():
+    """schema v2: a frozen LODO target that is absent from the data yields NO split, but the drop is
+    recorded as an explicit dropped_holdout audit event rather than a silent gap."""
+    from types import SimpleNamespace
+
     from evals.regimes import base as RB
-    groups = np.array(["A"] * 20 + ["B"] * 20 + ["C"] * 5, dtype=object)
-    y = np.array([0, 1] * 20 + [0] * 5)
-    bench = type("FB", (), {"name": "fb", "groups": groups})()
+    from evals.regimes import geographic_ood as geo
 
-    RB.REGIME_PROBLEMS.clear()
-    list(RB.iter_splits("geographic_ood", bench, y, holdouts=["A", "B", "C"], seed=0, strict_mode=False))
-    assert any("C" in reason for _, reg, reason in RB.REGIME_PROBLEMS if reg == "geographic_ood")
+    groups = np.array(["frh01"] * 20 + ["frh02"] * 20 + ["frh03"] * 20, dtype=object)  # frh04 absent
+    bench = SimpleNamespace(
+        name="breizhcrops", groups=groups, labels=np.arange(60) % 3,
+        latlon=np.column_stack([np.linspace(48, 49, 60), np.linspace(-4, -2, 60)]), sample_ids=np.arange(60),
+    )
+    bench_mod = SimpleNamespace(BENCHMARK="breizhcrops", make_targets=lambda b: (b.labels, b.groups))
 
-    with pytest.raises(RuntimeError):
-        list(RB.iter_splits("geographic_ood", bench, y, holdouts=["A", "B", "C"], seed=0, strict_mode=True))
+    RB.clear_split_audit_events()
+    labels = [s.label for s in geo.iter_source_target_splits(bench, bench_mod, 0)]
+    assert "frh04" not in labels  # the absent target produces no split
+    dropped = [e for e in RB.SPLIT_AUDIT_EVENTS if e["kind"] == "dropped_holdout" and e.get("holdout") == "frh04"]
+    assert dropped and dropped[0]["reason"] == "absent_from_data"
 
 
 def test_subset_indices_guards_tiny_pool():
@@ -363,39 +371,11 @@ def test_run_manifest_rejects_corrupt(tmp_path, monkeypatch):
         runstate.check_run_manifest(d, {"schema": 1}, overwrite_mode=False)
 
 
-def test_leave_one_domain_out_dropped_domain_surfaced(monkeypatch):
-    from evals.regimes import base as RB
-    from evals.regimes.base import Split
-
-    class StubRegime:
-        NAME = "geographic_ood"
-        GROUP_KIND = "geography"
-        HAS_TARGET = True
-        LEAVE_ONE_DOMAIN_OUT = True
-
-        @staticmethod
-        def assign_domains(bench, holdouts=None):
-            return np.array(["A", "A", "B", "B", "C", "C"], dtype=object)
-
-        @staticmethod
-        def iter_splits(y, groups, *, seed, holdouts, val_group=None, **_):
-            for d in ("A", "B"):           # C is silently dropped (degenerate) -> must be surfaced
-                idx = np.flatnonzero(groups == d)
-                tr = np.flatnonzero(groups != d)
-                yield Split(f"fold_{d}", tr, idx, np.array([], dtype=int), domain=d)
-
-    monkeypatch.setattr(RB, "load_regime", lambda name: StubRegime)
-    RB.REGIME_PROBLEMS.clear()
-    bench = type("B", (), {"name": "b"})()
-    list(RB.iter_splits(
-        "geographic_ood",
-        bench,
-        np.array([0, 1, 0, 1, 0, 1]),
-        holdouts=None,
-        seed=0,
-        strict_mode=False,
-    ))
-    assert any("C" in reason for _, reg, reason in RB.REGIME_PROBLEMS if reg == "geographic_ood")
+# A dropped leave-one-domain-out holdout being surfaced (never silent) is now a schema-v2 concern
+# covered by test_split_parity.test_generation_records_dropped_holdout (an absent geographic target is
+# recorded in dropped_holdouts) and test_phase_b_refuses_zero_yield_requested_regime (a requested
+# regime that yields zero leaves is refused at consumption). The v1 base.iter_splits LODO census check
+# it used to pin is removed.
 
 
 def test_run_manifest_includes_seeds_and_enc_kwargs():
@@ -479,3 +459,36 @@ def test_checkpoint_sha_reflects_override_content_not_mtime(tmp_path):
     os.utime(wp, (mtime, mtime))  # SAME mtime -> a content hash must still move
     C._CHECKPOINT_SHA_CACHE.clear()
     assert C.checkpoint_sha256("agrifm", weights_override=str(wp)) != sig1 and len(sig1) == 64
+
+
+def test_supplementary_stress_targets_excluded_from_headline_geographic_aggregation():
+    """Defect 3: CropHarvest one-class supplementary stress targets stay VISIBLE as source-only stress
+    rows, but never enter the headline geographic equal-region mean or worst-region F1. Marked by the
+    machine-readable target_role (supports_target_labels=False alone is insufficient -- official shares
+    that capability), so a stress region with the worst F1 must NOT dominate worst-region."""
+    from evals import confounds
+
+    base = {"model": "raw", "benchmark": "cropharvest", "method": "erm", "probe_family": "logistic"}
+    rows = [
+        # ID baseline (random_id source @ 1.0, eval test)
+        {**base, "split_regime": "random_id", "budget_type": "source", "label_budget": 1.0,
+         "evaluation_split": "test", "seed": 0, "f1": 0.9, "target_role": "headline"},
+        # headline OOD target regions (zero-shot, eval full)
+        {**base, "split_regime": "geographic_ood", "budget_type": "target", "label_budget": 0,
+         "evaluation_split": "full", "holdout": "kenya", "seed": 0, "f1": 0.8, "target_role": "headline"},
+        {**base, "split_regime": "geographic_ood", "budget_type": "target", "label_budget": 0,
+         "evaluation_split": "full", "holdout": "togo", "seed": 0, "f1": 0.7, "target_role": "headline"},
+        # a supplementary STRESS region with the WORST F1 -- would dominate worst-region if it leaked in
+        {**base, "split_regime": "geographic_ood", "budget_type": "target", "label_budget": 0,
+         "evaluation_split": "full", "holdout": "central-asia", "seed": 0, "f1": 0.1,
+         "target_role": "supplementary_stress"},
+    ]
+
+    deltas = confounds.compute_deltas(rows, ["f1"], n_boot=0)
+    d = next(r for r in deltas if r["metric"] == "f1")
+    # equal-region OOD mean over HEADLINE regions only (0.8, 0.7) -> 0.75; central-asia's 0.1 excluded
+    assert d["ood"] == pytest.approx(0.75)
+    assert d["ood_min"] == pytest.approx(0.7)              # togo, NOT central-asia's 0.1
+    assert d["ood_worst_region"] == pytest.approx(0.7)     # worst headline region, stress excluded
+    # the stress region is still present (visible source-only stress evidence)
+    assert any(r.get("holdout") == "central-asia" for r in rows)

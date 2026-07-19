@@ -1,129 +1,113 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 from evals import evals as EV
 from evals.metrics import expected_calibration_error, score_segmentation, score_segmentation_streamed
-from evals.regimes import base as regime_base
-from evals.regimes import geographic_ood, official
-from evals.regimes.geographic_ood import make_strict_holdout_splits
-from evals.regimes.random_id import make_splits
+from evals.regimes import geographic_ood, official, random_id
+
+# The old geographic_ood tabular tests were removed with the schema-v2 rewrite: geographic_ood now
+# emits SourceTargetSplit via true LODO + purge + partition_source, covered by test_regime_geographic.py.
 
 
-def test_make_strict_holdout_splits() -> None:
-    y = np.array([0, 1, 0, 1, 0, 1, 0, 1])
-    groups = np.array(["src1", "src1", "src2", "src2", "hold", "hold", "src3", "src3"], dtype=object)
+def test_random_id_v2_split_is_exact_with_singleton_classes() -> None:
+    """The schema-v2 successor to the retired make_splits fallback: a distribution with singleton
+    classes yields an EXACT disjoint+complete source split (partition_source, no fallback)."""
+    y = np.array([0, 0, 0, 1, 1, 2, 3, 4, 5, 6], dtype=np.int64)  # classes 2..6 are singletons
+    groups = np.array(["A"] * len(y), dtype=object)
+    bench = SimpleNamespace(labels=y, groups=groups, sample_ids=np.arange(len(y)))
+    bench_mod = SimpleNamespace(BENCHMARK="toy", make_targets=lambda b: (b.labels, b.groups))
 
-    train, val, test, train_val = make_strict_holdout_splits(y, groups, "hold", seed=0)
-
-    assert set(test.tolist()) == {4, 5}
-    assert set(train).isdisjoint(test)
-    assert set(val).isdisjoint(test)
-    assert set(train_val.tolist()) == {0, 1, 2, 3, 6, 7}
-    assert np.all(groups[train] != "hold")
-    assert np.all(groups[val] != "hold")
-
-
-def test_geographic_holdout_validation_is_whole_source_domain() -> None:
-    y = np.array([0, 1] * 4)
-    groups = np.array(["A", "A", "B", "B", "C", "C", "D", "D"], dtype=object)
-
-    train, val, test, _train_val = make_strict_holdout_splits(
-        y, groups, "B", seed=0, require_domain_val=True
-    )
-
-    assert set(groups[test]) == {"B"}
-    assert set(groups[val]) == {"C"}
-    assert set(groups[train]) == {"A", "D"}
-
-
-def test_geographic_ood_fixed_split_is_one_partition() -> None:
-    y = np.array([0, 1] * 6)
-    groups = np.array(["train"] * 4 + ["val"] * 4 + ["test"] * 4, dtype=object)
-
-    [split] = list(
-        geographic_ood.iter_splits(
-            y,
-            groups,
-            seed=0,
-            holdouts={"label": "fixed", "train": ["train"], "val": ["val"], "test": ["test"]},
-        )
-    )
-
-    assert split.label == "fixed"
-    assert set(groups[split.train]) == {"train"}
-    assert set(groups[split.val]) == {"val"}
-    assert set(groups[split.test]) == {"test"}
-
-
-def test_make_splits_falls_back_when_a_class_is_singleton() -> None:
-    y = np.array([0, 0, 0, 1, 1, 2, 3, 4, 5, 6])
-
-    train, val, test = make_splits(y, seed=0)
-
-    assert len(set(train) & set(val)) == 0
-    assert len(set(train) & set(test)) == 0
-    assert len(set(val) & set(test)) == 0
+    split = next(iter(random_id.iter_source_target_splits(bench, bench_mod, 0)))
+    train, val, test = split.source_train, split.source_val, split.source_test
+    assert set(train.tolist()).isdisjoint(val.tolist())
+    assert set(train.tolist()).isdisjoint(test.tolist())
+    assert set(val.tolist()).isdisjoint(test.tolist())
     assert sorted(np.concatenate([train, val, test]).tolist()) == list(range(len(y)))
+    assert split.has_target is False and split.target_test.size == 0
 
 
 def test_official_pastis_split_uses_published_folds() -> None:
-    class _Bench:
-        TRAIN_FOLDS = {1, 2, 3}
-        VAL_FOLDS = {4}
-        TEST_FOLDS = {5}
+    """schema v2: official emits a patch-level DenseSourceTargetSplit -- folds 1-3 source_train,
+    fold 4 source_val, fold 5 target_test -- has_target=True, supports_target_labels=False."""
+    bench_mod = SimpleNamespace(BENCHMARK="pastis", TRAIN_FOLDS={1, 2, 3}, VAL_FOLDS={4}, TEST_FOLDS={5})
+    patches = [SimpleNamespace(patch_id=100 + i, fold=(i % 5) + 1, tile=f"T3{i % 4}") for i in range(20)]
+    fold_of = {p.patch_id: p.fold for p in patches}
+    bench = SimpleNamespace(patches=patches)
 
-    cfg = list(official.iter_fold_splits(_Bench))[0]
+    [d] = list(official.iter_dense_source_target_splits(bench, bench_mod, 0))
 
-    assert cfg.label == "fold_5"
-    assert cfg.train_folds == {1, 2, 3}
-    assert cfg.val_folds == {4}
-    assert cfg.test_folds == {5}
-    assert cfg.has_target is True
-
-
-def test_geographic_pastis_split_is_leave_one_fold_out() -> None:
-    class _Bench:
-        TRAIN_FOLDS = {1, 2, 3}
-        VAL_FOLDS = {4}
-        TEST_FOLDS = {5}
-
-    cfgs = list(geographic_ood.iter_fold_splits(_Bench))
-    fold_5 = [cfg for cfg in cfgs if cfg[0] == "fold_5"][0]
-
-    assert len(cfgs) == 5
-    assert fold_5 == ("fold_5", {2, 3, 4}, {1}, {5})
+    assert d.label == "fold_5"
+    assert d.has_target is True and d.supports_target_labels is False
+    assert d.source_train_patches == frozenset(p for p, f in fold_of.items() if f in {1, 2, 3})
+    assert d.source_val_patches == frozenset(p for p, f in fold_of.items() if f == 4)
+    assert d.target_test_patches == frozenset(p for p, f in fold_of.items() if f == 5)
+    assert not d.source_test_patches and not d.target_label_pool_patches
 
 
-def test_random_pastis_split_is_patch_level(tmp_path) -> None:
-    class _Bench:
-        TRAIN_FOLDS = {1, 2, 3}
-        VAL_FOLDS = {4}
-        TEST_FOLDS = {5}
+def test_geographic_pastis_split_is_leave_one_tile_out() -> None:
+    """schema v2: geographic_ood dense LODO is over Sentinel TILES (never the published folds),
+    patch-level, has_target=True/supports_target_labels=True."""
+    from evals import split_spec
 
-    for fold in range(1, 6):
-        fold_dir = tmp_path / f"fold_{fold}"
-        fold_dir.mkdir()
-        for patch in range(fold * 100, fold * 100 + 4):
-            np.save(fold_dir / f"{patch}_0_0.labels.npy", np.array([0, 1], dtype=np.int64))
-
-    [(regime, cfg)] = list(
-        regime_base.segmentation_fold_configs(_Bench, ["random_id"], seed=0, emb_dir=tmp_path, strict_mode=True)
+    tiles = list(split_spec.PASTIS.geographic_targets)
+    centers = {t: (45.0 + 3 * i, -1.0 + 3 * i) for i, t in enumerate(tiles)}  # tiles spatially separated
+    patches, pid = [], 100
+    for tile in tiles:
+        la, lo = centers[tile]
+        for k in range(6):
+            patches.append(SimpleNamespace(patch_id=pid, fold=(pid % 5) + 1, tile=tile, latlon=(la + k * 0.01, lo + k * 0.01)))
+            pid += 1
+    pids = [p.patch_id for p in patches]
+    tile_of = {p.patch_id: p.tile for p in patches}
+    bench = SimpleNamespace(
+        patches=patches,
+        patch_ids=lambda folds=None, _p=pids: list(_p),
+        patch_class_sets=lambda ids=None, _p=pids: {int(p): {p % 4, 10 + p % 3} for p in (ids if ids is not None else _p)},
+        patch_tiles={p.patch_id: p.tile for p in patches},
+        patch_latlon={p.patch_id: p.latlon for p in patches},
     )
-    train = cfg.train_patches
-    val = cfg.val_patches
-    test = cfg.test_patches
+    bench_mod = SimpleNamespace(BENCHMARK="pastis")
 
-    assert regime == "random_id"
-    assert cfg.label == "random_patch"
-    assert cfg.train_folds == {1, 2, 3, 4, 5}
-    assert cfg.has_target is False
+    splits = list(geographic_ood.iter_dense_source_target_splits(bench, bench_mod, 0))
+    assert sorted(d.label for d in splits) == sorted(str(t) for t in tiles)
+    for d in splits:
+        target = d.target_label_pool_patches | d.target_test_patches
+        assert {tile_of[p] for p in target} == {d.label}          # held out is exactly its tile
+        source = d.source_train_patches | d.source_val_patches | d.source_test_patches
+        assert d.label not in {tile_of[p] for p in source}        # source never contains the target tile
+        assert d.has_target is True and d.supports_target_labels is True
+
+
+def test_random_pastis_split_is_patch_level() -> None:
+    """schema v2: random_id emits a source-only DenseSourceTargetSplit over patch IDs (cache-free --
+    the regime reads bench.patch_ids/patch_class_sets, never fold dirs). Patches, never folds/pixels,
+    are the split unit."""
+    pids = list(range(100, 120))  # 20 patches spanning all folds
+    patches = [SimpleNamespace(patch_id=p, fold=(p % 5) + 1, tile=f"T3{p % 4}") for p in pids]
+    bench = SimpleNamespace(
+        patches=patches,
+        patch_ids=lambda folds=None, _p=pids: list(_p),
+        patch_class_sets=lambda ids=None, _p=pids: {int(p): {0, 1} for p in (ids if ids is not None else _p)},
+        patch_tiles={p.patch_id: p.tile for p in patches},
+        patch_latlon={},
+    )
+    bench_mod = SimpleNamespace(BENCHMARK="pastis")
+
+    [d] = list(random_id.iter_dense_source_target_splits(bench, bench_mod, 0))
+    train, val, test = d.source_train_patches, d.source_val_patches, d.source_test_patches
+
+    assert d.label == "random_patch"
+    assert d.has_target is False and d.supports_target_labels is False
     assert train and val and test
     assert train.isdisjoint(val)
     assert train.isdisjoint(test)
     assert val.isdisjoint(test)
     assert len(train | val | test) == 20
+    assert not d.target_label_pool_patches and not d.target_test_patches
 
 
 def test_subset_indices() -> None:

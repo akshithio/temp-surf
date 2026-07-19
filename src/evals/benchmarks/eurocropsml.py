@@ -38,13 +38,8 @@ HOLDOUTS = ["Estonia"]
 OFFICIAL_HOLDOUTS = ["latvia_vs_estonia", "latvia_portugal_vs_estonia"]
 GEOGRAPHIC_HOLDOUTS = ["Estonia", "Latvia", "Portugal"]
 GEOGRAPHIC_PURGE_KM = 25.0
-SPATIAL_CLUSTER_SPLIT = {
-    "label": "spatial_cluster_purge25km",
-    "n_clusters": 9,
-    "val_fraction": 0.10,
-    "test_fraction": 0.20,
-    "purge_km": 25.0,
-}
+# spatial_cluster_ood: coordinate-only spherical-K-means cells (5 cells, purge_km from split_spec);
+# no benchmark-specific override -- see evals.regimes.spatial_cluster_ood / evals.split_spec.
 SPLIT_REGIMES = ["random_id", "official", "geographic_ood", "spatial_cluster_ood"]
 HCAT_PREFIX = 6  # truncate the 10-digit HCAT code to this many leading digits (crop-type level)
 
@@ -107,13 +102,26 @@ def load_benchmark(
     preprocess_dir = base / "preprocess"
     if not preprocess_dir.exists():
         raise FileNotFoundError(f"EuroCropsML preprocess dir not found: {preprocess_dir}")
-    files = _select_files([p for p in preprocess_dir.glob("*.npz") if p.is_file()], shuffle, seed, max_samples)
+    # Frozen 40-class population mask: drop the 7 six-digit HCAT classes with <10 global examples
+    # (22 parcels) BEFORE any regime, so every split sees the same 40-class / 706,661-parcel
+    # population and the random split can no longer silently lose their stratification. Applied to the
+    # FILE LIST before _select_files/max_samples, so a max_samples subset returns that many ELIGIBLE
+    # parcels rather than silently coming up short by however many masked parcels it happened to draw.
+    from evals.split_spec import EUROCROPS_REMOVED_CLASSES
+
+    removed_classes = set(EUROCROPS_REMOVED_CLASSES)
+    eligible = [
+        p for p in preprocess_dir.glob("*.npz")
+        if p.is_file() and p.stem.split("_")[-1][:HCAT_PREFIX] not in removed_classes
+    ]
+    files = _select_files(eligible, shuffle, seed, max_samples)
     if not files:
-        raise ValueError(f"No EuroCropsML npz files in {preprocess_dir}")
+        raise ValueError(f"No eligible EuroCropsML npz files in {preprocess_dir}")
 
     s2_series, s2_months, s2_doy, s2_years = [], [], [], []
     label_codes, groups, latlons, years, sample_ids = [], [], [], [], []
     for path in files:
+        code = path.stem.split("_")[-1]
         with np.load(str(path)) as data:
             raw = data["data"].astype(np.float32)
             dates = data["dates"]
@@ -129,7 +137,7 @@ def load_benchmark(
         s2_months.append((dates_arr.astype("datetime64[M]").astype(np.int64) % 12).astype(np.int64))
         s2_doy.append(((d_day - dates_arr.astype("datetime64[Y]").astype("datetime64[D]")).astype(np.int64) + 1).astype(np.float32))
         s2_years.append((dates_arr.astype("datetime64[Y]").astype(np.int64) + 1970).astype(np.int64))
-        label_codes.append(path.stem.split("_")[-1])
+        label_codes.append(code)
         groups.append(_ec_country(path.stem))
         latlons.append((float(center[1]), float(center[0])) if center is not None else (float("nan"), float("nan")))
         years.append(int(str(dates_arr.ravel()[0])[:4]) if dates_arr.size else 0)

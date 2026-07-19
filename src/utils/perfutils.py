@@ -495,11 +495,17 @@ def _sweep_target_budgets(
     y_val: np.ndarray | None = None,
     family: str = "logistic",
     target_id_budget: float | int = -1,
+    pool_idx: np.ndarray | None = None,
+    test_idx: np.ndarray | None = None,
 ) -> None:
     """Sweep target-region label budgets (absolute counts) on a SHARED fixed target test set.
 
-    A single 80/20 target split is drawn once (budget-independent): the 20% is the fixed test
-    set every budget is scored on, the 80% is the train pool with a fixed nested ordering.
+    ``x_target_full``/``y_target_full`` is the WHOLE held-out target region. In schema v2 the runtime
+    passes the FROZEN 80/20 split as ``pool_idx``/``test_idx`` (positions within the whole target):
+    ``test_idx`` is the fixed target_test every budget is scored on and few-shot draws ONLY from
+    ``pool_idx`` (the target_label_pool) -- labels are NEVER drawn from target_test. When they are not
+    provided (direct callers characterizing the sweep), a single budget-independent 80/20 split is
+    drawn internally instead.
 
     Budget = 0 → strict geographic holdout (train on source only).
     Budget > 0 → add the first ``budget`` target labels from the nested ordering to the source
@@ -524,16 +530,23 @@ def _sweep_target_budgets(
     # The split seed is budget-independent.
     split_seed = _budget_seed(seed, 0.5)
     idx = np.arange(n_target)
-    degenerate = n_target < 5
-    if degenerate:
-        pool_idx = test_idx = idx
+    if pool_idx is not None and test_idx is not None:
+        # schema v2: the frozen target_label_pool / target_test split from the artifact
+        pool_idx = np.asarray(pool_idx, dtype=int)
+        test_idx = np.asarray(test_idx, dtype=int)
+        degenerate = len(pool_idx) == 0 or len(test_idx) == 0
     else:
-        test_size = max(1, min(int(round(0.2 * n_target)), n_target - 1))
-        strat = y_target_full if stratify else None
-        try:
-            pool_idx, test_idx = train_test_split(idx, test_size=test_size, random_state=split_seed, stratify=strat)
-        except ValueError:
-            pool_idx, test_idx = train_test_split(idx, test_size=test_size, random_state=split_seed, stratify=None)
+        degenerate = n_target < 5
+        if degenerate:
+            pool_idx = test_idx = idx
+        else:
+            test_size = max(1, min(int(round(0.2 * n_target)), n_target - 1))
+            strat = y_target_full if stratify else None
+            try:
+                pool_idx, test_idx = train_test_split(idx, test_size=test_size, random_state=split_seed, stratify=strat)
+            except ValueError:
+                pool_idx, test_idx = train_test_split(idx, test_size=test_size, random_state=split_seed, stratify=None)
+    assert pool_idx is not None and test_idx is not None  # every branch above sets both
     order = np.random.default_rng(split_seed).permutation(pool_idx)  # nested few-shot ordering
     x_te_raw, y_te = x_target_full[test_idx], y_target_full[test_idx]
 

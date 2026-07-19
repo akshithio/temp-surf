@@ -64,9 +64,9 @@ REQUIRED_ARTIFACTS = (
     "summary.csv",
     "deltas.csv",
     ENVIRONMENT_FILE,
-    # PHASE B: canonical splits live under data/splits/; each pair records the regime-level leaves it
-    # consumed in split_ref.json (replacing the retired per-model split_manifest.json).
-    "split_ref.json",
+    # PHASE B: the frozen splits live under data/splits/ (discovered + checksum-verified via
+    # data/logs/splits.json). No per-pair split_ref.json is written -- the run manifest already pins
+    # the seeds/regimes consumed, and the central log's checksums pin the split contents.
 )
 
 #: The identity of one evaluation cell. Identical for the tabular and dense paths -- both write

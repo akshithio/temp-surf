@@ -34,13 +34,8 @@ OFFICIAL_HOLDOUTS = ["frh04"]
 OFFICIAL_VAL_HOLDOUT = "frh03"
 GEOGRAPHIC_HOLDOUTS = ["frh01", "frh02", "frh03", "frh04"]
 GEOGRAPHIC_PURGE_KM = 5.0
-SPATIAL_CLUSTER_SPLIT = {
-    "label": "spatial_cluster_purge5km",
-    "n_clusters": 8,
-    "val_fraction": 0.10,
-    "test_fraction": 0.20,
-    "purge_km": 5.0,
-}
+# spatial_cluster_ood: coordinate-only spherical-K-means cells (5 cells, purge_km from split_spec);
+# no benchmark-specific override -- see evals.regimes.spatial_cluster_ood / evals.split_spec.
 SPLIT_REGIMES = ["random_id", "official", "geographic_ood", "spatial_cluster_ood"]
 
 # The breizhcrops package returns L1C ``X`` as (T, 13) with bands in THIS order

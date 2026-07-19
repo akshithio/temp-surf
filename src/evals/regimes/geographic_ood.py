@@ -1,487 +1,256 @@
-"""Strict deployment-style geographic OOD regime."""
+"""Geographic leave-one-domain-out regime (schema v2).
+
+Deployment-style geographic OOD: each frozen geographic unit is held out ONCE as the target; every
+other eligible sample is the source. The source is purged of everything within ``purge_km`` of the
+ENTIRE target FIRST, then the purged source is partitioned exactly 80/10/10
+(source_train/source_val/source_test) and the target 80/20 (target_label_pool/target_test), both by
+the shared deterministic partitioners. ``has_target=True`` and ``supports_target_labels=True``: the
+target's own labels drive the target-label-budget routes -- few-shot draws come ONLY from
+target_label_pool and every budget is scored on the fixed target_test.
+
+Per-benchmark frozen geography (from :mod:`evals.split_spec`):
+  * CropHarvest -- canonical localized regions rotate as headline targets; GeoWiki / Croplands are
+    global collections that stay source-only (never a target); the one-class supplementary regions
+    are held out as zero-shot STRESS targets (supports_target_labels=False, empty target_label_pool),
+    excluded from the target-label routes. 50 km.
+  * EuroCropsML -- Estonia / Latvia / Portugal LODO, the other two jointly source. 25 km.
+  * BreizhCrops -- FRH01-FRH04 LODO, the other three jointly source. 5 km.
+  * PASTIS (dense) -- Sentinel TILE LODO (never the published folds); patch-level multilabel source
+    (80/10/10) and target (80/20) partitioning; whole patches, never pixels. 2 km.
+"""
 
 from __future__ import annotations
 
-import hashlib
-import importlib
-from typing import Any
+from collections.abc import Iterator
 
 import numpy as np
-from sklearn.model_selection import train_test_split
 from sklearn.neighbors import BallTree
 
-from evals.regimes.base import DOMAIN_CENSUS, DenseSplit, Split, emit_split_audit_event, geography_domains
-from utils import cacheutils
+from evals import partition, split_spec
+from evals.regimes.base import (
+    TARGET_ROLE_HEADLINE,
+    TARGET_ROLE_SUPPLEMENTARY_STRESS,
+    DenseSourceTargetSplit,
+    SourceTargetSplit,
+    emit_split_audit_event,
+)
 
 NAME = "geographic_ood"
 GROUP_KIND = "geography"
 HAS_TARGET = True
-USES_CURATED_HOLDOUTS = True
-LEAVE_ONE_DOMAIN_OUT = True
+SUPPORTS_TARGET_LABELS = True  # the held-out region's labels drive the target-label-budget routes
 EARTH_RADIUS_KM = 6371.0088
 
+_UNKNOWN = ("unknown", "nan")
 
-def _bench_mod(bench):
-    try:
-        return importlib.import_module(f"evals.benchmarks.{bench.name}")
-    except (ImportError, AttributeError):
+
+def _spec(bench_mod) -> split_spec.BenchmarkSpec:
+    return split_spec.ALL_SPECS[bench_mod.BENCHMARK]
+
+
+def _target_rotation(spec: split_spec.BenchmarkSpec) -> tuple[str, ...]:
+    """Every frozen geographic unit that is held out once as a target: the headline localized units
+    plus the (one-class) supplementary stress units. Source-only global collections are NOT here."""
+    return tuple(str(t) for t in spec.geographic_targets) + tuple(str(t) for t in spec.supplementary_targets)
+
+
+# --------------------------------------------------------------------------- #
+# Domain metadata
+# --------------------------------------------------------------------------- #
+def sample_domains(bench, bench_mod) -> np.ndarray:
+    """Per-sample geographic domain -- the canonical unit LODO leaves out (region / country)."""
+    del bench_mod
+    return np.asarray(bench.groups, dtype=object)
+
+
+def patch_domains(bench, bench_mod) -> dict[int, str]:
+    """Per-patch geographic domain: the canonical Sentinel TILE (NOT the published fold). This is the
+    unit tile-LODO holds out and the basis the runtime structural check validates against."""
+    del bench_mod
+    return {int(pid): str(tile) for pid, tile in bench.patch_tiles.items()}
+
+
+def requested_targets(bench, bench_mod) -> list[str]:
+    """The frozen LODO target rotation this regime DECLARES it will attempt (headline + supplementary),
+    independent of what the data contains -- an absent target is still declared here and recorded as a
+    dropped_holdout at generation, so it can never be a silent gap."""
+    del bench
+    return list(_target_rotation(_spec(bench_mod)))
+
+
+# --------------------------------------------------------------------------- #
+# Purge (whole source vs entire target, BEFORE partitioning)
+# --------------------------------------------------------------------------- #
+def _latlon(coords) -> np.ndarray | None:
+    if coords is None:
         return None
+    arr = np.asarray(coords, dtype=float)
+    return arr if arr.ndim == 2 and arr.shape[1] == 2 else None
 
 
-def assign_domains(bench, holdouts: Any = None) -> np.ndarray:
-    """Domain basis for this regime, SELECTED BY THE SPLIT STRATEGY.
-
-    The basis and the strategy are not independent. ``spatial_blocks`` assembles val/test by
-    hash-ranking domains until a sample-count target is met, which only reconstructs the
-    historical ``spatial_block_2deg_purge50km`` partition when the domains are 2-degree blocks;
-    run it over canonical provenance domains and it silently emits the historical label over a
-    different split. Leave-one-domain-out needs the opposite -- the named canonical domains.
-    Hence the strategy has to be known BEFORE domains are assigned, not after.
-    """
-    mod = _bench_mod(bench)
-    if isinstance(holdouts, dict) and holdouts.get("strategy") == "spatial_blocks":
-        fn = getattr(mod, "spatial_block_domains", None) if mod is not None else None
-        if fn is None:
-            raise ValueError(
-                f"{getattr(bench, 'name', '?')}: the spatial_blocks strategy requires a "
-                f"spatial_block_domains() basis; refusing to fall back to another basis, which "
-                f"would emit a historical split label over a different partition"
-            )
-        return np.asarray(fn(bench), dtype=object)
-    fn = getattr(mod, "geographic_domains", None) if mod is not None else None
-    if fn is not None:
-        return np.asarray(fn(bench), dtype=object)
-    return geography_domains(bench)
-
-
-def _valid_domains(groups: np.ndarray) -> list[str]:
-    return sorted({str(g) for g in np.asarray(groups).astype(str) if str(g) not in ("unknown", "nan")})
-
-
-def _idx_for(groups: np.ndarray, domains: set[str]) -> np.ndarray:
-    groups_s = np.asarray(groups).astype(str)
-    return np.flatnonzero(np.isin(groups_s, list(domains)))
-
-
-def _check_split(
-    y: np.ndarray,
-    train: np.ndarray,
-    val: np.ndarray,
-    test: np.ndarray,
-    label: str,
-    *,
-    allow_one_class_test: bool = False,
-) -> None:
-    """Reject partitions that cannot support probe training, threshold calibration, or scoring.
-
-    ``allow_one_class_test`` keeps a one-class TARGET: several canonical domains genuinely
-    contain a single class, and dropping them would silently shrink the evaluated universe. Only
-    train and val are structurally required to be two-class -- train to fit the probe at all, val
-    to calibrate a decision threshold. A one-class target still scores accuracy, balanced
-    accuracy, calibration and test_pos_rate; the metrics that need both classes (auc) already
-    come back as nan from score_binary.
-    """
-    if len(train) == 0 or len(val) == 0 or len(test) == 0:
-        raise ValueError(f"{label}: empty train/val/test partition")
-    if len(np.unique(y[train])) < 2:
-        raise ValueError(f"{label}: training partition is one-class")
-    if len(np.unique(y[val])) < 2:
-        raise ValueError(f"{label}: validation partition is one-class")
-    if not allow_one_class_test and len(np.unique(y[test])) < 2:
-        raise ValueError(f"{label}: test partition is one-class")
-
-
-def _domain_size(groups: np.ndarray, domains: set[str]) -> int:
-    return int(np.isin(np.asarray(groups).astype(str), list(domains)).sum())
-
-
-def _domain_classes(y: np.ndarray, groups: np.ndarray, domains: set[str]) -> int:
-    idx = _idx_for(groups, domains)
-    return int(len(np.unique(y[idx]))) if len(idx) else 0
-
-
-def _is_lodo(holdouts: Any) -> bool:
-    return isinstance(holdouts, dict) and holdouts.get("strategy") == "leave_one_domain_out"
-
-
-def domain_census(y: np.ndarray, groups: np.ndarray, holdouts: Any) -> list[dict[str, Any]]:
-    """Eligibility census over every canonical domain present in the data.
-
-    Computed BEFORE any model runs, so validity is a declared property of the dataset rather than
-    a side effect of whichever folds happened to survive. One row per domain, including the ones
-    that are excluded and why -- an excluded domain must be visible in the artifact, never a
-    silent gap in the results table.
-    """
-    if not _is_lodo(holdouts):
-        return []
-    min_n = int(holdouts.get("min_target_n", 10))
-    allow_one_class = bool(holdouts.get("allow_one_class_target", True))
-    rows: list[dict[str, Any]] = []
-    for domain in _valid_domains(groups):
-        n = _domain_size(groups, {domain})
-        n_classes = _domain_classes(y, groups, {domain})
-        excluded: list[str] = []
-        if n < min_n:
-            excluded.append(f"n<{min_n}")
-        if n_classes < 2 and not allow_one_class:
-            excluded.append("one_class")
-        rows.append({
-            "domain": domain,
-            "n": n,
-            "n_classes": n_classes,
-            "one_class": n_classes < 2,
-            "valid_target": not excluded,
-            # a one-class domain cannot calibrate a decision threshold, so it cannot be the
-            # validation region even when it is a perfectly valid target
-            "valid_val": n_classes >= 2 and n >= min_n,
-            "excluded_because": excluded,
-            "metrics_excluded": ["auc"] if n_classes < 2 else [],
-        })
-    return rows
-
-
-def expected_domains(y: np.ndarray, groups: np.ndarray, holdouts: Any) -> list[str] | None:
-    """Domains this regime DECLARES it will produce a fold for (None => check not applicable).
-
-    Compared against what actually got yielded, so a declared-valid domain that vanishes is a
-    hard failure rather than a missing row someone notices later.
-    """
-    if not _is_lodo(holdouts):
-        return None
-    return [r["domain"] for r in domain_census(y, groups, holdouts) if r["valid_target"]]
-
-
-def _source_diag_indices(y: np.ndarray, train: np.ndarray, seed: int):
-    train = np.asarray(train, dtype=np.int64)
-    if len(train) < 10 or len(np.unique(y[train])) < 2:
-        return np.sort(train), np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
-    try:
-        train_val, source_test = train_test_split(train, test_size=0.10, random_state=seed + 101, stratify=y[train])
-        source_train, source_val = train_test_split(
-            train_val, test_size=0.1111111111, random_state=seed + 102, stratify=y[train_val]
-        )
-    except ValueError:
-        emit_split_audit_event("stratification_fallback", where="_source_diag_indices", stage="source_diag")
-        train_val, source_test = train_test_split(train, test_size=0.10, random_state=seed + 101)
-        source_train, source_val = train_test_split(train_val, test_size=0.1111111111, random_state=seed + 102)
-    if len(source_train) == 0 or len(np.unique(y[source_train])) < 2:
-        return np.sort(train), np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
-    return np.sort(source_train), np.sort(source_val), np.sort(source_test)
-
-
-def _source_diag_patches(patches: list[int] | np.ndarray, seed: int, patch_classes: dict | None = None):
-    patches = np.asarray(sorted(map(int, patches)), dtype=np.int64)
-    if len(patches) < 10:
-        return set(map(int, patches)), None, None
-    train_val, source_test = train_test_split(patches, test_size=0.10, random_state=seed + 101)
-    source_train, source_val = train_test_split(train_val, test_size=0.1111111111, random_state=seed + 102)
-    if patch_classes is not None:
-        if not len(source_train) or len(set().union(*(patch_classes.get(p, set()) for p in source_train))) < 2:
-            return set(map(int, patches)), None, None
-    return set(map(int, source_train)), set(map(int, source_val)), set(map(int, source_test))
-
-
-def _spatial_partitions(y: np.ndarray, groups: np.ndarray, *, val_frac: float, test_frac: float):
-    domains = _valid_domains(groups)
-    if len(domains) < 3:
-        raise ValueError("spatial-block split needs at least three valid blocks")
-    ranked = sorted(
-        domains,
-        key=lambda d: hashlib.sha256(d.encode()).hexdigest(),
-    )
-
-    valid_n = int(np.isin(np.asarray(groups).astype(str), domains).sum())
-    test_target = max(1, int(round(test_frac * valid_n)))
-    val_target = max(1, int(round(val_frac * valid_n)))
-
-    def pick(used: set[str], target_n: int) -> set[str]:
-        picked: set[str] = set()
-        for domain in ranked:
-            if domain in used:
-                continue
-            picked.add(domain)
-            if _domain_size(groups, picked) >= target_n and _domain_classes(y, groups, picked) >= 2:
-                return picked
-        raise ValueError("spatial-block split cannot build a two-class validation/test partition")
-
-    test = pick(set(), test_target)
-    val = pick(test, val_target)
-    train = set(domains) - val - test
-    return train, val, test
-
-
-def _fixed_partitions(groups: np.ndarray, spec: dict[str, Any]):
-    train = {str(v) for v in spec["train"]}
-    val = {str(v) for v in spec["val"]}
-    test = {str(v) for v in spec["test"]}
-    missing = (train | val | test) - set(_valid_domains(groups))
-    if missing:
-        raise ValueError(f"fixed geographic split references absent domain(s): {sorted(missing)}")
-    if train & val or train & test or val & test:
-        raise ValueError("fixed geographic split train/val/test domains must be disjoint")
-    return train, val, test
-
-
-def _purge_train_near_ood(train: np.ndarray, val: np.ndarray, test: np.ndarray, bench, radius_km: float) -> np.ndarray:
-    if radius_km <= 0 or bench is None or not hasattr(bench, "latlon"):
-        return train
-    latlon = np.asarray(bench.latlon, dtype=float)
-    if latlon.ndim != 2 or latlon.shape[1] != 2:
-        return train
-    ref = np.concatenate([val, test])
-    ref_valid = ref[np.isfinite(latlon[ref]).all(axis=1)]
-    train_valid_mask = np.isfinite(latlon[train]).all(axis=1)
-    if len(ref_valid) == 0 or not train_valid_mask.any():
-        return train
-    tree = BallTree(np.deg2rad(latlon[ref_valid]), metric="haversine")
-    dist = tree.query(np.deg2rad(latlon[train[train_valid_mask]]), k=1, return_distance=True)[0].ravel()
-    keep_valid = dist > (radius_km / EARTH_RADIUS_KM)
-    keep = np.ones(len(train), dtype=bool)
-    keep[np.flatnonzero(train_valid_mask)] = keep_valid
-    purged = np.asarray(train)[~keep]
+def _purge(source: np.ndarray, target: np.ndarray, latlon: np.ndarray | None, radius_km: float, *, where: str):
+    """Remove every source item within ``radius_km`` of ANY target item (haversine). Records exactly
+    which items were purged so the artifact builder can attach a PROVEN ``purged_near_ood`` reason."""
+    source = np.asarray(source, dtype=np.int64)
+    if radius_km <= 0 or latlon is None or len(source) == 0 or len(target) == 0:
+        return np.sort(source)
+    tgt_valid = np.asarray(target)[np.isfinite(latlon[target]).all(axis=1)]
+    src_valid_mask = np.isfinite(latlon[source]).all(axis=1)
+    if len(tgt_valid) == 0 or not src_valid_mask.any():
+        return np.sort(source)
+    tree = BallTree(np.deg2rad(latlon[tgt_valid]), metric="haversine")
+    dist = tree.query(np.deg2rad(latlon[source[src_valid_mask]]), k=1, return_distance=True)[0].ravel()
+    keep = np.ones(len(source), dtype=bool)
+    keep[np.flatnonzero(src_valid_mask)] = dist > (radius_km / EARTH_RADIUS_KM)
+    purged = source[~keep]
     if len(purged):
-        # Behavior-neutral: record exactly which training rows the (unchanged) purge removed and
-        # why, so preprocessing can attach a PROVEN exclusion reason instead of guessing.
         emit_split_audit_event(
-            "purge",
-            where="_purge_train_near_ood",
-            reference="val_test",
-            radius_km=float(radius_km),
-            n_purged=int(len(purged)),
-            purged_train_indices=[int(i) for i in purged.tolist()],
+            "purge", where=where, reference="target", radius_km=float(radius_km),
+            n_purged=int(len(purged)), purged_indices=[int(i) for i in purged.tolist()],
         )
-    return np.sort(train[keep])
+    return np.sort(source[keep])
 
 
-def _split_from_domain_sets(y, groups, train_domains, val_domains, test_domains, *, label, bench, purge_km, seed):
-    train = _idx_for(groups, train_domains)
-    val = _idx_for(groups, val_domains)
-    test = _idx_for(groups, test_domains)
-    train = _purge_train_near_ood(train, val, test, bench, purge_km)
-    _check_split(y, train, val, test, label)
-    train, source_val, source_test = _source_diag_indices(y, train, seed)
-    return Split(label, train, np.sort(test), np.sort(val), source_val, source_test)
-
-
-def make_strict_holdout_splits(
-    y: np.ndarray,
-    groups: np.ndarray,
-    heldout_group: str,
-    seed: int,
-    val_group: str | None = None,
-    require_domain_val: bool = False,
-    *,
-    allow_one_class_test: bool = False,
-    val_pool: list[str] | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    idx = np.arange(len(y))
-    groups_s = np.asarray(groups).astype(str)
-    heldout_group = str(heldout_group)
-    test = idx[groups_s == heldout_group]
-    if len(test) == 0:
-        raise ValueError(f"No samples found for strict holdout group: {heldout_group}")
-    if not allow_one_class_test and len(np.unique(y[test])) < 2:
-        raise ValueError(f"Strict holdout group is one-class: {heldout_group}")
-    if val_group is not None and np.any(groups_s == str(val_group)) and str(val_group) != heldout_group:
-        val_group = str(val_group)
-        val = idx[groups_s == val_group]
-        train = idx[(groups_s != heldout_group) & (groups_s != val_group)]
-        train_val = idx[groups_s != heldout_group]
-        _check_split(
-            y, train, val, test, f"{val_group}->{heldout_group}", allow_one_class_test=allow_one_class_test
+def _require_finite_coords(rows, latlon: np.ndarray | None, *, benchmark: str, target: str, kind: str) -> None:
+    """Fail closed: every ASSIGNED source/target item MUST have finite coordinates. The purge is
+    load-bearing for the holdout's meaning, so a missing coordinate is a hard generation error (with
+    benchmark/target context) -- an item lacking a valid coordinate is never silently retained,
+    dropped, or skipped."""
+    if latlon is None:
+        raise ValueError(
+            f"{benchmark}/{NAME} target {target!r}: {kind} requires geographic coordinates, "
+            f"but the benchmark provides none -- refuse to build (the source-target purge cannot run)"
         )
-        return np.sort(train), np.sort(val), np.sort(test), np.sort(train_val)
-    if require_domain_val:
-        domains = _valid_domains(groups_s)
-        start = domains.index(heldout_group)
-        # Deterministic alphabetical rotation: the validation region is a property of the split,
-        # not of the seed, so every seed and model sees the identical fold.
-        rotated = domains[start + 1:] + domains[:start]
-        allowed = set(val_pool) if val_pool is not None else set(domains)
-        candidates = [d for d in rotated if d in allowed and d != heldout_group]
-        for candidate in candidates:
-            val = idx[groups_s == candidate]
-            train = idx[(groups_s != heldout_group) & (groups_s != candidate)]
-            try:
-                _check_split(
-                    y, train, val, test, f"{candidate}->{heldout_group}",
-                    allow_one_class_test=allow_one_class_test,
-                )
-            except ValueError:
-                continue
-            train_val = idx[groups_s != heldout_group]
-            return np.sort(train), np.sort(val), np.sort(test), np.sort(train_val)
-        raise ValueError(f"No valid whole-domain validation group found for holdout: {heldout_group}")
-    train_val = idx[groups_s != heldout_group]
-    if len(np.unique(y[train_val])) < 2:
-        raise ValueError(f"Strict holdout training pool is one-class after excluding: {heldout_group}")
-    try:
-        train, val = train_test_split(train_val, test_size=0.10, random_state=seed, stratify=y[train_val])
-    except ValueError:
-        emit_split_audit_event(
-            "stratification_fallback", where="make_strict_holdout_splits", stage="train_vs_val",
-            holdout=str(heldout_group),
+    rows = np.asarray(rows, dtype=np.int64)
+    if len(rows) == 0:
+        return
+    bad = rows[~np.isfinite(latlon[rows]).all(axis=1)]
+    if len(bad):
+        raise ValueError(
+            f"{benchmark}/{NAME} target {target!r}: {len(bad)} {kind} item(s) have non-finite "
+            f"coordinates (first at index {int(bad[0])}); the purge cannot verify their distance to "
+            f"the target region -- refuse to build"
         )
-        train, val = train_test_split(train_val, test_size=0.10, random_state=seed, stratify=None)
-    return np.sort(train), np.sort(val), np.sort(test), np.sort(train_val)
 
 
-def _iter_lodo_splits(y, groups, *, seed, holdouts, bench, purge_km):
-    """Leave-one-domain-out over the full canonical domain census.
+def _source_sizes(n: int) -> list[tuple[str, int]]:
+    train, val, test = split_spec.source_partition_sizes(n)
+    return [("source_train", train), ("source_val", val), ("source_test", test)]
 
-    One fold per declared-valid domain: that domain is the target, one different valid whole
-    domain is the validation region, and every remaining domain is the source training pool.
-    Each fold is isolated -- a fold that cannot be built is reported and skipped here, and the
-    completeness check in regimes.base then fails the run because the domain was declared valid.
-    """
-    purge_km = float(holdouts.get("purge_km", purge_km))
-    allow_one_class = bool(holdouts.get("allow_one_class_target", True))
-    census = domain_census(y, groups, holdouts)
-    bench_name = str(getattr(bench, "name", "?"))
-    seen = {(r["benchmark"], r["domain"]) for r in DOMAIN_CENSUS if r["regime"] == NAME}
-    for row in census:
-        if (bench_name, row["domain"]) not in seen:
-            DOMAIN_CENSUS.append({"benchmark": bench_name, "regime": NAME, **row})
 
-    val_pool = [r["domain"] for r in census if r["valid_val"]]
-    for row in census:
-        domain = row["domain"]
-        if not row["valid_target"]:
-            emit_split_audit_event(
-                "dropped_holdout", regime=NAME, holdout=str(domain), reason="ineligible_target",
-                excluded_because=list(row["excluded_because"]), n=int(row["n"]), n_classes=int(row["n_classes"]),
-            )
-            print(
-                f"   !! geographic_ood: domain {domain!r} (n={row['n']}, "
-                f"{row['n_classes']} class(es)) is not an eligible target: "
-                f"{row['excluded_because']}",
-                flush=True,
+# --------------------------------------------------------------------------- #
+# Tabular LODO
+# --------------------------------------------------------------------------- #
+def iter_source_target_splits(bench, bench_mod, seed: int) -> Iterator[SourceTargetSplit]:
+    spec = _spec(bench_mod)
+    benchmark = bench_mod.BENCHMARK
+    groups = np.asarray(sample_domains(bench, bench_mod), dtype=object).astype(str)
+    y = np.asarray(bench_mod.make_targets(bench)[0])
+    latlon = _latlon(getattr(bench, "latlon", None))
+    present = set(groups.tolist())
+
+    for target in _target_rotation(spec):
+        if target not in present:
+            emit_split_audit_event("dropped_holdout", regime=NAME, holdout=target, reason="absent_from_data")
+            continue
+        target_rows = np.flatnonzero(groups == target)
+        # the COMPLETE eligible non-target population is the source (unknown/nan domains excluded)
+        source_rows = np.flatnonzero((groups != target) & ~np.isin(groups, _UNKNOWN))
+        # fail closed: every assigned source/target item must have a valid coordinate before the purge
+        _require_finite_coords(target_rows, latlon, benchmark=benchmark, target=target, kind="target")
+        _require_finite_coords(source_rows, latlon, benchmark=benchmark, target=target, kind="source")
+        # purge the whole source against the ENTIRE target FIRST, then partition
+        source_rows = _purge(source_rows, target_rows, latlon, spec.purge_km, where=NAME)
+        if len(source_rows) == 0:
+            emit_split_audit_event("dropped_holdout", regime=NAME, holdout=target, reason="empty_source_after_purge")
+            continue
+
+        src = partition.partition_source(
+            [str(c) for c in y[source_rows].tolist()],
+            [str(g) for g in groups[source_rows].tolist()],
+            _source_sizes(len(source_rows)), int(seed),
+        )
+        source_train = np.sort(source_rows[src["source_train"]])
+        source_val = np.sort(source_rows[src["source_val"]])
+        source_test = np.sort(source_rows[src["source_test"]])
+
+        n_target_classes = int(len(np.unique(y[target_rows])))
+        # one-class regions (and the declared supplementary stress units) get NO target-label route:
+        # zero-shot SUPPLEMENTARY STRESS only -- target_label_pool empty, supports_target_labels=False,
+        # and target_role marks them so headline equal-region aggregation excludes them.
+        if target in spec.supplementary_targets or n_target_classes < 2:
+            yield SourceTargetSplit(
+                label=target, source_train=source_train, source_val=source_val, source_test=source_test,
+                target_label_pool=np.empty(0, dtype=np.int64), target_test=np.sort(target_rows),
+                domain=target, has_target=True, supports_target_labels=False, group_kind=GROUP_KIND,
+                target_role=TARGET_ROLE_SUPPLEMENTARY_STRESS,
             )
             continue
-        try:
-            train, val, test, _train_val = make_strict_holdout_splits(
-                y, groups, domain, seed,
-                require_domain_val=True,
-                allow_one_class_test=allow_one_class,
-                val_pool=val_pool,
-            )
-            train = _purge_train_near_ood(train, val, test, bench, purge_km)
-            _check_split(y, train, val, test, str(domain), allow_one_class_test=allow_one_class)
-            train, source_val, source_test = _source_diag_indices(y, train, seed)
-        except ValueError as exc:
-            emit_split_audit_event(
-                "dropped_holdout", regime=NAME, holdout=str(domain), reason=str(exc), stage="lodo_fold",
-            )
-            print(f"   !! geographic_ood: LODO fold {domain!r} dropped ({exc})", flush=True)
-            continue
-        yield Split(str(domain), train, np.sort(test), np.sort(val), source_val, source_test, domain=str(domain))
 
-
-def iter_splits(y, groups, *, seed, holdouts, n_folds=None, val_group=None, bench=None, **_):
-    del n_folds, val_group
-    mod = _bench_mod(bench) if bench is not None else None
-    purge_km = float(getattr(mod, "GEOGRAPHIC_PURGE_KM", 0.0)) if mod is not None else 0.0
-    if _is_lodo(holdouts):
-        yield from _iter_lodo_splits(y, groups, seed=seed, holdouts=holdouts, bench=bench, purge_km=purge_km)
-        return
-    try:
-        if isinstance(holdouts, dict) and holdouts.get("strategy") == "spatial_blocks":
-            purge_km = float(holdouts.get("purge_km", purge_km))
-            train_d, val_d, test_d = _spatial_partitions(
-                y,
-                groups,
-                val_frac=float(holdouts.get("val_fraction", 0.10)),
-                test_frac=float(holdouts.get("test_fraction", 0.20)),
-            )
-            yield _split_from_domain_sets(
-                y,
-                groups,
-                train_d,
-                val_d,
-                test_d,
-                label=str(holdouts.get("label", "spatial_blocks")),
-                bench=bench,
-                purge_km=purge_km,
-                seed=seed,
-            )
-            return
-        if isinstance(holdouts, dict):
-            purge_km = float(holdouts.get("purge_km", purge_km))
-            train_d, val_d, test_d = _fixed_partitions(groups, holdouts)
-            yield _split_from_domain_sets(
-                y,
-                groups,
-                train_d,
-                val_d,
-                test_d,
-                label=str(holdouts.get("label", "fixed_geography")),
-                bench=bench,
-                purge_km=purge_km,
-                seed=seed,
-            )
-            return
-    except ValueError as exc:
-        emit_split_audit_event("dropped_split", regime=NAME, reason=str(exc), stage="strategy_split")
-        print(f"   !! geographic_ood: split dropped ({exc})", flush=True)
-        return
-    for holdout in holdouts:
-        try:
-            train, val, test, _train_val = make_strict_holdout_splits(
-                y, groups, holdout, seed, require_domain_val=True
-            )
-            train = _purge_train_near_ood(train, val, test, bench, purge_km)
-            _check_split(y, train, val, test, str(holdout))
-            train, source_val, source_test = _source_diag_indices(y, train, seed)
-        except ValueError as exc:
-            emit_split_audit_event(
-                "dropped_holdout", regime=NAME, holdout=str(holdout), reason=str(exc), stage="curated_holdout",
-            )
-            print(f"   !! geographic_ood: holdout {holdout!r} dropped ({exc})", flush=True)
-            continue
-        yield Split(str(holdout), train, test, val, source_val, source_test)
-
-
-def iter_fold_splits(bench_mod):
-    split = getattr(bench_mod, "GEOGRAPHIC_FOLD_SPLIT", None)
-    if split is not None:
-        yield (
-            str(split.get("label", "fixed_folds")),
-            set(split["train"]),
-            set(split["val"]),
-            set(split["test"]),
+        pool_n, test_n = split_spec.target_partition_sizes(len(target_rows))
+        tgt = partition.partition_target([str(c) for c in y[target_rows].tolist()], pool_n, test_n, int(seed))
+        yield SourceTargetSplit(
+            label=target, source_train=source_train, source_val=source_val, source_test=source_test,
+            target_label_pool=np.sort(target_rows[tgt["target_label_pool"]]),
+            target_test=np.sort(target_rows[tgt["target_test"]]),
+            domain=target, has_target=True, supports_target_labels=True, group_kind=GROUP_KIND,
+            target_role=TARGET_ROLE_HEADLINE,
         )
-        return
-    all_folds = sorted(set(bench_mod.TRAIN_FOLDS) | set(bench_mod.VAL_FOLDS) | set(bench_mod.TEST_FOLDS))
-    for i, test_fold in enumerate(all_folds):
-        val_fold = all_folds[(i + 1) % len(all_folds)]
-        train_folds = {f for f in all_folds if f not in (test_fold, val_fold)}
-        yield (f"fold_{test_fold}", train_folds, {val_fold}, {test_fold})
 
 
-def iter_dense_splits(bench_mod, *, emb_dir, seed, bench=None):
-    for label, train_folds, val_folds, test_folds in iter_fold_splits(bench_mod):
-        patch_classes = getattr(bench, "patch_classes", None) if bench is not None else None
-        # Cache-free seam: emb_dir=None sources the patch universe from the benchmark descriptor.
-        # patch_classes stays as-is (currently None) so behavior is unchanged either way.
-        if emb_dir is None:
-            if bench is None:
-                raise ValueError("cache-free dense split needs the benchmark object (bench=...)")
-            fold_patches = bench.patch_ids(set(train_folds))
-        else:
-            fold_patches = cacheutils.dense_fold_patches(emb_dir, set(train_folds))
-        train_patches, source_val, source_test = _source_diag_patches(
-            fold_patches,
-            seed,
-            patch_classes=patch_classes,
+# --------------------------------------------------------------------------- #
+# Dense (PASTIS) LODO over Sentinel tiles -- patch-level multilabel
+# --------------------------------------------------------------------------- #
+def iter_dense_source_target_splits(bench, bench_mod, seed: int) -> Iterator[DenseSourceTargetSplit]:
+    spec = _spec(bench_mod)
+    benchmark = bench_mod.BENCHMARK
+    all_patches = [int(p) for p in bench.patch_ids(None)]
+    tile_of = {int(pid): str(tile) for pid, tile in bench.patch_tiles.items()}
+    class_sets = bench.patch_class_sets(all_patches)
+    patch_latlon = bench.patch_latlon
+    pids_arr = np.asarray(all_patches, dtype=np.int64)
+    # a patch missing coordinates becomes (nan, nan) so the fail-closed check below catches it
+    latlon = _latlon([patch_latlon.get(p, (np.nan, np.nan)) for p in all_patches])
+    pos = {p: i for i, p in enumerate(all_patches)}  # patch id -> row in latlon
+    present = {tile_of[p] for p in all_patches}
+
+    for tile in (str(t) for t in spec.geographic_targets):
+        if tile not in present:
+            emit_split_audit_event("dropped_holdout", regime=NAME, holdout=tile, reason="absent_from_data")
+            continue
+        target_patches = [p for p in all_patches if tile_of[p] == tile]
+        source_patches = [p for p in all_patches if tile_of[p] != tile and tile_of[p] not in _UNKNOWN]
+        tgt_rows = np.asarray([pos[p] for p in target_patches], dtype=np.int64)
+        src_rows = np.asarray([pos[p] for p in source_patches], dtype=np.int64)
+        # fail closed: every assigned source/target patch must have a valid centroid before the purge
+        _require_finite_coords(tgt_rows, latlon, benchmark=benchmark, target=tile, kind="target patch")
+        _require_finite_coords(src_rows, latlon, benchmark=benchmark, target=tile, kind="source patch")
+        # purge source PATCHES against the entire target tile (patch-centroid haversine), then partition
+        kept_rows = _purge(src_rows, tgt_rows, latlon, spec.purge_km, where=NAME)
+        source_patches = [int(pids_arr[r]) for r in kept_rows.tolist()]
+        if not source_patches:
+            emit_split_audit_event("dropped_holdout", regime=NAME, holdout=tile, reason="empty_source_after_purge")
+            continue
+
+        src = partition.multilabel_assign(
+            [sorted(class_sets.get(p, set())) for p in source_patches], _source_sizes(len(source_patches)), int(seed),
         )
-        yield DenseSplit(
-            str(label),
-            set(train_folds),
-            set(val_folds),
-            set(test_folds),
-            train_patches=train_patches,
-            source_val_patches=source_val,
-            source_test_patches=source_test,
-            has_target=HAS_TARGET,
-            group_kind=GROUP_KIND,
+        pool_n, test_n = split_spec.target_partition_sizes(len(target_patches))
+        tgt = partition.multilabel_assign(
+            [sorted(class_sets.get(p, set())) for p in target_patches],
+            [("target_label_pool", pool_n), ("target_test", test_n)], int(seed),
+        )
+
+        def pset(idx, base):  # noqa: ANN001 -- map partitioner indices back to patch ids
+            return frozenset(base[i] for i in idx.tolist())
+
+        yield DenseSourceTargetSplit(
+            label=tile,
+            source_train_patches=pset(src["source_train"], source_patches),
+            source_val_patches=pset(src["source_val"], source_patches),
+            source_test_patches=pset(src["source_test"], source_patches),
+            target_label_pool_patches=pset(tgt["target_label_pool"], target_patches),
+            target_test_patches=pset(tgt["target_test"], target_patches),
+            has_target=True, supports_target_labels=True, group_kind=GROUP_KIND,
+            target_role=TARGET_ROLE_HEADLINE,  # every Sentinel tile is a headline multiclass target
         )

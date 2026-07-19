@@ -26,23 +26,30 @@ from dataio.get_input import (
     _select_files,
     _synthetic_month_doy,
 )
+from evals import split_spec
 
 BENCHMARK = "cropharvest"
 LABEL_KIND = "binary"
 HOLDOUTS = ["kenya", "togo", "ethiopia", "lem-brazil", "rwanda"]
-OFFICIAL_HOLDOUTS = ["kenya", "lem-brazil", "togo"]
+#: The official CropHarvest split is Togo ONLY: the released is_crop task does not reproduce the
+#: Kenya maize / Brazil coffee release evaluations, so those are NOT official holdouts.
+OFFICIAL_HOLDOUTS = ["togo"]
+#: Official Togo split provenance (the un-merged source-collection names the canonical region
+#: collapses): the ``togo`` source pool (1,272) subdivided per seed vs the fixed ``togo-eval`` target
+#: evaluation (306). Consumed by the official regime; distinct from the canonical geographic region.
+OFFICIAL_PROVENANCE = {"source": "togo", "target": "togo-eval"}
 #: Basis for the retired ``spatial_blocks`` strategy only -- see spatial_block_domains().
 GEOGRAPHIC_BLOCK_DEGREES = 2.0
 GEOGRAPHIC_SPLIT = {
-    # Leave-one-domain-out over the FULL canonical domain census (18 domains), not a curated
-    # subset: `HOLDOUTS` above covers only 10,405 of 67,693 samples (15%) and omits the five
-    # largest domains entirely, so it cannot support a claim about geographic robustness.
+    # Leave-one-domain-out over the FULL canonical domain census (17 canonical regions after the
+    # Mali merge), not a curated subset: `HOLDOUTS` above covers only ~15% of samples and omits the
+    # five largest domains entirely, so it cannot support a claim about geographic robustness.
     "strategy": "leave_one_domain_out",
     "label": "lodo_canonical_purge50km",
     "purge_km": 50.0,
     # Validity is declared HERE, before any model runs (see geographic_ood.domain_census):
     #   target -- any domain with >= min_target_n samples. One-class domains are REAL deployment
-    #     regions (central-asia, mali, mali-non-crop, tanzania, uganda, zimbabwe) and are kept;
+    #     regions (central-asia, tanzania, uganda, zimbabwe) and are kept;
     #     they are excluded only from metrics that mathematically require both classes, which
     #     score_binary already handles by returning auc=nan while accuracy / balanced_accuracy /
     #     calibration and the test_pos_rate class-conditional diagnostic stay well defined.
@@ -51,13 +58,8 @@ GEOGRAPHIC_SPLIT = {
     "min_target_n": 10,
     "allow_one_class_target": True,
 }
-SPATIAL_CLUSTER_SPLIT = {
-    "label": "spatial_cluster_purge50km",
-    "n_clusters": 12,
-    "val_fraction": 0.10,
-    "test_fraction": 0.20,
-    "purge_km": 50.0,
-}
+# spatial_cluster_ood: coordinate-only spherical-K-means cells (5 cells, purge_km from split_spec);
+# no benchmark-specific override -- see evals.regimes.spatial_cluster_ood / evals.split_spec.
 SPLIT_REGIMES = ["random_id", "official", "geographic_ood", "spatial_cluster_ood"]
 
 # --- Raw array band layout --------------------------------------------------
@@ -106,30 +108,40 @@ def _load_ch_labels(labels_geojson: Path) -> dict[tuple[int, str], tuple[int, fl
     return out
 
 
-def _ch_geo_group(dataset: str) -> str:
-    name = str(dataset).lower()
-    if "togo" in name:
-        return "togo"
-    if "brazil" in name:
-        return "lem-brazil"
-    if "kenya" in name:
-        return "kenya"
-    if "rwanda" in name:
-        return "rwanda"
-    return name
+#: THE canonical-region mapper (provenance -> region). The merge rules live once in
+#: ``split_spec.CROPHARVEST_REGION_MERGES``; this module holds no rules of its own. ``bench.groups``
+#: is built from this.
+canonical_region = split_spec.cropharvest_canonical_region
+_ch_geo_group = canonical_region  # internal alias (loader + geographic_domains)
+
+
+def provenance_dataset(sample_id: str) -> str:
+    """Original source-collection provenance (22 datasets) recovered from a stable sample id.
+
+    Stable ids are ``<index>_<dataset>.h5``; the official Togo split needs the un-merged provenance
+    (Togo source vs Togo-eval), which the canonical region collapses. Recovering it from the id
+    keeps a single source of truth and needs no extra benchmark field.
+    """
+    stem = str(sample_id)
+    if stem.endswith(".h5"):
+        stem = stem[:-3]
+    return stem.split("_", 1)[1] if "_" in stem else stem
+
+
+def provenance_groups(bench) -> np.ndarray:
+    """Per-sample provenance dataset (22) -- the basis for the official Togo split, not geography."""
+    return np.asarray([provenance_dataset(s) for s in bench.sample_ids], dtype=object)
 
 
 def spatial_block_domains(bench) -> np.ndarray:
     """The PRE-LODO domain basis: 2-degree lat/lon blocks.
 
-    Retained solely so the ``spatial_block_2deg_purge50km`` artifacts stay reproducible: 20
-    result files across five runs were produced on this basis, four of them in the canonical
-    ``output-erm-full-20260711`` tree the paper currently cites. The ``spatial_blocks`` strategy
-    is meaningless on any other basis -- it hash-ranks domains to assemble val/test partitions
-    by sample fraction, which only reconstructs the historical split when the domains are these
-    blocks. ``geographic_ood.assign_domains`` therefore selects the basis FROM THE STRATEGY;
-    never let a ``spatial_blocks`` split read canonical domains, or it will emit the historical
-    label over a different partition.
+    Retained solely so the frozen ``spatial_block_2deg_purge50km`` result artifacts stay
+    reproducible: 20 result files across five runs were produced on this basis, four of them in the
+    canonical ``output-erm-full-20260711`` tree the paper currently cites. It is NOT consumed by any
+    current split regime -- schema-v2 ``geographic_ood`` is true region/tile LODO and
+    ``spatial_cluster_ood`` is coordinate-only spherical-K-means cells -- and only the no-coordinate
+    edge case is pinned (test_tasks.test_cropharvest_retains_the_block_basis_for_historical_artifacts).
     """
     latlon = np.asarray(bench.latlon, dtype=float)
     out = np.full(len(latlon), "unknown", dtype=object)
@@ -173,7 +185,12 @@ def load_benchmark(
         raise FileNotFoundError(f"CropHarvest labels not found: {labels_geojson}")
 
     label_map = _load_ch_labels(labels_geojson)
-    files = _select_files([p for p in arrays_dir.glob("*.h5") if p.is_file()], shuffle, seed, None)
+    excluded = set(split_spec.CROPHARVEST_EXCLUDED_FILES)
+    all_h5 = [p for p in arrays_dir.glob("*.h5") if p.is_file()]
+    # A frozen, verified-malformed exclusion is NOT an unexpected corruption: record it in
+    # data_quality separately and never let it trip the STRICT_MODE skipped-inputs failure below.
+    frozen_excluded = sorted(p.name for p in all_h5 if p.name in excluded)
+    files = _select_files([p for p in all_h5 if p.name not in excluded], shuffle, seed, None)
 
     s2_series, s1_series, clim_series = [], [], []
     labels, groups, latlons, years, sample_ids = [], [], [], [], []
@@ -218,6 +235,15 @@ def load_benchmark(
     if not s2_series:
         raise ValueError(f"No valid CropHarvest arrays parsed from {arrays_dir}")
 
+    data_quality: dict = {}
+    if skipped_records:
+        data_quality["skipped_inputs"] = skipped_records
+    if frozen_excluded:
+        data_quality["frozen_exclusions"] = [
+            {"file": name, "reason": "verified malformed; frozen exclusion applied before all regimes"}
+            for name in frozen_excluded
+        ]
+
     n = len(s2_series)
     # Shared per-step calendar months / day-of-year (identical for every sample); per-sample years.
     doy_vals = _synthetic_month_doy(12)[CH_MONTHS].astype(np.float32)
@@ -238,7 +264,7 @@ def load_benchmark(
         latlon=np.asarray(latlons, dtype=np.float32),
         years=np.asarray(years, dtype=np.int64),
         sample_ids=np.asarray(sample_ids, dtype=object),
-        data_quality={"skipped_inputs": skipped_records} if skipped_records else {},
+        data_quality=data_quality,
         monthly_order=CH_MONTHS,
     )
 

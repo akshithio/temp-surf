@@ -229,6 +229,8 @@ def run_probes_target(
     x_val: np.ndarray | None = None,
     y_val: np.ndarray | None = None,
     family: str = "logistic",
+    pool_idx: np.ndarray | None = None,
+    test_idx: np.ndarray | None = None,
 ) -> None:
     """Run binary target-budget probes."""
 
@@ -257,7 +259,7 @@ def run_probes_target(
         budgets=budgets, meta=meta, stratify=True, groups_source=groups_source,
         predictions=predictions, sample_ids_target=sample_ids_target, groups_target=groups_target,
         x_val=x_val, y_val=y_val, target_id_budget=TARGET_ID_UPPER_BOUND,
-        family=family,
+        family=family, pool_idx=pool_idx, test_idx=test_idx,
     )
 
 
@@ -322,6 +324,8 @@ def run_probes_multiclass_target(
     x_val: np.ndarray | None = None,
     y_val: np.ndarray | None = None,
     family: str = "logistic",
+    pool_idx: np.ndarray | None = None,
+    test_idx: np.ndarray | None = None,
 ) -> None:
     """Run multiclass target-budget probes."""
 
@@ -344,7 +348,7 @@ def run_probes_multiclass_target(
         budgets=budgets, meta=meta, stratify=True, groups_source=groups_source,
         predictions=predictions, sample_ids_target=sample_ids_target, groups_target=groups_target,
         x_val=x_val, y_val=y_val, target_id_budget=TARGET_ID_UPPER_BOUND,
-        family=family,
+        family=family, pool_idx=pool_idx, test_idx=test_idx,
     )
 
 
@@ -384,6 +388,8 @@ def run_probes_segmentation_target(
     meta: dict[str, Any] | None = None,
     family: str = "logistic",
     groups_source: np.ndarray | None = None,
+    pool_patches: Any = None,
+    target_test_patches: Any = None,
 ) -> None:
     bench = load_benchmark("pastis")
     bench.run_probes_segmentation_target(
@@ -391,6 +397,7 @@ def run_probes_segmentation_target(
         stream_target=stream_target, x_val=x_val, y_val=y_val, budgets=budgets,
         meta=meta, family=family, groups_source=groups_source,
         target_id_budget=TARGET_ID_UPPER_BOUND,
+        pool_patches=pool_patches, target_test_patches=target_test_patches,
     )
 
 # Pair-level execution

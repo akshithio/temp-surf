@@ -39,12 +39,11 @@ def build_run_manifest(
     budget_regimes,
     max_dense_pixels,
     write_predictions: bool = True,
-    consumed_splits: list[str] | None = None,
 ) -> dict:
     """A readable, exact-match final-run manifest. Records every result-affecting knob plus the
-    final commit, uv.lock digest, numerical-core deps, the embedding's recorded content digest
-    (artifact SHA for tabular, tile-set digest for dense), and the sorted canonical relative
-    consumed-split leaf paths (regime-partitions-only) that this run bound itself to."""
+    final commit, uv.lock digest, numerical-core deps, and the embedding's recorded content digest
+    (artifact SHA for tabular, tile-set digest for dense). Splits are consumed from the frozen
+    data/splits/ CSVs (discovered + checksum-verified via data/logs/splits.json), not bound here."""
     from evals import probes as _probes
 
     fi = cacheutils.frozen_run_identity()
@@ -71,15 +70,6 @@ def build_run_manifest(
         "write_predictions": bool(write_predictions),
         "enc": enc,
     }
-    # PHASE B: bind the consumed regime-level split leaf paths (canonical, relative) to resume
-    # identity. Because check_run_manifest does an exact field-by-field match, a run whose manifest
-    # LACKS this field is refused (not backfilled), and any added/removed/changed leaf path rejects
-    # resume unless overwrite is requested. No hashes -- the readable paths ARE the record.
-    if consumed_splits is not None:
-        manifest["consumed_splits"] = {
-            "scope": "regime_partitions_only",
-            "leaves": sorted({str(p) for p in consumed_splits}),
-        }
     return manifest
 
 
@@ -230,7 +220,8 @@ def _probe_cell_target(
     emb,
     train,
     val,
-    test,
+    target_pool,
+    target_test,
     y,
     groups,
     meta,
@@ -239,11 +230,20 @@ def _probe_cell_target(
     budgets=None,
     write_predictions: bool = True,
 ) -> tuple[list[dict], list[dict]]:
-    x_source_tr, x_target_full = emb[train], emb[test]
-    y_source_tr, y_target_full = y[train], y[test]
+    # schema v2: few-shot label budgets draw ONLY from the frozen target_label_pool and every budget
+    # is scored on the frozen target_test. The whole target region (pool ++ test) is assembled for the
+    # budget-0 "full" deployment anchor; pool_idx/test_idx mark the fixed split so labels are never
+    # drawn from target_test.
+    target_pool = np.asarray(target_pool, dtype=np.int64)
+    target_test = np.asarray(target_test, dtype=np.int64)
+    full = np.concatenate([target_pool, target_test])
+    x_source_tr = emb[train]
+    x_target_full, y_target_full = emb[full], y[full]
     g_source_tr = groups[train]
     x_val = emb[val] if len(val) else None
     y_val = y[val] if len(val) else None
+    pool_idx = np.arange(len(target_pool))
+    test_idx = np.arange(len(target_pool), len(full))
     mname = meta.get("method", "?")
     identity = {k: meta[k] for k in ("seed", "holdout", "method") if k in meta}
     rows: list[dict] = []
@@ -251,7 +251,7 @@ def _probe_cell_target(
     with perf.measure(
         f"probe.target/{meta.get('benchmark', '?')}/{mname}",
         n_samples_source=len(train),
-        n_samples_target=len(test),
+        n_samples_target=len(full),
         n_features=x_source_tr.shape[1],
     ):
         preds: list[dict] = []
@@ -259,17 +259,19 @@ def _probe_cell_target(
             rows,
             x_source_tr,
             x_target_full,
-            y_source_tr,
+            y[train],
             y_target_full,
             seed,
             meta=meta,
             groups_source=g_source_tr,
             predictions=preds if write_predictions else None,
-            sample_ids_target=np.asarray(test),
-            groups_target=np.asarray(groups)[test],
+            sample_ids_target=full,
+            groups_target=np.asarray(groups)[full],
             x_val=x_val,
             y_val=y_val,
             family=family,
+            pool_idx=pool_idx,
+            test_idx=test_idx,
             **({} if budgets is None else {"budgets": budgets}),
         )
     perf.set_identity(None)
@@ -286,66 +288,66 @@ def _run_segmentation_cell(
     target_budgets,
     max_dense_pixels,
     meta,
+    *,
+    all_folds,
 ) -> list[dict]:
+    """Run one dense probe cell against a schema-v2 :class:`DenseSourceTargetSplit`.
+
+    Allocation is patch-level: each partition is a set of patch IDs, streamed across every fold
+    directory (``all_folds``) and filtered by patch id -- folds are a cache-layout detail, never a
+    split unit. Routing follows the route capability:
+      * random_id (has_target=False): evaluate IN DISTRIBUTION on source_test;
+      * official (has_target=True, supports_target_labels=False): fit source_train, calibrate on
+        source_val, evaluate ZERO-SHOT on target_test -- no target-label access, no target sweep;
+      * geographic/spatial (supports_target_labels=True): the source budgets ALSO evaluate zero-shot
+        on target_test, AND the target budgets draw few-shot patches ONLY from target_label_pool and
+        are scored on the SAME target_test.
+    """
+    del bench_mod
     from evals import evals as EV
 
-    def sample_dense(folds, sample_seed, patch_ids=None):
-        return cacheutils.load_dense_samples(
-            emb_dir,
-            folds,
-            max_dense_pixels,
-            sample_seed,
-            patch_ids=patch_ids,
-        )
+    def sample_dense(patch_ids, sample_seed):
+        return cacheutils.load_dense_samples(emb_dir, all_folds, max_dense_pixels, sample_seed, patch_ids=set(patch_ids))
 
-    def stream_dense(folds, patch_ids=None):
-        return cacheutils.iter_dense_tiles(emb_dir, folds, patch_ids=patch_ids)
+    def stream_dense(patch_ids):
+        return cacheutils.iter_dense_tiles(emb_dir, all_folds, patch_ids=set(patch_ids))
 
+    train_patches = set(cfg.source_train_patches)
+    val_patches = set(cfg.source_val_patches)
+    # official/geographic (has_target) evaluate zero-shot on target_test; random_id on source_test.
+    test_patches = set(cfg.target_test_patches if cfg.has_target else cfg.source_test_patches)
     x_train, y_train, groups_train, _, _ = cacheutils.load_dense_samples(
-        emb_dir,
-        cfg.train_folds,
-        max_dense_pixels,
-        seed,
-        patch_ids=cfg.train_patches,
+        emb_dir, all_folds, max_dense_pixels, seed, patch_ids=train_patches
     )
-    x_val, y_val, _, _, _ = sample_dense(cfg.val_folds, seed + 10_000, cfg.val_patches)
+    x_val, y_val, _, _, _ = sample_dense(val_patches, seed + 10_000)
     eval_streams = {
-        "validation": lambda vf=cfg.val_folds, vp=cfg.val_patches: stream_dense(vf, vp),
-        "test": lambda tf=cfg.test_folds, tp=cfg.test_patches: stream_dense(tf, tp),
+        "validation": lambda vp=val_patches: stream_dense(vp),
+        "test": lambda tp=test_patches: stream_dense(tp),
     }
-    if cfg.source_val_patches and cfg.source_test_patches:
-        eval_streams["source_validation"] = lambda tf=cfg.train_folds, p=cfg.source_val_patches: stream_dense(tf, p)
-        eval_streams["source_test"] = lambda tf=cfg.train_folds, p=cfg.source_test_patches: stream_dense(tf, p)
+    # 80/10/10 within-source reference: source_test is streamed as an UNTOUCHED extra eval scope
+    # (never trained or tuned on) when the split carries one -- geographic/spatial.
+    source_test_patches = {int(p) for p in cfg.source_test_patches}
+    if cfg.has_target and source_test_patches:
+        eval_streams["source_test"] = lambda sp=source_test_patches: stream_dense(sp)
     rows: list[dict] = []
     EV.run_probes_segmentation(
-        rows,
-        x_train,
-        x_val,
-        y_train,
-        y_val,
-        seed,
-        eval_streams=eval_streams,
-        budgets=source_budgets,
-        meta=meta,
-        groups_train=groups_train,
-        family=family,
+        rows, x_train, x_val, y_train, y_val, seed,
+        eval_streams=eval_streams, budgets=source_budgets, meta=meta,
+        groups_train=groups_train, family=family,
     )
-    if cfg.has_target:
-        target_patch_ids = cfg.test_patches or set(cacheutils.dense_fold_patches(emb_dir, cfg.test_folds))
+    if cfg.has_target and cfg.supports_target_labels:
+        # target-budget sweep: few-shot patches drawn ONLY from target_label_pool, scored on the SAME
+        # target_test patches (never labels from target_test).
+        pool_patches = {int(p) for p in cfg.target_label_pool_patches}
+        target_test_patches = {int(p) for p in cfg.target_test_patches}
         EV.run_probes_segmentation_target(
-            rows,
-            x_train,
-            y_train,
-            seed,
-            target_patches=target_patch_ids,
-            sample_target=lambda pids, sd, tf=cfg.test_folds: sample_dense(tf, sd, pids),
-            stream_target=lambda pids, tf=cfg.test_folds: stream_dense(tf, pids),
-            x_val=x_val,
-            y_val=y_val,
-            budgets=target_budgets,
-            meta=meta,
-            family=family,
-            groups_source=groups_train,
+            rows, x_train, y_train, seed,
+            target_patches=pool_patches | target_test_patches,
+            pool_patches=pool_patches, target_test_patches=target_test_patches,
+            sample_target=lambda pids, sd: sample_dense(pids, sd),
+            stream_target=lambda pids: stream_dense(pids),
+            x_val=x_val, y_val=y_val, budgets=target_budgets, meta={**meta, "budget_type": "target"},
+            family=family, groups_source=groups_train,
         )
     return rows
 
@@ -391,16 +393,17 @@ def _run_segmentation_pair(
         raise ValueError(f"Unknown/unsupported split regimes for {benchmark_name}: {unsupported}. Supported: {supported}")
     regimes = [r for r in supported if r in split_regimes]
 
-    fold_configs_by_seed: dict[int, list[tuple[str, Any]]] = {}
-    consumed_leaves: list[str] = []
+    splits_by_seed: dict[int, list[Any]] = {}
+    patch_fold: dict[int, int] = {}
     if probing:
-        # patch_fold is the CURRENT benchmark patch->fold mapping, used both as the eligible patch set
-        # and for the fold-consistency check (every assigned patch must sit in its partition's declared
-        # fold set, else refuse).
+        # patch_fold / patch_tile are the CURRENT benchmark patch->fold and patch->tile mappings.
+        # patch_fold's keys are the eligible patch universe; its values (folds) are the cache-layout
+        # dirs a patch set is streamed from. patch_tile drives the geographic_ood structural check.
         splits_root = cacheutils.SCRATCH / "splits"
         patch_fold = {int(p.patch_id): int(p.fold) for p in getattr(bench, "patches", [])}
-        fold_configs_by_seed, consumed_leaves = split_artifacts.load_dense_splits(
-            splits_root, bench_mod.BENCHMARK, patch_fold, regimes, seeds
+        patch_tile = {int(k): v for k, v in getattr(bench, "patch_tiles", {}).items()}  # @property dict
+        splits_by_seed = split_artifacts.load_dense_splits(
+            splits_root, bench_mod.BENCHMARK, patch_fold, patch_tile, regimes, seeds
         )
 
     bench_for_emb = bench.s2_only() if s2_only else bench
@@ -429,7 +432,7 @@ def _run_segmentation_pair(
     manifest = build_run_manifest(
         model_name, benchmark_name, artifact, emb_digest, split_regimes, seeds, enc_kwargs,
         active_probes=active_probes, budget_regimes=budget_regimes, max_dense_pixels=max_dense_pixels,
-        write_predictions=write_predictions, consumed_splits=consumed_leaves,
+        write_predictions=write_predictions,
     )
     signature = run_manifest_digest(manifest)
     check_run_manifest(results_dir, manifest, overwrite_mode=overwrite_mode)
@@ -440,8 +443,8 @@ def _run_segmentation_pair(
             results_dir / "summary.csv",
             results_dir / "deltas.csv",
             results_dir / "data_quality.json",
-            results_dir / split_artifacts.SPLIT_REF_FILE,
-            results_dir / "split_manifest.json",   # legacy per-model artifact -- retired, remove on resume
+            results_dir / "split_ref.json",          # legacy per-model artifact -- retired, remove on resume
+            results_dir / "split_manifest.json",     # legacy per-model artifact -- retired, remove on resume
             results_dir / artifacts.RUN_MANIFEST_FILE,
             results_dir / artifacts.ENVIRONMENT_FILE,
             results_dir / artifacts.RUN_COMPLETE_FILE,
@@ -453,7 +456,6 @@ def _run_segmentation_pair(
     artifacts.write_environment(results_dir, overwrite_mode=overwrite_mode)
     publish_run_manifest(results_dir, manifest)
     artifacts.invalidate_run_complete(results_dir)
-    split_artifacts.write_split_ref(results_dir, benchmark=bench_mod.BENCHMARK, consumed=consumed_leaves)
     # Attribute regime problems / skipped cells to THIS pair (both accumulators are shard-global).
     regime_problems_before = len(regime_base.REGIME_PROBLEMS)
     cell_failures_before = len(perf.CELL_FAILURES)
@@ -470,24 +472,35 @@ def _run_segmentation_pair(
         present_by_family.setdefault(_fam_key(r), set()).add(
             (r.get("budget_type"), r.get("label_budget"), r.get("evaluation_split"))
         )
+    # The 80/10/10 within-source reference (source_test) is evaluated as an extra scope whenever the
+    # split HAS a target eval AND carries a source_test partition -- geographic/spatial. random_id's
+    # source_test IS its primary eval; official's 90/10 pool has no source_test.
     has_source_diag = {
-        (seed, regime, cfg.label): bool(cfg.source_val_patches and cfg.source_test_patches)
-        for seed in seeds for regime, cfg in fold_configs_by_seed[seed]
+        (seed, ld.regime, ld.split.label): bool(ld.split.has_target and ld.split.source_test_patches)
+        for seed in seeds for ld in splits_by_seed[seed]
+    }
+    # Target-budget rows are expected ONLY when the regime supports target labels. official
+    # (has_target=True, supports_target_labels=False) is zero-shot: source budgets on target_test, no
+    # target sweep -- so it must NOT be gated by "regime != random_id".
+    supports_target = {
+        (seed, ld.regime, ld.split.label): bool(ld.split.supports_target_labels)
+        for seed in seeds for ld in splits_by_seed[seed]
     }
     expected_target = {("target", b, "held_out") for b in target_budgets}
     if any(float(b) == 0.0 for b in target_budgets):
         expected_target.add(("target", 0, "full"))
 
     def _expected(key):
+        # dense already scores "validation" (the source_val calibration set); the source diagnostic
+        # adds ONLY the untouched within-source reference "source_test".
         splits = ("validation", "test")
         if has_source_diag.get((key[0], key[2], key[3]), False):
-            splits = (*splits, "source_validation", "source_test")
+            splits = (*splits, "source_test")
         exp = {("source", b, s) for b in source_budgets for s in splits}
-        if key[regime_idx] != "random_id":
+        if supports_target.get((key[0], key[2], key[3]), False):
             exp |= expected_target
         return exp
 
-    regime_idx = fam_fields.index("split_regime")
     done_families = {
         k for k, seen in present_by_family.items() if _expected(k).issubset(seen)
     }
@@ -502,20 +515,22 @@ def _run_segmentation_pair(
             tmp_rows.touch()
         os.replace(tmp_rows, rows_path)
 
-    # PHASE B: the per-model split_manifest.json is retired -- canonical patch-level splits under
-    # data/splits/ plus the split_ref.json written above are the source of truth; no model-specific
-    # split definition is written here.
+    # PHASE B: the per-model split_manifest.json is retired -- the frozen patch-level assignments.csv
+    # leaves under data/splits/ (discovered + checksum-verified via data/logs/splits.json) are the
+    # source of truth; no model-specific split definition is written here.
     # Every cell this pair is supposed to produce, from the config and the REALIZED fold configs.
     # `_expected` already encodes the per-family scope rules (source budgets x {validation,test}
-    # plus source diagnostics, and the target sweep on non-random_id regimes); reuse it so the
-    # completeness check and the resume logic cannot disagree about what a complete pair is.
+    # plus source diagnostics, and the target sweep only on regimes that support target labels);
+    # reuse it so the completeness check and the resume logic cannot disagree about a complete pair.
     expected_keys: set[tuple] = set()
     jobs = []
     # ERM only -- see main.py. The literal keeps method="erm" on every dense row.
     method_name = EV.ERM_METHOD
     method_meta = EV.erm_metadata()
+    all_folds = set(patch_fold.values())  # cache-layout fold dirs a patch set is streamed across
     for seed in seeds:
-        for split_regime, cfg in fold_configs_by_seed[seed]:
+        for loaded_dense in splits_by_seed[seed]:
+            split_regime, cfg = loaded_dense.regime, loaded_dense.split
             holdout = cfg.label
             for f in active_probes:
                 for bt, lb, es in _expected((seed, method_name, split_regime, holdout, f)):
@@ -534,6 +549,7 @@ def _run_segmentation_pair(
                     "split_regime": split_regime,
                     "domain_basis": cfg.group_kind,
                     "holdout": holdout,
+                    "target_role": cfg.target_role,
                     "probe_family": family,
                 }
                 jobs.append(
@@ -547,6 +563,7 @@ def _run_segmentation_pair(
                         target_budgets,
                         max_dense_pixels,
                         seg_meta,
+                        all_folds=all_folds,
                     )
                 )
     if jobs:

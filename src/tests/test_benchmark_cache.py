@@ -138,3 +138,72 @@ def test_tagging_and_fingerprint_subsystem_removed():
         "_update_file_content_hash",
     ):
         assert not hasattr(C, gone), f"{gone} should have been deleted"
+
+
+# --- readable schema header: a pre-metadata-change pickle cannot silently survive ----------
+import pickle  # noqa: E402
+
+
+def _write_bare(path, obj):
+    """A LEGACY pickle: the object with no schema header (what the old writer produced)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(obj, f)
+
+
+def _write_headed(path, *, schema, benchmark, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump({C._BENCH_SCHEMA_KEY: schema, "benchmark": benchmark}, f)
+        pickle.dump(obj, f)
+
+
+def test_written_pickle_carries_a_readable_header(cache):
+    bench = C.cached_bench("cropharvest")
+    path = C.benchmark_cache_path("cropharvest")
+    with open(path, "rb") as f:
+        header = pickle.load(f)
+        obj = pickle.load(f)
+    assert header == {C._BENCH_SCHEMA_KEY: C.BENCHMARK_CACHE_SCHEMA, "benchmark": "cropharvest"}
+    assert obj.name == bench.name == "cropharvest"
+
+
+def test_legacy_bare_pickle_is_rejected_and_rebuilt(cache, capsys):
+    """The regression: an old readable pickle (pre-Mali-merge / pre-EPSG-transform / pre-mask) must
+    NOT be reused just because it unpickles cleanly."""
+    path = C.benchmark_cache_path("cropharvest")
+    _write_bare(path, SimpleNamespace(name="cropharvest", payload="STALE_PRE_METADATA_OBJECT"))
+
+    bench = C.cached_bench("cropharvest")
+
+    assert cache.calls["n"] == 1, "a legacy bare pickle was silently reused"
+    assert bench.payload == list(range(3))  # the freshly rebuilt object, not the stale one
+    assert "stale" in capsys.readouterr().out
+    # rebuilt with a valid header now
+    assert C._read_cached_bench(path, "cropharvest").payload == list(range(3))
+
+
+def test_wrong_schema_is_rejected_and_rebuilt(cache):
+    path = C.benchmark_cache_path("pastis")
+    _write_headed(path, schema=C.BENCHMARK_CACHE_SCHEMA - 1, benchmark="pastis",
+                  obj=SimpleNamespace(name="pastis", payload="OLD_SCHEMA"))
+    bench = C.cached_bench("pastis")
+    assert cache.calls["n"] == 1 and bench.payload == list(range(3))
+
+
+def test_wrong_benchmark_name_is_rejected_and_rebuilt(cache):
+    # a correctly-schema'd pickle for the WRONG benchmark must not be served at this path
+    path = C.benchmark_cache_path("breizhcrops")
+    _write_headed(path, schema=C.BENCHMARK_CACHE_SCHEMA, benchmark="pastis",
+                  obj=SimpleNamespace(name="pastis", payload="WRONG_BENCH"))
+    bench = C.cached_bench("breizhcrops")
+    assert cache.calls["n"] == 1 and bench.name == "breizhcrops"
+
+
+def test_valid_headed_pickle_is_served_without_rebuild(cache):
+    path = C.benchmark_cache_path("eurocropsml")
+    _write_headed(path, schema=C.BENCHMARK_CACHE_SCHEMA, benchmark="eurocropsml",
+                  obj=SimpleNamespace(name="eurocropsml", payload="FROM_DISK"))
+    bench = C.cached_bench("eurocropsml")
+    assert cache.calls["n"] == 0, "a valid current pickle should be served from disk, not rebuilt"
+    assert bench.payload == "FROM_DISK"

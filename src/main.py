@@ -140,12 +140,11 @@ def _run_tabular_pair(
     # the encoder or touching existing results (byte-for-byte, even under OVERWRITE_MODE=True).
     # Partitions AND per-sample domains come entirely from the artifacts. Embedding-only runs
     # (probing disabled) never require split artifacts.
-    split_specs: list[tuple] = []
-    consumed_leaves: list[str] = []
+    split_specs: list[split_artifacts.LoadedTabularSplit] = []
     if probing:
         splits_root = cacheutils.SCRATCH / "splits"
-        split_specs, consumed_leaves = split_artifacts.load_tabular_splits(
-            splits_root, bench_mod.BENCHMARK, bench.sample_ids, bench, bench_mod, split_regimes, seeds
+        split_specs = split_artifacts.load_tabular_splits(
+            splits_root, bench_mod.BENCHMARK, bench.sample_ids, split_regimes, seeds
         )
 
     bench_for_emb = bench.s2_only() if s2_only else bench
@@ -169,15 +168,13 @@ def _run_tabular_pair(
     rows_path = results_dir / "probe_results.jsonl"
     preds_path = results_dir / "predictions.jsonl"
 
-    # split_specs / consumed_leaves were loaded + structurally validated ABOVE, before any embedding
-    # work AND before any mutation (validate-before-mutation still holds: a refused split here leaves
-    # existing rows, split_ref.json, environment.json, run_manifest.json, and run_complete.json
-    # untouched). Build the run manifest (and check its resume identity) only AFTER split loading has
-    # fixed the consumed path set, so that set is bound to resume identity.
+    # split_specs were loaded + structurally validated (checksum + complete accounting) ABOVE, before
+    # any embedding work AND before any mutation (validate-before-mutation still holds: a refused split
+    # here leaves existing rows, environment.json, run_manifest.json, and run_complete.json untouched).
     manifest = runstate.build_run_manifest(
         model_name, benchmark_name, artifact, emb_digest, split_regimes, seeds, enc_kwargs,
         active_probes=active_probes, budget_regimes=budget_regimes, max_dense_pixels=max_dense_pixels,
-        write_predictions=write_predictions, consumed_splits=consumed_leaves,
+        write_predictions=write_predictions,
     )
     signature = runstate.run_manifest_digest(manifest)
     runstate.check_run_manifest(results_dir, manifest, overwrite_mode=overwrite_mode)
@@ -190,9 +187,9 @@ def _run_tabular_pair(
             results_dir / "summary.csv",
             results_dir / "deltas.csv",
             results_dir / "data_quality.json",
-            results_dir / split_artifacts.SPLIT_REF_FILE,
-            results_dir / "split_manifest.json",   # legacy per-model artifact -- retired, remove on resume
-            results_dir / "domain_census.json",     # legacy per-model artifact -- retired, remove on resume
+            results_dir / "split_ref.json",          # legacy per-model artifact -- retired, remove on resume
+            results_dir / "split_manifest.json",     # legacy per-model artifact -- retired, remove on resume
+            results_dir / "domain_census.json",      # legacy per-model artifact -- retired, remove on resume
             results_dir / artifacts.RUN_MANIFEST_FILE,
             results_dir / artifacts.ENVIRONMENT_FILE,
             results_dir / artifacts.RUN_COMPLETE_FILE,
@@ -206,7 +203,6 @@ def _run_tabular_pair(
     # This pair is about to be made incomplete again, so any completion marker from a previous run
     # must not survive it.
     artifacts.invalidate_run_complete(results_dir)
-    split_artifacts.write_split_ref(results_dir, benchmark=bench_mod.BENCHMARK, consumed=consumed_leaves)
     if data_quality:
         IOU.write_json(results_dir / "data_quality.json", data_quality)
 
@@ -230,7 +226,9 @@ def _run_tabular_pair(
     def _scopes(budget_type, b, source_diag=False):
         if budget_type == "target":
             return ("full", "held_out") if b == 0 else ("held_out",)
-        return ("test", "source_validation", "source_test") if source_diag else ("test",)
+        # source_test is the untouched within-source reference, evaluated alongside the primary eval
+        # (target_test for OOD) when the 80/10/10 split carries a source_test partition.
+        return ("test", "source_test") if source_diag else ("test",)
 
     def _missing(base, budget_type, expected, source_diag=False):
         return [
@@ -257,9 +255,26 @@ def _run_tabular_pair(
     mname = EV.ERM_METHOD
     method_meta = EV.erm_metadata()
     for seed in seeds:
-        seed_split_specs = [spec for spec in split_specs if spec[0] == seed]
-        for spec in seed_split_specs:
-            _, split_regime, split_label, train, val, test, groups, has_target, domain_basis, source_val, source_test = spec
+        seed_split_specs = [ls for ls in split_specs if ls.seed == seed]
+        for loaded in seed_split_specs:
+            split_regime = loaded.regime
+            st = loaded.split                 # SourceTargetSplit whose arrays are CURRENT row indices
+            groups = loaded.domains           # per-sample domain basis (worst-group scoring)
+            split_label, has_target, domain_basis = st.label, st.has_target, st.group_kind
+            supports_target_labels = st.supports_target_labels
+            # Schema-v2 partition routing, by route capability:
+            #  * random_id (has_target=False): evaluate IN DISTRIBUTION on source_test.
+            #  * official (has_target=True, supports_target_labels=False): fit source_train, calibrate
+            #    source_val, evaluate ZERO-SHOT on target_test -- NO target-label access, NO target sweep.
+            #  * geographic/spatial (supports_target_labels=True): the source budgets ALSO evaluate
+            #    zero-shot on target_test, AND the target budgets draw few-shot labels ONLY from
+            #    target_label_pool and are scored on the SAME target_test.
+            train, val = st.source_train, st.source_val
+            test = st.target_test if has_target else st.source_test
+            # The 80/10/10 within-source reference: source_test is evaluated as an UNTOUCHED diagnostic
+            # (never trained or tuned on) whenever the split carries one -- geographic/spatial. official's
+            # 90/10 pool has no source_test; random_id's source_test IS its primary eval.
+            source_test_ref = st.source_test if (has_target and len(st.source_test) > 0) else np.empty(0, dtype=np.int64)
             for family in active_probes:
                 meta = {
                     "model": model_name,
@@ -269,13 +284,15 @@ def _run_tabular_pair(
                     "split_regime": split_regime,
                     "domain_basis": domain_basis,
                     "holdout": split_label,
+                    "target_role": st.target_role,
                     "probe_family": family,
                 }
                 base = (seed, split_regime, split_label, mname, family)
-                has_source_diag = len(source_val) > 0 and len(source_test) > 0
+                has_source_diag = len(source_test_ref) > 0
                 # Same key shape as `done` / `rerun_keys`: every scope of every budget this
-                # cell is planned to emit.
-                if has_target:
+                # cell is planned to emit. Target-budget sweeps run ONLY when the regime supports
+                # target labels; official (has_target but supports_target_labels=False) is zero-shot.
+                if supports_target_labels:
                     expected_keys.update(
                         (*base, "target", b, sc)
                         for b in target_budgets for sc in _scopes("target", b)
@@ -284,7 +301,7 @@ def _run_tabular_pair(
                     (*base, "source", b, sc)
                     for b in source_budgets for sc in _scopes("source", b, has_source_diag)
                 )
-                if has_target:
+                if supports_target_labels:
                     todo = _missing(base, "target", target_budgets)
                     if todo:
                         rerun_keys.update((*base, "target", b, sc) for b in todo for sc in _scopes("target", b))
@@ -295,7 +312,8 @@ def _run_tabular_pair(
                                     emb,
                                     train,
                                     val,
-                                    test,
+                                    st.target_label_pool,
+                                    st.target_test,
                                     y,
                                     groups,
                                     {**meta, "budget_type": "target"},
@@ -322,8 +340,8 @@ def _run_tabular_pair(
                                 seed,
                                 family,
                                 [budget],
-                                source_val,
-                                source_test,
+                                None,               # no source_validation diagnostic (source_val is the calibration set)
+                                source_test_ref,    # the untouched within-source reference (source_test scope)
                                 write_predictions=write_predictions,
                             )
                         )

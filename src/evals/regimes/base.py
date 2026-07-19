@@ -17,45 +17,163 @@ def _empty() -> np.ndarray:
     return np.empty(0, dtype=np.int64)
 
 
+# --------------------------------------------------------------------------- #
+# Schema-v2 explicit source/target representation. Every regime emits SourceTargetSplit /
+# DenseSourceTargetSplit directly (the overloaded v1 Split/DenseSplit train/val/test contract and its
+# iter_splits/segmentation_fold_configs iteration path are gone); the generator serializes these via
+# evals.split_artifacts and the runtime consumes them from data/splits/.
+# --------------------------------------------------------------------------- #
+#: The five explicit v2 partitions. Source partitions are the exact 80/10/10 of the purged source
+#: pool; target partitions are the exact 80/20 of the held-out target region.
+SOURCE_PARTITIONS: tuple[str, ...] = ("source_train", "source_val", "source_test")
+TARGET_PARTITIONS: tuple[str, ...] = ("target_label_pool", "target_test")
+V2_PARTITIONS: tuple[str, ...] = SOURCE_PARTITIONS + TARGET_PARTITIONS
+
+
+def route_partition_problems(
+    has_target: bool, supports_target_labels: bool, n_target_label_pool: int, n_target_test: int,
+) -> list[str]:
+    """The fail-closed route-capability contract between the two flags and the target partition
+    sizes. Returns a (possibly empty) list of violations; callers raise their own error type."""
+    problems: list[str] = []
+    if supports_target_labels and not has_target:
+        problems.append("supports_target_labels=True requires has_target=True")
+    if not has_target and (n_target_label_pool or n_target_test):
+        problems.append("has_target=False requires both target partitions empty")
+    if has_target and n_target_test == 0:
+        problems.append("has_target=True requires a non-empty target_test")
+    if supports_target_labels and n_target_label_pool == 0:
+        problems.append("supports_target_labels=True requires a non-empty target_label_pool")
+    if not supports_target_labels and n_target_label_pool:
+        problems.append("supports_target_labels=False requires an empty target_label_pool")
+    return problems
+
+
+def require_bool_flags(has_target: Any, supports_target_labels: Any) -> None:
+    """Reject anything but an exact ``bool`` for the two route flags (no truthy/falsy coercion)."""
+    for name, v in (("has_target", has_target), ("supports_target_labels", supports_target_labels)):
+        if not isinstance(v, bool):
+            raise ValueError(f"{name} must be a bool, got {type(v).__name__}: {v!r}")
+
+
+def validate_route_partitions(has_target: bool, supports_target_labels: bool, n_pool: int, n_test: int) -> None:
+    """Raise ValueError if the route flags are non-bool or the route/partition invariants are violated."""
+    require_bool_flags(has_target, supports_target_labels)
+    problems = route_partition_problems(has_target, supports_target_labels, n_pool, n_test)
+    if problems:
+        raise ValueError("route-capability invariants violated: " + "; ".join(problems))
+
+
+#: The machine-readable role of a target in headline aggregation. ``headline`` targets enter the
+#: equal-region mean / worst-region metrics; ``supplementary_stress`` targets (CropHarvest's one-class
+#: regions) are held out and scored as SOURCE-ONLY stress evidence but MUST NOT enter the headline
+#: mean/worst. This is distinct from ``supports_target_labels`` (official is supports=False yet
+#: headline), so aggregation can tell a stress target from a zero-shot release target.
+TARGET_ROLE_HEADLINE = "headline"
+TARGET_ROLE_SUPPLEMENTARY_STRESS = "supplementary_stress"
+TARGET_ROLES = (TARGET_ROLE_HEADLINE, TARGET_ROLE_SUPPLEMENTARY_STRESS)
+
+
+def validate_target_role(target_role: Any, supports_target_labels: bool) -> None:
+    """Reject an unknown role, and enforce that a supplementary stress target draws no target labels."""
+    if target_role not in TARGET_ROLES:
+        raise ValueError(f"target_role must be one of {TARGET_ROLES}, got {target_role!r}")
+    if target_role == TARGET_ROLE_SUPPLEMENTARY_STRESS and supports_target_labels:
+        raise ValueError("a supplementary_stress target must have supports_target_labels=False (zero-shot only)")
+
+
 @dataclass(frozen=True)
-class Split:
-    """One regime partition."""
+class SourceTargetSplit:
+    """One realized tabular split (schema v2): explicit partitions + first-class route capabilities.
 
-    label: str
-    train: np.ndarray
-    test: np.ndarray
-    val: np.ndarray = field(default_factory=_empty)
-    source_val: np.ndarray = field(default_factory=_empty)
-    source_test: np.ndarray = field(default_factory=_empty)
-    domain: str | None = None
-    has_target: bool | None = None
-
-
-@dataclass(frozen=True)
-class DenseSplit:
-    label: str
-    train_folds: set[int]
-    val_folds: set[int]
-    test_folds: set[int]
-    train_patches: set[int] | None = None
-    val_patches: set[int] | None = None
-    test_patches: set[int] | None = None
-    source_val_patches: set[int] | None = None
-    source_test_patches: set[int] | None = None
-    has_target: bool = False
-    group_kind: str = "geography"
-
-
-def geography_domains(bench, holdouts: Any = None) -> np.ndarray:
-    """Default domain assignment: the benchmark's native region/source groups.
-
-    Takes ``holdouts`` because every regime's ``assign_domains`` is called with the split
-    strategy (some regimes must pick their domain basis from it -- see
-    geographic_ood.assign_domains). This one has a single basis and ignores it. ``random_id``
-    and ``official`` alias this function directly, so the signature is part of that contract.
+    ``target_label_pool``/``target_test`` are empty when ``has_target`` is False (source-only, e.g.
+    ``random_id``). ``supports_target_labels`` is False for ``official`` (a fixed release evaluation
+    set with no label-budget access) even though it HAS a target geography. The route-capability
+    invariants are enforced at construction (fail-closed): they cannot silently disagree with the
+    target partition sizes.
     """
-    del holdouts
-    return np.asarray(bench.groups, dtype=object)
+
+    label: str
+    source_train: np.ndarray
+    source_val: np.ndarray
+    source_test: np.ndarray
+    target_label_pool: np.ndarray = field(default_factory=_empty)
+    target_test: np.ndarray = field(default_factory=_empty)
+    domain: str | None = None
+    has_target: bool = True
+    supports_target_labels: bool = True
+    group_kind: str = "geography"
+    target_role: str = TARGET_ROLE_HEADLINE
+
+    def __post_init__(self) -> None:
+        validate_route_partitions(
+            self.has_target, self.supports_target_labels, len(self.target_label_pool), len(self.target_test)
+        )
+        validate_target_role(self.target_role, self.supports_target_labels)
+
+    def as_partitions(self) -> dict[str, np.ndarray]:
+        """Partition-name -> index array, in canonical :data:`V2_PARTITIONS` order."""
+        return {
+            "source_train": self.source_train,
+            "source_val": self.source_val,
+            "source_test": self.source_test,
+            "target_label_pool": self.target_label_pool,
+            "target_test": self.target_test,
+        }
+
+
+@dataclass(frozen=True)
+class DenseSourceTargetSplit:
+    """One realized PASTIS patch-level split (schema v2). Allocation is over patch IDs only; the
+    evaluation streams pixels afterwards, but patch membership is immutable and never split. The
+    route-capability invariants are enforced at construction, exactly as for the tabular split."""
+
+    label: str
+    source_train_patches: frozenset[int]
+    source_val_patches: frozenset[int]
+    source_test_patches: frozenset[int]
+    target_label_pool_patches: frozenset[int] = frozenset()
+    target_test_patches: frozenset[int] = frozenset()
+    has_target: bool = True
+    supports_target_labels: bool = True
+    group_kind: str = "geography"
+    target_role: str = TARGET_ROLE_HEADLINE
+
+    def __post_init__(self) -> None:
+        validate_route_partitions(
+            self.has_target, self.supports_target_labels,
+            len(self.target_label_pool_patches), len(self.target_test_patches),
+        )
+        validate_target_role(self.target_role, self.supports_target_labels)
+
+    def as_partitions(self) -> dict[str, frozenset[int]]:
+        return {
+            "source_train": self.source_train_patches,
+            "source_val": self.source_val_patches,
+            "source_test": self.source_test_patches,
+            "target_label_pool": self.target_label_pool_patches,
+            "target_test": self.target_test_patches,
+        }
+
+
+def route_capabilities(regime_module: Any) -> tuple[bool, bool]:
+    """``(has_target, supports_target_labels)`` for a regime module -- fail-closed.
+
+    Both ``HAS_TARGET`` and ``SUPPORTS_TARGET_LABELS`` MUST be declared (no default inference), each
+    must be a real ``bool``, and ``supports_target_labels=True`` requires ``has_target=True``. Any
+    violation raises ValueError so a regime can never silently ship an ambiguous route capability.
+    """
+    name = getattr(regime_module, "NAME", getattr(regime_module, "__name__", "?"))
+    for attr in ("HAS_TARGET", "SUPPORTS_TARGET_LABELS"):
+        if not hasattr(regime_module, attr):
+            raise ValueError(f"regime {name!r} must declare {attr}")
+        if not isinstance(getattr(regime_module, attr), bool):
+            raise ValueError(f"regime {name!r}: {attr} must be a bool, got {getattr(regime_module, attr)!r}")
+    has_target = regime_module.HAS_TARGET
+    supports = regime_module.SUPPORTS_TARGET_LABELS
+    if supports and not has_target:
+        raise ValueError(f"regime {name!r}: SUPPORTS_TARGET_LABELS=True requires HAS_TARGET=True")
+    return has_target, supports
 
 
 REGIME_PROBLEMS: list[tuple[str, str, str]] = []
@@ -105,7 +223,8 @@ def holdouts_for(bench_mod, regime_name: str):
             return bench_mod.GEOGRAPHIC_SPLIT
         return getattr(bench_mod, "GEOGRAPHIC_HOLDOUTS", getattr(bench_mod, "HOLDOUTS", []))
     if regime_name == "spatial_cluster_ood":
-        return getattr(bench_mod, "SPATIAL_CLUSTER_SPLIT", {})
+        # coordinate-only spherical-K-means cells: no curated holdouts, no benchmark override
+        return {}
     return getattr(bench_mod, "HOLDOUTS", [])
 
 
@@ -143,149 +262,13 @@ def report_regime_problems() -> None:
     print(f"{bar}\n", flush=True)
 
 
-def iter_splits(
-    split_regime, bench, y, holdouts, seed, *, strict_mode: bool = False, overwrite_mode: bool | None = None, val_group=None
-):
-    """Yield split metadata and regime-assigned domain labels."""
-    if overwrite_mode is not None:
-        strict_mode = bool(overwrite_mode)
-    regime = load_regime(split_regime)
-    bench_name = getattr(bench, "name", "?")
-    try:
-        # `holdouts` carries the split strategy, and some regimes must pick their domain basis
-        # from it (see geographic_ood.assign_domains); regimes with a single basis ignore it.
-        domains = np.asarray(regime.assign_domains(bench, holdouts), dtype=object)
-    except Exception as exc:
-        regime_problem(
-            bench_name,
-            split_regime,
-            f"domain assignment failed ({type(exc).__name__}: {exc})",
-            strict_mode=strict_mode,
-        )
-        return
-    if len(domains) != len(y):
-        raise ValueError(
-            f"{split_regime}.assign_domains returned {len(domains)} domains for {len(y)} labels"
-        )
-    n_unknown = int(np.isin(domains.astype(str), ("unknown", "nan")).sum())
-    if n_unknown:
-        print(
-            f"   [{bench_name}/{split_regime}] {n_unknown}/{len(domains)} samples have no domain "
-            f"(unknown/nan coords) and are excluded from this regime's holdouts",
-            flush=True,
-        )
-    n_splits = 0
-    yielded_labels: set[str] = set()
-    yielded_domains: set[str] = set()
-    for split in regime.iter_splits(y, domains, seed=seed, holdouts=holdouts, val_group=val_group, bench=bench):
-        n_splits += 1
-        yielded_labels.add(str(split.label))
-        yielded_domains.add(str(getattr(split, "domain", None) or split.label))
-        yield (
-            split.label, split.train, split.val, split.test, domains,
-            regime.HAS_TARGET if split.has_target is None else split.has_target,
-            regime.GROUP_KIND, split.source_val, split.source_test,
-        )
-    expected_fn = getattr(regime, "expected_domains", None)
-    expected = expected_fn(y, domains, holdouts) if expected_fn is not None else None
-    if n_splits == 0:
-        labels = sorted({str(d) for d in domains})
-        shown = labels[:8] + (["..."] if len(labels) > 8 else [])
-        regime_problem(
-            bench_name,
-            split_regime,
-            f"produced 0 splits (domain labels seen: {shown})",
-            strict_mode=strict_mode,
-        )
-    elif expected is not None:
-        # The regime declared, from the census, exactly which domains it would evaluate. A
-        # declared-valid domain that produced no fold is a hard failure, not a missing table row.
-        missing = sorted({str(d) for d in expected} - yielded_domains)
-        if missing:
-            regime_problem(
-                bench_name,
-                split_regime,
-                f"declared-valid domain(s) produced no split: {missing}",
-                strict_mode=strict_mode,
-            )
-    elif getattr(regime, "USES_CURATED_HOLDOUTS", False) and not isinstance(holdouts, dict):
-        missing = [str(h) for h in (holdouts or []) if str(h) not in yielded_labels]
-        if missing:
-            regime_problem(
-                bench_name,
-                split_regime,
-                f"curated holdout(s) dropped (no valid split): {missing}",
-                strict_mode=strict_mode,
-            )
-    elif getattr(regime, "LEAVE_ONE_DOMAIN_OUT", False):
-        attempted = {str(d) for d in domains if str(d) not in ("unknown", "nan")}
-        missing = sorted(attempted - yielded_domains)
-        if missing:
-            regime_problem(
-                bench_name,
-                split_regime,
-                f"domain(s) dropped (no valid split): {missing}",
-                strict_mode=strict_mode,
-            )
-
-
-def _dense_split_from_tuple(regime, item) -> DenseSplit:
-    if isinstance(item, DenseSplit):
-        return item
-    label, train_folds, val_folds, test_folds = item
-    return DenseSplit(
-        str(label),
-        set(train_folds),
-        set(val_folds),
-        set(test_folds),
-        has_target=bool(getattr(regime, "HAS_TARGET", False)),
-        group_kind=str(getattr(regime, "GROUP_KIND", "geography")),
-    )
-
-
-def segmentation_fold_configs(
-    bench_mod, regimes, *, seed: int, emb_dir, strict_mode: bool = False, overwrite_mode: bool | None = None, bench=None
-):
-    """Yield dense fold configs for segmentation regimes.
-
-    Every declared regime must yield at least one config. The dense path previously had no such
-    check -- unlike the tabular ``iter_splits`` above, which has four -- so a regime whose split
-    construction raised (spatial_cluster_ood wraps its whole build in a try/except that prints and
-    returns) simply produced nothing, was never recorded as a problem, and vanished from the
-    results table behind one line of stdout in a multi-hour log. That is how PASTIS lost
-    spatial_cluster_ood.
-    """
-    if overwrite_mode is not None:
-        strict_mode = bool(overwrite_mode)
-    benchmark = getattr(bench_mod, "BENCHMARK", "?")
-    for regime_name in regimes:
-        regime = load_regime(regime_name)
-        dense_iter = getattr(regime, "iter_dense_splits", None)
-        fold_iter = getattr(regime, "iter_fold_splits", None)
-        n_yielded = 0
-        if dense_iter is not None:
-            for item in dense_iter(bench_mod, emb_dir=emb_dir, seed=seed, bench=bench):
-                n_yielded += 1
-                yield regime_name, _dense_split_from_tuple(regime, item)
-        elif fold_iter is None:
-            regime_problem(
-                benchmark,
-                regime_name,
-                "no dense (segmentation) realization -- regime exposes no iter_fold_splits",
-                strict_mode=strict_mode,
-            )
-            continue
-        else:
-            for item in fold_iter(bench_mod):
-                n_yielded += 1
-                yield regime_name, _dense_split_from_tuple(regime, item)
-        if n_yielded == 0:
-            regime_problem(
-                benchmark,
-                regime_name,
-                "produced 0 dense fold configs (declared but not evaluated)",
-                strict_mode=strict_mode,
-            )
+# The v1 split-iteration path (iter_splits over regime.assign_domains/iter_splits, plus
+# _dense_split_from_tuple / segmentation_fold_configs over regime.iter_dense_splits) has been
+# removed. Every regime now emits SourceTargetSplit / DenseSourceTargetSplit directly, the generator
+# (tools/generate_splits.py) serializes them via evals.split_artifacts, and a requested regime that
+# yields zero leaves is refused at consumption time (split_artifacts.load_*_splits), not surfaced as a
+# runtime regime_problem. REGIME_PROBLEMS / regime_problem / report_regime_problems remain the
+# run-level "declared regime did not run" channel consumed by main.py / runstate.py.
 
 
 def _append_prediction_rows(

@@ -1,417 +1,352 @@
-"""Structural-integrity, serialization, and overwrite-safety tests for canonical split artifacts.
+"""Structural-integrity, serialization, and runtime-round-trip tests for the frozen split artifacts.
 
-No hashing anywhere: identity is the path, integrity is structural, and completeness is the presence
-of ``manifest.json``. These tests exercise the guarantees directly (they do not run the regimes --
-that is ``test_split_parity``).
+The format is one ``assignments.csv`` per leaf (stable_id, partition, status, domain, reason) plus one
+central ``data/logs/splits.json`` (provenance + per-leaf summary + SHA-256). These tests exercise the
+scientific invariants directly (they do not run the regimes -- that is ``test_split_parity`` and the
+per-regime files): partition disjointness, complete accounting, the route-capability contract, the
+central-log checksum gate, PASTIS patch-level dense leaves + structural fold/tile checks, and the
+generated-to-runtime round-trip.
 """
 
 from __future__ import annotations
 
 import csv
-import json
-import os
-from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from evals import split_artifacts as SA
+from evals.regimes.base import DenseSourceTargetSplit, SourceTargetSplit
+
+_PROV = {"generation_timestamp": "t", "code_revision": "x", "run_seeds": [0], "cluster_seed": 0}
 
 
-def _spec(partitions, *, benchmark="toy", regime="random_id", label="random_id", exclusions=(), stats=None, domains=None):
-    partitions = dict(partitions)
-    if domains is None:
-        domains = {sid: "d" for ids in partitions.values() for sid in ids}
-    return SA.LeafSpec(
-        benchmark=benchmark, regime=regime, seed=0, holdout_label=label,
-        target_unit="sample", domain_basis="geography", group_kind="geography", has_target=False,
-        params={"assembly_seed": 0}, partitions=partitions,
-        partition_stats=stats or {}, domains=domains, exclusions=list(exclusions), audit=[],
+def _root(tmp_path):
+    return tmp_path / "splits"
+
+
+def _write_log(root, entries):
+    SA.write_splits_log(SA.default_log_path(root), provenance=_PROV, entries=list(entries))
+
+
+def _publish_tabular(root, benchmark, regime, seed, *, split, domains, labels, sample_ids, audit_events=(), purge_km=0.0):
+    rows, entry = SA.build_tabular_leaf(
+        benchmark, regime, seed, split=split, domains=domains, labels=labels,
+        sample_ids=sample_ids, audit_events=list(audit_events), purge_km=purge_km,
     )
+    _p, entry["sha256"] = SA.write_assignments(root, benchmark, regime, seed, split.label, rows)
+    return entry
 
 
-# --------------------------------------------------------------------------- #
-# Structural validation
-# --------------------------------------------------------------------------- #
-def test_duplicate_id_within_partition_rejected():
-    spec = _spec({"train": ["a", "a"], "val": [], "test": ["b"]})
-    with pytest.raises(SA.SplitArtifactError, match="duplicate id 'a' within partition"):
-        SA.validate_leaf(spec, ["a", "b"])
-
-
-def test_five_partition_pairwise_disjointness_enforced():
-    # source_test overlaps train -> must be caught (not just train/val/test)
-    spec = _spec({"train": ["a"], "val": ["b"], "test": ["c"], "source_val": [], "source_test": ["a"]})
-    with pytest.raises(SA.SplitArtifactError, match=r"partitions 'train'/'source_test' overlap"):
-        SA.validate_leaf(spec, ["a", "b", "c"])
-
-
-def test_complete_accounting_missing_unit_rejected():
-    spec = _spec({"train": ["a"], "test": ["b"]}, exclusions=[])
-    with pytest.raises(SA.SplitArtifactError, match="incomplete accounting"):
-        SA.validate_leaf(spec, ["a", "b", "c"])  # c is unaccounted
-
-
-def test_complete_accounting_unexpected_unit_rejected():
-    spec = _spec({"train": ["a", "x"], "test": ["b"]})
-    with pytest.raises(SA.SplitArtifactError, match="incomplete accounting"):
-        SA.validate_leaf(spec, ["a", "b"])  # x is not eligible
-
-
-def test_assignments_and_exclusions_must_be_disjoint():
-    spec = _spec(
-        {"train": ["a"], "test": ["b"]},
-        exclusions=[{"stable_id": "a", "reason": SA.UNASSIGNED_REASON, "status": "unknown"}],
+def _publish_dense(root, benchmark, regime, seed, *, dense_split, cache, audit_events=(), purge_km=0.0):
+    rows, entry = SA.build_dense_leaf(
+        benchmark, regime, seed, dense_split=dense_split, audit_events=list(audit_events), purge_km=purge_km, **cache,
     )
-    with pytest.raises(SA.SplitArtifactError, match="appear in BOTH assignments and exclusions"):
-        SA.validate_leaf(spec, ["a", "b"])
+    _p, entry["sha256"] = SA.write_assignments(root, benchmark, regime, seed, dense_split.label, rows)
+    return entry
 
 
-def test_complete_accounting_passes_when_exclusions_fill_the_gap():
-    spec = _spec(
-        {"train": ["a"], "test": ["b"]},
-        exclusions=[{"stable_id": "c", "reason": SA.UNASSIGNED_REASON, "status": "unknown"}],
-    )
-    SA.validate_leaf(spec, ["a", "b", "c"])  # no raise
+def _write_raw_csv(root, benchmark, regime, seed, holdout, rows):
+    """Write a raw assignments.csv (rows are 5-tuples) and return (entry-stub, sha256)."""
+    path = SA.assignments_path(root, benchmark, regime, seed, holdout)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    import io
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(SA.CSV_HEADER)
+    for r in rows:
+        w.writerow(r)
+    data = buf.getvalue().encode()
+    path.write_bytes(data)
+    return SA.sha256_bytes(data)
 
 
-# --------------------------------------------------------------------------- #
-# Roundtrip, no model identity, no hashes
-# --------------------------------------------------------------------------- #
-def test_roundtrip_and_no_model_or_hash_fields(tmp_path):
-    sample_ids = np.array([f"s{i}" for i in range(6)], dtype=object)
-    domains = np.array(list("AABBAB"), dtype=object)
-    labels = np.array([0, 1, 0, 1, 0, 1])
-    spec, eligible = SA.build_tabular_leaf(
-        "toy", "random_id", 1, label="random_id",
-        train=[0, 1], val=[2], test=[3], source_val=[4], source_test=[5],
-        domains=domains, labels=labels, sample_ids=sample_ids, has_target=False,
-        group_kind="geography", params={"assembly_seed": 0}, audit_events=[],
-    )
-    ldir = SA.publish_leaf(tmp_path, spec, eligible)
-    assert (ldir / "assignments.csv").exists()
-    assert (ldir / "exclusions.csv").exists()
-    assert (ldir / "manifest.json").exists()
-
-    manifest = SA.read_manifest(ldir)
-    assert "model" not in manifest
-    blob = json.dumps(manifest).lower()
-    for banned in ("sha", "hash", "digest", "fingerprint", "checksum"):
-        assert banned not in blob, f"canonical manifest must not contain {banned!r}"
-    assert manifest["holdout"] == "random_id"
-    assert set(manifest["partitions"]) == set(SA.PARTITIONS)
-
-    id_map = {str(s): i for i, s in enumerate(sample_ids.tolist())}
-    idx = SA.load_split_indices(ldir, id_map)
-    assert idx["train"].tolist() == [0, 1]
-    assert idx["source_val"].tolist() == [4]
-    assert idx["source_test"].tolist() == [5]
-
-
-def test_unknown_id_on_load_rejected(tmp_path):
-    ids = np.array(["a", "b", "c"], dtype=object)
-    spec, eligible = SA.build_tabular_leaf(
-        "toy", "random_id", 0, label="random_id",
-        train=[0], val=[1], test=[2], source_val=[], source_test=[],
-        domains=np.array(list("ABC"), dtype=object), labels=np.array([0, 1, 0]),
-        sample_ids=ids, has_target=False, group_kind="geography", params={}, audit_events=[],
-    )
-    ldir = SA.publish_leaf(tmp_path, spec, eligible)
-    # current benchmark no longer contains 'c'
-    with pytest.raises(SA.SplitArtifactError, match="unknown id 'c'"):
-        SA.load_split_indices(ldir, {"a": 0, "b": 1})
-
-
-def test_malformed_assignments_header_rejected(tmp_path):
-    ldir = tmp_path / "leaf"
-    ldir.mkdir()
-    (ldir / "manifest.json").write_text("{}")
-    (ldir / "assignments.csv").write_text("wrong,header\nx,train\n")
-    with pytest.raises(SA.SplitArtifactError, match="malformed assignments header"):
-        SA.read_assignments(ldir)
-
-
-# --------------------------------------------------------------------------- #
-# Completeness marker & overwrite safety
-# --------------------------------------------------------------------------- #
-def _publish_simple(root, label, train_ids, eligible, *, regime="random_id"):
-    spec = _spec(
-        {"train": list(train_ids), "val": [], "test": [], "source_val": [], "source_test": []},
-        regime=regime, label=label,
-        exclusions=[{"stable_id": e, "reason": SA.UNASSIGNED_REASON, "status": "unknown"}
-                    for e in eligible if e not in set(train_ids)],
-    )
-    return SA.publish_leaf(root, spec, eligible)
-
-
-def test_incomplete_leaf_without_manifest_is_ignored(tmp_path):
-    ldir = _publish_simple(tmp_path, "random_id", ["a", "b"], ["a", "b"])
-    assert SA.is_complete(ldir)
-    (ldir / "manifest.json").unlink()  # simulate crash before manifest was written
-    assert not SA.is_complete(ldir)
-    with pytest.raises(SA.SplitArtifactError, match="incomplete"):
-        SA.load_split_indices(ldir, {"a": 0, "b": 1})
-
-
-def test_overwrite_replaces_membership(tmp_path):
-    ldir = _publish_simple(tmp_path, "random_id", ["a", "b"], ["a", "b", "c"])
-    assert SA.read_assignments(ldir)["train"] == ["a", "b"]
-    _publish_simple(tmp_path, "random_id", ["c"], ["a", "b", "c"])
-    assert SA.read_assignments(ldir)["train"] == ["c"]  # fully replaced, not merged
-
-
-def test_interrupted_overwrite_of_complete_leaf_reads_incomplete(tmp_path):
-    """A crash mid-overwrite must leave an incomplete leaf, never new payload under the old marker."""
-    ldir = _publish_simple(tmp_path, "random_id", ["a", "b"], ["a", "b"])
-    assert SA.is_complete(ldir)
-    # Reproduce the protocol's intermediate state: manifest removed FIRST, payload half-swapped,
-    # then a crash before the new manifest is published.
-    (ldir / "manifest.json").unlink()
-    (ldir / "assignments.csv").write_text("stable_id,partition\nc,train\n")  # new payload, no marker
-    assert not SA.is_complete(ldir)  # readers treat it as incomplete
-    with pytest.raises(SA.SplitArtifactError, match="incomplete"):
-        SA.load_split_indices(ldir, {"c": 2})
-
-
-def test_fault_injection_interrupted_publish_of_complete_leaf(tmp_path, monkeypatch):
-    """Fault-inject the REAL publish_leaf transaction: crash after the old manifest is removed and
-    after one payload replacement. The leaf must end with NO canonical manifest, and load must
-    refuse it. Regresses if manifest is written before payloads or the old manifest is not removed.
-    """
-    ldir = _publish_simple(tmp_path, "random_id", ["a", "b"], ["a", "b"])  # complete v1
-    assert SA.is_complete(ldir)
-
-    real_replace = os.replace
-
-    def flaky_replace(src, dst):
-        dstp = Path(dst)
-        # fail on the IN-LOCK exclusions.csv swap: manifest already unlinked, assignments already swapped
-        if dstp.name == "exclusions.csv" and dstp.parent == ldir:
-            raise RuntimeError("injected crash mid-publish")
-        return real_replace(src, dst)
-
-    monkeypatch.setattr(SA.os, "replace", flaky_replace)
-    spec = _spec({"train": ["c"], "val": [], "test": [], "source_val": [], "source_test": []},
-                 regime="random_id", label="random_id")
-    with pytest.raises(RuntimeError, match="injected crash"):
-        SA.publish_leaf(tmp_path, spec, ["c"], overwrite=True)
-
-    assert not (ldir / "manifest.json").exists(), "old manifest must have been removed and new one not written"
-    assert not SA.is_complete(ldir)
-    with pytest.raises(SA.SplitArtifactError, match="incomplete"):
-        SA.load_split_indices(ldir, {"c": 0})
-
-
-# --------------------------------------------------------------------------- #
-# Runtime enforces the SAME invariants as generation over an on-disk leaf
-# --------------------------------------------------------------------------- #
-def _write_raw_leaf(root, *, benchmark, regime, seed, holdout, assignments, exclusions, manifest_over=None):
-    ldir = SA.leaf_dir(root, benchmark, regime, seed, holdout)
-    ldir.mkdir(parents=True, exist_ok=True)
-    with open(ldir / "assignments.csv", "w", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(["stable_id", "partition", "domain"])
-        for row in assignments:
-            sid, part = row[0], row[1]
-            w.writerow([sid, part, row[2] if len(row) > 2 else "d"])
-    with open(ldir / "exclusions.csv", "w", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(["stable_id", "reason", "status"])
-        for row in exclusions:
-            w.writerow(row)
-    manifest = {
-        "schema_version": SA.SCHEMA_VERSION, "benchmark": benchmark, "regime": regime, "seed": seed,
-        "holdout": holdout, "holdout_dirname": SA.holdout_dirname(holdout), "target_unit": "sample",
-        "domain_basis": "geography", "group_kind": "geography", "has_target": False, "params": {},
-        "partitions": {}, "n_excluded": len(exclusions), "exclusion_reason_counts": {}, "audit": [],
+def _entry(benchmark, regime, seed, holdout, sha, *, has_target=False, supports_target_labels=False,
+           target_role="headline", group_kind="geography", target_unit="sample"):
+    return {
+        "benchmark": benchmark, "regime": regime, "seed": seed, "holdout": holdout,
+        "target_unit": target_unit, "group_kind": group_kind, "has_target": has_target,
+        "supports_target_labels": supports_target_labels, "target_role": target_role,
+        "assignments_csv": SA.leaf_rel_path(benchmark, regime, seed, holdout), "sha256": sha,
     }
-    if manifest_over:
-        manifest.update(manifest_over)
-    (ldir / "manifest.json").write_text(json.dumps(manifest))
-    return ldir
-
-
-def test_load_rejects_partition_overlap_on_disk(tmp_path):
-    ldir = _write_raw_leaf(tmp_path, benchmark="toy", regime="random_id", seed=0, holdout="random_id",
-                           assignments=[("a", "train"), ("a", "test")], exclusions=[])
-    with pytest.raises(SA.SplitArtifactError, match="overlap"):
-        SA.load_split_indices(ldir, {"a": 0})
-
-
-def test_load_rejects_incomplete_accounting_on_disk(tmp_path):
-    ldir = _write_raw_leaf(tmp_path, benchmark="toy", regime="random_id", seed=0, holdout="random_id",
-                           assignments=[("a", "train")], exclusions=[])
-    with pytest.raises(SA.SplitArtifactError, match="incomplete accounting"):
-        SA.load_split_indices(ldir, {"a": 0, "b": 1})  # b unaccounted in the CURRENT population
-
-
-def test_load_rejects_unknown_excluded_id_on_disk(tmp_path):
-    ldir = _write_raw_leaf(tmp_path, benchmark="toy", regime="random_id", seed=0, holdout="random_id",
-                           assignments=[("a", "train")],
-                           exclusions=[("zzz", SA.UNASSIGNED_REASON, "unknown")])
-    with pytest.raises(SA.SplitArtifactError, match="unknown excluded id"):
-        SA.load_split_indices(ldir, {"a": 0})
-
-
-def test_load_rejects_manifest_path_disagreement(tmp_path):
-    ldir = _write_raw_leaf(tmp_path, benchmark="toy", regime="random_id", seed=0, holdout="random_id",
-                           assignments=[("a", "train")], exclusions=[],
-                           manifest_over={"benchmark": "other-benchmark"})
-    with pytest.raises(SA.SplitArtifactError, match="disagrees with canonical path"):
-        SA.load_split_indices(ldir, {"a": 0})
-
-
-def test_load_rejects_requested_identity_mismatch(tmp_path):
-    ldir = _write_raw_leaf(tmp_path, benchmark="toy", regime="random_id", seed=0, holdout="random_id",
-                           assignments=[("a", "train")], exclusions=[])
-    with pytest.raises(SA.SplitArtifactError, match="requested holdout"):
-        SA.load_split_indices(ldir, {"a": 0}, holdout="a-different-holdout")
-
-
-def test_load_accepts_a_wellformed_on_disk_leaf(tmp_path):
-    ldir = _write_raw_leaf(tmp_path, benchmark="toy", regime="random_id", seed=0, holdout="random_id",
-                           assignments=[("a", "train"), ("b", "test")],
-                           exclusions=[("c", SA.UNASSIGNED_REASON, "unknown")])
-    idx = SA.load_split_indices(ldir, {"a": 0, "b": 1, "c": 2},
-                                benchmark="toy", regime="random_id", seed=0, holdout="random_id")
-    assert idx["train"].tolist() == [0] and idx["test"].tolist() == [1]
 
 
 # --------------------------------------------------------------------------- #
-# Schema-version parser contract (one schema, no historical-version fallbacks) + blank domains
+# validate_rows: the generation-time invariant core
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("ver,match", [
-    ("1", "must be an integer"),   # a string, not an int
-    (1.0, "must be an integer"),   # a float, not an int
-    (True, "must be an integer"),  # bool is an int subclass -- must still be rejected
-    (0, "unsupported schema_version 0"),
-    (2, "unsupported schema_version 2"),
+def test_duplicate_stable_id_rejected():
+    rows = [
+        SA._row("a", "source_train", SA.STATUS_ASSIGNED, "d", ""),
+        SA._row("a", "source_test", SA.STATUS_ASSIGNED, "d", ""),
+    ]
+    with pytest.raises(SA.SplitArtifactError, match="duplicate stable_id"):
+        SA.validate_rows(rows, has_target=False, supports_target_labels=False)
+
+
+def test_assigned_row_needs_a_non_blank_domain():
+    rows = [SA._row("a", "source_train", SA.STATUS_ASSIGNED, "", "")]
+    with pytest.raises(SA.SplitArtifactError, match="blank domain"):
+        SA.validate_rows(rows, has_target=False, supports_target_labels=False)
+
+
+@pytest.mark.parametrize("parts,has_t,supp,match", [
+    ([("a", "source_train"), ("b", "target_label_pool")], True, False, "empty target_label_pool"),
+    ([("a", "source_train"), ("b", "target_test")], True, True, "non-empty target_label_pool"),
+    ([("a", "source_train"), ("b", "target_label_pool")], True, True, "non-empty target_test"),
+    ([("a", "target_test")], False, True, "has_target=True"),
+    ([("a", "target_test")], False, False, "both target partitions empty"),
 ])
-def test_leaf_manifest_rejects_a_bad_schema_version(tmp_path, ver, match):
-    ldir = _write_raw_leaf(tmp_path, benchmark="toy", regime="random_id", seed=0, holdout="random_id",
-                           assignments=[("a", "train")], exclusions=[],
-                           manifest_over={"schema_version": ver})
+def test_route_capability_contract_enforced(parts, has_t, supp, match):
+    rows = [SA._row(sid, part, SA.STATUS_ASSIGNED, "d", "") for sid, part in parts]
     with pytest.raises(SA.SplitArtifactError, match=match):
-        SA.read_manifest(ldir)
-
-
-def test_leaf_manifest_rejects_a_missing_schema_version(tmp_path):
-    ldir = _write_raw_leaf(tmp_path, benchmark="toy", regime="random_id", seed=0, holdout="random_id",
-                           assignments=[("a", "train")], exclusions=[])
-    m = json.loads((ldir / "manifest.json").read_text())
-    del m["schema_version"]
-    (ldir / "manifest.json").write_text(json.dumps(m))
-    with pytest.raises(SA.SplitArtifactError, match="missing schema_version"):
-        SA.read_manifest(ldir)
-
-
-def test_generation_json_schema_version_is_enforced(tmp_path):
-    root = tmp_path / "splits"
-    _publish_simple(root, "random_id", ["a", "b"], ["a", "b"])  # a real, complete leaf under toy/random_id/0
-    d = SA.regime_seed_dir(root, "toy", "random_id", 0)
-    good = {"schema_version": SA.SCHEMA_VERSION, "benchmark": "toy", "regime": "random_id", "seed": 0,
-            "requested_holdouts": ["random_id"], "yielded_holdouts": ["random_id"],
-            "dropped_holdouts": [], "audit_events": [], "regime_problems": []}
-    (d / "generation.json").write_text(json.dumps(good))
-    assert SA.list_leaves(root, "toy", "random_id", 0) == ["random_id"]  # baseline: a valid version passes
-
-    (d / "generation.json").write_text(json.dumps({**good, "schema_version": 2}))
-    with pytest.raises(SA.SplitArtifactError, match="unsupported schema_version 2"):
-        SA.list_leaves(root, "toy", "random_id", 0)
-
-    (d / "generation.json").write_text(json.dumps({k: v for k, v in good.items() if k != "schema_version"}))
-    with pytest.raises(SA.SplitArtifactError, match="missing schema_version"):
-        SA.list_leaves(root, "toy", "random_id", 0)
-
-
-@pytest.mark.parametrize("domain", ["", "   ", "\t"])
-def test_blank_or_whitespace_domain_in_assignments_is_rejected(tmp_path, domain):
-    ldir = SA.leaf_dir(tmp_path, "toy", "random_id", 0, "random_id")
-    ldir.mkdir(parents=True, exist_ok=True)
-    with open(ldir / "assignments.csv", "w", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(["stable_id", "partition", "domain"])
-        w.writerow(["a", "train", "kenya"])
-        w.writerow(["b", "test", domain])
-    # both readers funnel through the same row parser, so both must reject it
-    with pytest.raises(SA.SplitArtifactError, match="blank/whitespace-only domain for id 'b'"):
-        SA.read_assignments(ldir)
-    with pytest.raises(SA.SplitArtifactError, match="blank/whitespace-only domain for id 'b'"):
-        SA.read_domains(ldir)
+        SA.validate_rows(rows, has_target=has_t, supports_target_labels=supp)
 
 
 # --------------------------------------------------------------------------- #
-# Filesystem-safe holdout names (exact label preserved)
+# Row building: statuses + reasons are honest (assigned / purged / excluded)
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("label", ["kenya", "lem-brazil", "latvia_vs_estonia", "fold_5", "a/b c", "d:e", "%weird"])
-def test_holdout_dirname_roundtrips_and_is_fs_safe(label):
-    d = SA.holdout_dirname(label)
-    assert "/" not in d and " " not in d
-    assert SA.holdout_label(d) == label
-
-
-def test_slashy_label_dir_is_encoded_but_manifest_keeps_exact_label(tmp_path):
-    label = "region/with space"
-    spec = _spec(
-        {"train": ["a"], "val": [], "test": [], "source_val": [], "source_test": []},
-        regime="geographic_ood", label=label,
-        exclusions=[],
+def test_build_tags_assigned_purged_and_excluded_rows():
+    sample_ids = np.array(["p0", "p1", "u0", "x0", "t0", "t1"], dtype=object)
+    domains = np.array(["A", "A", "unknown", "A", "K", "K"], dtype=object)
+    labels = np.array([0, 1, 0, 0, 0, 1])
+    audit = [{"kind": "purge", "purged_indices": [0]}]  # p0 purged
+    split = SourceTargetSplit(
+        label="K", source_train=np.array([], dtype=np.int64), source_val=np.array([1]),
+        source_test=np.array([], dtype=np.int64),
+        target_label_pool=np.array([4]), target_test=np.array([5]),
+        has_target=True, supports_target_labels=True,
     )
-    ldir = SA.publish_leaf(tmp_path, spec, ["a"])
-    assert "/" not in ldir.name and " " not in ldir.name
-    assert SA.read_manifest(ldir)["holdout"] == label
-    assert SA.read_manifest(ldir)["holdout_dirname"] == ldir.name
+    rows, summary = SA.build_tabular_leaf(
+        "toy", "geographic_ood", 0, split=split, domains=domains, labels=labels,
+        sample_ids=sample_ids, audit_events=audit, purge_km=50.0,
+    )
+    by_id = {r["stable_id"]: (r["status"], r["reason"]) for r in rows}
+    assert by_id["p0"] == (SA.STATUS_PURGED, "purged_near_ood")
+    assert by_id["u0"] == (SA.STATUS_EXCLUDED, "unknown_domain")
+    assert by_id["x0"] == (SA.STATUS_EXCLUDED, "unassigned")
+    assert by_id["p1"][0] == SA.STATUS_ASSIGNED
+    # the log summary carries counts (not stable ids) + purge distance
+    assert summary["status_counts"] == {"assigned": 3, "purged": 1, "excluded": 2}
+    assert summary["purge_km"] == 50.0 and summary["purge_count"] == 1
+    assert summary["validation"] == "passed"
+
+
+def test_leaf_summary_has_per_partition_stratification():
+    sample_ids = np.array([f"s{i}" for i in range(6)], dtype=object)
+    domains = np.array(list("SSSSKK"), dtype=object)  # source vs kenya target
+    labels = np.array([0, 1, 0, 1, 0, 1])
+    _rows, summary = SA.build_tabular_leaf(
+        "toy", "geographic_ood", 0, split=_geo_split(), domains=domains, labels=labels,
+        sample_ids=sample_ids, audit_events=[],
+    )
+    # the GLOBAL class/domain/partition counts are gone; only per-partition stratification remains
+    assert "class_counts" not in summary and "domain_counts" not in summary and "partition_counts" not in summary
+    ps = summary["partition_stats"]
+    assert set(ps) == set(SA.PARTITIONS)
+    assert all({"n", "class_counts", "domain_counts"} == set(ps[p]) for p in SA.PARTITIONS)
+    # source_train = rows 0,1 (domain S, classes 0/1); target_test = row 5 (domain K, class 1)
+    assert ps["source_train"] == {"n": 2, "class_counts": {"0": 1, "1": 1}, "domain_counts": {"S": 2}}
+    assert ps["target_test"] == {"n": 1, "class_counts": {"1": 1}, "domain_counts": {"K": 1}}
+
+
+def test_dense_partition_stats_are_patch_level_class_presence():
+    _rows, summary = SA.build_dense_leaf(
+        "pastis", "official", 0, dense_split=_dense_official_split(), audit_events=[], **_dense_cache(),
+    )
+    ps = summary["partition_stats"]
+    # patch 10 has classes {0,1}, patch 11 has {1}: source_train class PRESENCE is 0:1, 1:2 (not pixels)
+    assert ps["source_train"] == {"n": 2, "class_counts": {"0": 1, "1": 2}, "domain_counts": {"1": 1, "2": 1}}
+    # patch 30 (target_test) has classes {0, 2}
+    assert ps["target_test"]["class_counts"] == {"0": 1, "2": 1}
 
 
 # --------------------------------------------------------------------------- #
-# Exclusion reasons/status: proven when available, else unassigned/unknown; never guessed
+# Tabular round-trip (generation -> frozen CSV + central log -> runtime load)
 # --------------------------------------------------------------------------- #
-def test_exclusion_reason_status_from_proof_only():
-    sample_ids = np.array(["p0", "p1", "u0", "x0"], dtype=object)
-    # p0 purged (proof: audit event index 0); u0 has unknown domain (proof: domains); x0 just unassigned
-    domains = np.array(["A", "A", "unknown", "A"], dtype=object)
-    labels = np.array([0, 1, 0, 0])
-    audit = [{"kind": "purge", "purged_train_indices": [0]}]
-    spec, eligible = SA.build_tabular_leaf(
-        "toy", "geographic_ood", 0, label="A",
-        train=[], val=[1], test=[], source_val=[], source_test=[],
-        domains=domains, labels=labels, sample_ids=sample_ids, has_target=True,
-        group_kind="geography", params={}, audit_events=audit,
+def _geo_split(label="kenya"):
+    return SourceTargetSplit(
+        label=label, source_train=np.array([0, 1]), source_val=np.array([2]), source_test=np.array([3]),
+        target_label_pool=np.array([4]), target_test=np.array([5]),
+        has_target=True, supports_target_labels=True, group_kind="geography",
     )
-    by_id = {e["stable_id"]: (e["reason"], e["status"]) for e in spec.exclusions}
-    assert by_id["p0"] == ("purged_near_ood", "proven")
-    assert by_id["u0"] == ("unknown_domain", "proven")
-    assert by_id["x0"] == (SA.UNASSIGNED_REASON, "unknown")
-    # p1 is assigned (val), so it must NOT appear in exclusions
-    assert "p1" not in by_id
+
+
+def test_tabular_round_trip_and_no_stable_ids_in_log(tmp_path):
+    root = _root(tmp_path)
+    sample_ids = np.array([f"s{i}" for i in range(6)], dtype=object)
+    domains = np.array(list("SSSSKK"), dtype=object)
+    labels = np.array([0, 1, 0, 1, 0, 1])
+    entry = _publish_tabular(root, "toy", "geographic_ood", 1, split=_geo_split(),
+                             domains=domains, labels=labels, sample_ids=sample_ids)
+    _write_log(root, [entry])
+
+    # the log entry carries counts + capability + checksum, never stable ids
+    blob = str(entry)
+    assert "s0" not in blob and "sha256" in entry and len(entry["sha256"]) == 64
+    assert entry["has_target"] is True and entry["supports_target_labels"] is True
+
+    loaded = SA.load_tabular_splits(root, "toy", sample_ids, ["geographic_ood"], [1])
+    assert len(loaded) == 1
+    ls = loaded[0]
+    assert ls.split.source_train.tolist() == [0, 1]
+    assert ls.split.target_label_pool.tolist() == [4] and ls.split.target_test.tolist() == [5]
+    # per-sample domain array is reconstructed from the CSV (worst-group scoring)
+    assert ls.domains[4] == "K" and ls.domains[0] == "S"
+
+
+def test_load_checksum_mismatch_is_refused(tmp_path):
+    root = _root(tmp_path)
+    sample_ids = np.array([f"s{i}" for i in range(6)], dtype=object)
+    entry = _publish_tabular(root, "toy", "geographic_ood", 0, split=_geo_split(),
+                             domains=np.array(list("SSSSKK"), dtype=object),
+                             labels=np.array([0, 1, 0, 1, 0, 1]), sample_ids=sample_ids)
+    _write_log(root, [entry])
+    # tamper the frozen CSV after the log recorded its checksum
+    csv_path = SA.assignments_path(root, "toy", "geographic_ood", 0, "kenya")
+    csv_path.write_bytes(csv_path.read_bytes() + b"s6,source_train,assigned,S,\n")
+    with pytest.raises(SA.SplitArtifactError, match="checksum mismatch"):
+        SA.load_tabular_splits(root, "toy", sample_ids, ["geographic_ood"], [0])
+
+
+def test_load_rejects_incomplete_accounting_against_current_population(tmp_path):
+    root = _root(tmp_path)
+    sha = _write_raw_csv(root, "toy", "random_id", 0, "random_id",
+                         [("a", "source_train", "assigned", "d", "")])
+    _write_log(root, [_entry("toy", "random_id", 0, "random_id", sha)])
+    # current benchmark has {a, b}; the CSV only accounts for a
+    with pytest.raises(SA.SplitArtifactError, match="does not account for the current population"):
+        SA.load_tabular_splits(root, "toy", np.array(["a", "b"], dtype=object), ["random_id"], [0])
+
+
+def test_load_rejects_unexpected_id_against_current_population(tmp_path):
+    root = _root(tmp_path)
+    sha = _write_raw_csv(root, "toy", "random_id", 0, "random_id",
+                         [("a", "source_train", "assigned", "d", ""), ("zzz", "source_test", "assigned", "d", "")])
+    _write_log(root, [_entry("toy", "random_id", 0, "random_id", sha)])
+    with pytest.raises(SA.SplitArtifactError, match="does not account for the current population"):
+        SA.load_tabular_splits(root, "toy", np.array(["a", "zzz"], dtype=object)[:1], ["random_id"], [0])
+
+
+def test_load_rejects_route_invariant_violation_on_disk(tmp_path):
+    root = _root(tmp_path)
+    # supports_target_labels=True but no target_label_pool rows -> refuse (route invariant at load)
+    sha = _write_raw_csv(root, "toy", "geographic_ood", 0, "kenya",
+                         [("a", "source_train", "assigned", "k", ""), ("b", "target_test", "assigned", "k", "")])
+    _write_log(root, [_entry("toy", "geographic_ood", 0, "kenya", sha, has_target=True, supports_target_labels=True)])
+    with pytest.raises(SA.SplitArtifactError, match="non-empty target_label_pool"):
+        SA.load_tabular_splits(root, "toy", np.array(["a", "b"], dtype=object), ["geographic_ood"], [0])
+
+
+def test_load_refuses_a_requested_regime_with_zero_leaves(tmp_path):
+    root = _root(tmp_path)
+    sha = _write_raw_csv(root, "toy", "random_id", 0, "random_id", [("a", "source_train", "assigned", "d", "")])
+    _write_log(root, [_entry("toy", "random_id", 0, "random_id", sha)])
+    with pytest.raises(SA.SplitArtifactError, match="zero leaves"):
+        SA.load_tabular_splits(root, "toy", np.array(["a"], dtype=object), ["official"], [0])
+
+
+def test_missing_log_is_refused(tmp_path):
+    with pytest.raises(SA.SplitArtifactError, match="no split log"):
+        SA.load_tabular_splits(_root(tmp_path), "toy", np.array(["a"], dtype=object), ["random_id"], [0])
 
 
 # --------------------------------------------------------------------------- #
-# Dense (PASTIS) leaves are patch-level; stable ids are patch ids
+# Dense (PASTIS) leaves are patch-level; official/geographic structural checks
 # --------------------------------------------------------------------------- #
-def test_dense_leaf_is_patch_level(tmp_path):
-    from evals.regimes.base import DenseSplit
+def _dense_official_split():
+    return DenseSourceTargetSplit(
+        label="fold_5",
+        source_train_patches=frozenset({10, 11}), source_val_patches=frozenset({20}),
+        source_test_patches=frozenset({12}),
+        target_label_pool_patches=frozenset(), target_test_patches=frozenset({30}),
+        has_target=True, supports_target_labels=False, group_kind="geography",
+    )
 
-    cfg = DenseSplit(
-        label="fold_5", train_folds={1, 2, 3}, val_folds={4}, test_folds={5},
-        train_patches={10, 11}, val_patches={20}, test_patches={30},
-        source_val_patches=set(), source_test_patches=set(), has_target=True, group_kind="geography",
+
+def _dense_cache():
+    return dict(
+        all_patch_ids=[10, 11, 12, 20, 30, 99],  # 99 has no coords -> no_coords exclusion
+        domain_of={10: "1", 11: "2", 12: "3", 20: "4", 30: "5", 99: "3"},  # fold as domain
+        class_sets={10: {0, 1}, 11: {1}, 12: {0}, 20: {0}, 30: {0, 2}, 99: {0}},
+        patch_latlon={10: (1.0, 2.0), 11: (1.1, 2.0), 12: (1.2, 2.0), 20: (3.0, 4.0),
+                      30: (5.0, 6.0), 99: (np.nan, np.nan)},
     )
-    dense_cache = dict(
-        all_patch_ids=[10, 11, 20, 30, 99],  # 99 has no coords -> proven no_coords exclusion
-        fold_of={10: 1, 11: 2, 20: 4, 30: 5, 99: 3},
-        class_sets={10: {0, 1}, 11: {1}, 20: {0}, 30: {0, 2}, 99: {0}},
-        patch_latlon={10: (1.0, 2.0), 11: (1.1, 2.0), 20: (3.0, 4.0), 30: (5.0, 6.0), 99: (np.nan, np.nan)},
+
+
+def test_dense_leaf_is_patch_level_with_no_coords_exclusion():
+    rows, summary = SA.build_dense_leaf(
+        "pastis", "official", 0, dense_split=_dense_official_split(), audit_events=[], **_dense_cache(),
     )
-    spec, eligible = SA.build_dense_leaf(
-        "pastis", "official", 0, cfg=cfg, bench=SimpleNamespace(), params={"assembly_seed": 0},
-        audit_events=[], **dense_cache,
+    by_id = {r["stable_id"]: (r["partition"], r["status"], r["reason"]) for r in rows}
+    assert by_id["10"] == ("source_train", "assigned", "")
+    assert by_id["30"] == ("target_test", "assigned", "")
+    assert by_id["99"] == ("", "excluded", "no_coords")
+    assert summary["target_unit"] == "patch" and summary["supports_target_labels"] is False
+
+
+def _dense_patch_fold():
+    return {10: 1, 11: 2, 12: 3, 20: 4, 30: 5, 99: 3}
+
+
+def test_dense_official_load_rejects_changed_fold(tmp_path):
+    root = _root(tmp_path)
+    entry = _publish_dense(root, "pastis", "official", 0, dense_split=_dense_official_split(), cache=_dense_cache())
+    _write_log(root, [entry])
+    patch_fold = _dense_patch_fold()
+    patch_tile = {p: "T31TFM" for p in patch_fold}
+    by_seed = SA.load_dense_splits(root, "pastis", patch_fold, patch_tile, ["official"], [0])
+    assert by_seed[0][0].split.target_test_patches == frozenset({30})
+    patch_fold[30] = 2  # target_test patch's published fold shifts 5 -> 2
+    with pytest.raises(SA.SplitArtifactError, match="published fold"):
+        SA.load_dense_splits(root, "pastis", patch_fold, patch_tile, ["official"], [0])
+
+
+def test_dense_geographic_load_rejects_changed_tile(tmp_path):
+    root = _root(tmp_path)
+    split = DenseSourceTargetSplit(
+        label="T31TFM",
+        source_train_patches=frozenset({10, 11}), source_val_patches=frozenset({12}),
+        source_test_patches=frozenset({20}),
+        target_label_pool_patches=frozenset({30}), target_test_patches=frozenset({40}),
+        has_target=True, supports_target_labels=True, group_kind="geography",
     )
-    ldir = SA.publish_leaf(tmp_path, spec, eligible)
-    assigns = SA.read_assignments(ldir)
-    assert assigns["train"] == ["10", "11"] and assigns["test"] == ["30"]
-    # patch 99 excluded, proven no_coords
-    excl = {e["stable_id"]: (e["reason"], e["status"]) for e in SA.read_exclusions(ldir)}
-    assert excl["99"] == ("no_coords", "proven")
-    assert SA.read_manifest(ldir)["target_unit"] == "patch"
+    cache = dict(
+        all_patch_ids=[10, 11, 12, 20, 30, 40],
+        domain_of={10: "T30UXV", 11: "T30UXV", 12: "T31TFJ", 20: "T32ULU", 30: "T31TFM", 40: "T31TFM"},
+        class_sets={p: {0, 1} for p in [10, 11, 12, 20, 30, 40]},
+        patch_latlon={p: (1.0, 2.0) for p in [10, 11, 12, 20, 30, 40]},
+    )
+    entry = _publish_dense(root, "pastis", "geographic_ood", 0, dense_split=split, cache=cache)
+    _write_log(root, [entry])
+    patch_fold = {p: 1 for p in cache["all_patch_ids"]}
+    patch_tile = dict(cache["domain_of"])
+    SA.load_dense_splits(root, "pastis", patch_fold, patch_tile, ["geographic_ood"], [0])  # OK
+    patch_tile[40] = "T30UXV"  # a target patch's tile changed
+    with pytest.raises(SA.SplitArtifactError, match="Sentinel tile"):
+        SA.load_dense_splits(root, "pastis", patch_fold, patch_tile, ["geographic_ood"], [0])
+
+
+def test_dense_spatial_load_does_not_recompute_clusters(tmp_path, monkeypatch):
+    """Spatial cells are frozen in the CSV; loading must consume them without re-clustering."""
+    root = _root(tmp_path)
+    split = DenseSourceTargetSplit(
+        label="cluster_00",
+        source_train_patches=frozenset({10, 11}), source_val_patches=frozenset({12}),
+        source_test_patches=frozenset({20}),
+        target_label_pool_patches=frozenset({30}), target_test_patches=frozenset({40}),
+        has_target=True, supports_target_labels=True, group_kind="spatial_cluster",
+    )
+    cache = dict(
+        all_patch_ids=[10, 11, 12, 20, 30, 40],
+        domain_of={p: "cluster_00" for p in [10, 11, 12, 20, 30, 40]},
+        class_sets={p: {0, 1} for p in [10, 11, 12, 20, 30, 40]},
+        patch_latlon={p: (1.0, 2.0) for p in [10, 11, 12, 20, 30, 40]},
+    )
+    entry = _publish_dense(root, "pastis", "spatial_cluster_ood", 0, dense_split=split, cache=cache)
+    _write_log(root, [entry])
+    import evals.regimes.spatial_cluster_ood as sc
+    monkeypatch.setattr(sc, "_cell_labels", lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError("must not recompute clusters at load")))
+    patch_fold = {p: 1 for p in cache["all_patch_ids"]}
+    by_seed = SA.load_dense_splits(root, "pastis", patch_fold, dict(cache["domain_of"]), ["spatial_cluster_ood"], [0])
+    assert by_seed[0][0].split.target_test_patches == frozenset({40})

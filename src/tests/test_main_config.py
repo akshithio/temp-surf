@@ -97,13 +97,13 @@ def test_s2_only_uses_original_coordinates_for_split_regimes(monkeypatch, tmp_pa
         seen["embedding_modalities"] = loaded.available_modalities()
         return np.zeros((n, 2), dtype=np.float32)
 
-    # PHASE B: main consumes splits via split_artifacts.load_tabular_splits, which receives the
-    # ORIGINAL (non-s2only) bench -- capture there to assert the split path sees original coordinates
-    # while the embedding path sees the s2only-zeroed ones.
-    def load_tabular_splits(_root, _benchmark, _sample_ids, loaded, _bench_mod, _regimes, _seeds):
-        seen["regime_latlon"] = np.asarray(loaded.latlon).copy()
-        seen["regime_modalities"] = loaded.available_modalities()
-        return [], []
+    # PHASE B (schema v2): main consumes PRE-GENERATED splits via split_artifacts.load_tabular_splits,
+    # which receives only the ORIGINAL (non-s2only) bench's stable sample_ids -- the runtime split path
+    # is coordinate-free (coordinates were baked into the offline artifacts). Capture the ids to assert
+    # the load ran on the original bench.
+    def load_tabular_splits(_root, _benchmark, sample_ids, _regimes, _seeds):
+        seen["regime_sample_ids"] = None if sample_ids is None else np.asarray(sample_ids).copy()
+        return []
 
     monkeypatch.setattr(main.cacheutils, "load_cached_embeddings", load_embeddings)
     monkeypatch.setattr(main.split_artifacts, "load_tabular_splits", load_tabular_splits)
@@ -130,8 +130,12 @@ def test_s2_only_uses_original_coordinates_for_split_regimes(monkeypatch, tmp_pa
 
     assert np.all(seen["embedding_latlon"] == 0.0)
     assert "latlon" not in seen["embedding_modalities"]
-    np.testing.assert_array_equal(seen["regime_latlon"], latlon)
-    assert "latlon" in seen["regime_modalities"]
+    # v2: the split-consumption path was invoked (on the original bench's sample_ids), and s2_only()
+    # returned a zeroed COPY for the embedding path WITHOUT mutating the original bench that the split
+    # generator/consumer uses -- so split regimes still rest on original coordinates.
+    assert "regime_sample_ids" in seen  # load_tabular_splits ran before any s2only transform
+    np.testing.assert_array_equal(bench.latlon, latlon)
+    assert "latlon" in bench.available_modalities()
 
 
 def test_compatibility_table_excludes_only_blocked_pairs() -> None:
