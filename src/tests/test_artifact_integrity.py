@@ -13,10 +13,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from evals import probes
 from evals.metrics import _class_index
 from evals.regimes import base as RB
 from utils import artifacts, runstate
 from utils import ioutils as IOU
+from utils import perfutils as perf
 
 # --- torn JSONL tail --------------------------------------------------------
 
@@ -120,64 +122,37 @@ def test_class_index_is_correct_for_unsorted_classes() -> None:
     assert _class_index(y, classes).tolist() == [2, 0, 1, -1]
 
 
-# --- signature env knobs ----------------------------------------------------
+# --- signature knobs (PROBE_CAP / PROBE_TUNING) -----------------------------
 
 
-def test_knob_parts_are_empty_for_every_semantic_default(monkeypatch) -> None:
-    """Backwards compatibility: an unset/zero/false knob must add NOTHING, or every existing
-    results directory stops resuming."""
-    for cap in (None, "", "0", "false", "no", "  ", "-1"):
-        for tune in (None, "", "0", "false", "no"):
-            monkeypatch.delenv("RB_PROBE_CAP", raising=False)
-            monkeypatch.delenv("RB_PROBE_TUNING", raising=False)
-            if cap is not None:
-                monkeypatch.setenv("RB_PROBE_CAP", cap)
-            if tune is not None:
-                monkeypatch.setenv("RB_PROBE_TUNING", tune)
-            assert artifacts.result_defining_env_parts() == [], f"cap={cap!r} tune={tune!r}"
-
-
-def test_knob_parts_normalize_enabled_values(monkeypatch) -> None:
-    monkeypatch.setenv("RB_PROBE_CAP", "50000")
-    monkeypatch.setenv("RB_PROBE_TUNING", "1")
-    assert artifacts.result_defining_env_parts() == ["probe_cap=50000", "probe_tuning=1"]
-
-    monkeypatch.setenv("RB_PROBE_CAP", " 50000.0 ")  # same setting, different spelling
-    assert artifacts.result_defining_env_parts() == ["probe_cap=50000", "probe_tuning=1"]
-
-    monkeypatch.setenv("RB_PROBE_TUNING", "TRUE")
-    assert "probe_tuning=1" in artifacts.result_defining_env_parts()
+# A stable stub run manifest shared by the monkeypatch stubs and the "finished dir" seeder, so the
+# manifest resume check passes and it is the ENVIRONMENT gate that decides refused-resume tests.
+_STUB_MANIFEST = {"stub": "run", "schema": 1}
 
 
 def _sig(**over):
     kwargs = dict(
-        model_name="raw", tag="cropharvest", split_regimes=["random_id"], seeds=[0],
+        model_name="raw", benchmark="cropharvest", artifact="baseline",
+        embedding_manifest_sha256="emb", split_regimes=["random_id"], seeds=[0],
         enc_kwargs={}, active_probes=["logistic"],
-        budget_regimes={"source": [1.0]}, max_samples=None, max_dense_pixels=None,
+        budget_regimes={"source": [1.0]}, max_dense_pixels=None,
     )
     kwargs.update(over)
-    return runstate.run_signature(**kwargs)
+    man = runstate.build_run_manifest(
+        kwargs["model_name"], kwargs["benchmark"], kwargs["artifact"], kwargs["embedding_manifest_sha256"],
+        kwargs["split_regimes"], kwargs["seeds"], kwargs["enc_kwargs"],
+        active_probes=kwargs["active_probes"], budget_regimes=kwargs["budget_regimes"],
+        max_dense_pixels=kwargs["max_dense_pixels"], write_predictions=True,
+    )
+    return runstate.run_manifest_digest(man)
 
 
-def test_signature_is_unchanged_when_knobs_are_at_their_defaults(monkeypatch) -> None:
-    monkeypatch.delenv("RB_PROBE_CAP", raising=False)
-    monkeypatch.delenv("RB_PROBE_TUNING", raising=False)
+def test_signature_changes_when_the_probe_cap_is_set(monkeypatch) -> None:
     baseline = _sig()
 
-    monkeypatch.setenv("RB_PROBE_CAP", "0")
-    monkeypatch.setenv("RB_PROBE_TUNING", "false")
-
-    assert _sig() == baseline, "a semantic default must not perturb the signature"
-
-
-def test_signature_changes_when_a_knob_is_enabled(monkeypatch) -> None:
-    monkeypatch.delenv("RB_PROBE_CAP", raising=False)
-    monkeypatch.delenv("RB_PROBE_TUNING", raising=False)
-    baseline = _sig()
-
-    monkeypatch.setenv("RB_PROBE_CAP", "50000")
+    monkeypatch.setattr(perf, "PROBE_CAP", 50000)
     capped = _sig()
-    monkeypatch.setenv("RB_PROBE_CAP", "100000")
+    monkeypatch.setattr(perf, "PROBE_CAP", 100000)
     capped_bigger = _sig()
 
     assert capped != baseline, "a capped run must not share the uncapped run's signature"
@@ -185,11 +160,9 @@ def test_signature_changes_when_a_knob_is_enabled(monkeypatch) -> None:
 
 
 def test_signature_changes_when_probe_tuning_is_enabled(monkeypatch) -> None:
-    monkeypatch.delenv("RB_PROBE_CAP", raising=False)
-    monkeypatch.delenv("RB_PROBE_TUNING", raising=False)
     baseline = _sig()
 
-    monkeypatch.setenv("RB_PROBE_TUNING", "1")
+    monkeypatch.setattr(probes, "PROBE_TUNING", True)
 
     assert _sig() != baseline
 
@@ -434,7 +407,7 @@ def test_completion_validation_checks_the_environment_schema_not_just_its_hash(t
 
 # --- real-path regressions: a REFUSED resume must not touch anything ---------
 #
-# The guards live in artifacts, but the ORDER lives in the callers: check_run_signature ->
+# The guards live in artifacts, but the ORDER lives in the callers: check_run_manifest ->
 # write_environment -> invalidate_run_complete. Get that order wrong and a refused resume deletes
 # the completion marker of the finished run it just declined to touch. Only a test through the
 # real entry points can see that, so these drive main._run_tabular_pair and
@@ -449,9 +422,9 @@ def _seed_finished_dir(results_dir, env: dict) -> bytes:
     for name in ("probe_results.csv", "summary.csv", "deltas.csv", "split_manifest.json"):
         (results_dir / name).write_text('{"a": 1}\n')
     IOU.write_json(results_dir / "environment.json", env)
-    (results_dir / "run_signature.txt").write_text("sig")
+    IOU.write_json(results_dir / "run_manifest.json", _STUB_MANIFEST)
     artifacts.write_run_complete(
-        results_dir, signature="sig", expected_keys={_key()}, rows=rows,
+        results_dir, run_manifest_sha256="sig", expected_keys={_key()}, rows=rows,
     )
     return (results_dir / "run_complete.json").read_bytes()
 
@@ -496,16 +469,15 @@ def _run_tabular(monkeypatch, tmp_path, *, overwrite=False):
 
     monkeypatch.setattr(main.EV, "load_benchmark", lambda _n: FakeBenchMod)
     monkeypatch.setattr(main.cacheutils, "OUTPUT_DIR", tmp_path)
-    monkeypatch.setattr(main.cacheutils, "bench_tag", lambda *a, **k: "tag")
     monkeypatch.setattr(main.cacheutils, "cached_bench", lambda *a, **k: bench)
-    monkeypatch.setattr(main.runstate, "run_signature", lambda *a, **k: "sig")
+    monkeypatch.setattr(main.runstate, "build_run_manifest", lambda *a, **k: _STUB_MANIFEST)
     monkeypatch.setattr(main.compat, "input_modalities", lambda _m: set())
     monkeypatch.setattr(main.cacheutils, "load_cached_embeddings",
                         lambda *a, **k: np.zeros((6, 2), dtype=np.float32))
     monkeypatch.setattr(main.regime_base, "iter_splits", lambda *a, **k: iter(()))
     main._run_tabular_pair(
-        "fake", "raw", [0], None, 0, ["random_id"], ["probing"], ["logistic"],
-        {"source": [1.0], "target": [0]}, overwrite, False, {},
+        "fake", "raw", [0], 0, ["random_id"], ["probing"], ["logistic"],
+        {"source": [1.0], "target": [0]}, False, overwrite, False, {},  # s2_only=False
     )
 
 
@@ -563,8 +535,7 @@ def _dense_stubs(monkeypatch, tmp_path):
     from utils import runstate as RS
 
     monkeypatch.setattr(RS.cacheutils, "OUTPUT_DIR", tmp_path)
-    monkeypatch.setattr(RS.cacheutils, "bench_tag", lambda *a, **k: "tag")
-    monkeypatch.setattr(RS, "run_signature", lambda *a, **k: "sig")
+    monkeypatch.setattr(RS, "build_run_manifest", lambda *a, **k: _STUB_MANIFEST)
     monkeypatch.setattr(RS.cacheutils, "cached_bench", lambda *a, **k: SimpleNamespace(
         name="pastis", data_quality=None, patch_classes=None, n_samples=4))
     # The dense cache is content-addressed off the benchmark; stub the lookup so the test reaches
@@ -576,8 +547,8 @@ def _dense_stubs(monkeypatch, tmp_path):
 
 def _run_dense(RS, *, overwrite=False):
     RS._run_segmentation_pair(
-        "pastis", "raw", [0], None, 10, ["random_id"], ["probing"], ["logistic"],
-        {"source": [1.0], "target": [0]}, overwrite, False, False, {},
+        "pastis", "raw", [0], 10, ["random_id"], ["probing"], ["logistic"],
+        {"source": [1.0], "target": [0]}, False, overwrite, False, False, {},  # s2_only=False
     )
 
 
@@ -668,16 +639,15 @@ def _run_dense_healthy(monkeypatch, tmp_path):
     emb_dir = _dense_cache_on_disk(tmp_path / "emb")
 
     monkeypatch.setattr(RS.cacheutils, "OUTPUT_DIR", tmp_path / "out")
-    monkeypatch.setattr(RS.cacheutils, "bench_tag", lambda *a, **k: "tag")
     monkeypatch.setattr(RS.cacheutils, "cached_bench", lambda *a, **k: SimpleNamespace(
         name="pastis", data_quality=None, patch_classes=None, n_samples=4))
     monkeypatch.setattr(RS.cacheutils, "require_dense_cache", lambda *a, **k: emb_dir)
-    monkeypatch.setattr(RS, "run_signature", lambda *a, **k: "sig")
+    monkeypatch.setattr(RS, "build_run_manifest", lambda *a, **k: _STUB_MANIFEST)
     monkeypatch.setattr(artifacts, "capture_environment", lambda repo=None: _env(sklearn="1.9.0"))
 
     RS._run_segmentation_pair(
-        "pastis", "raw", [0], None, 10_000, ["random_id"], ["probing"], ["logistic"],
-        {"source": [1.0], "target": [0]}, False, True, False, {},
+        "pastis", "raw", [0], 10_000, ["random_id"], ["probing"], ["logistic"],
+        {"source": [1.0], "target": [0]}, False, False, True, False, {},  # s2_only=False
     )
     return tmp_path / "out" / "results" / "raw" / "pastis"
 
@@ -691,7 +661,9 @@ def test_dense_pair_schedules_and_executes_a_real_cell(monkeypatch, tmp_path) ->
 
     # write_run_complete raises IncompleteRunError rather than publishing a partial marker, so
     # reaching here already means the pair finished; validate it the way a reader would.
-    ok, problems = artifacts.validate_run_complete(results_dir, expected_signature="sig")
+    ok, problems = artifacts.validate_run_complete(
+        results_dir, expected_signature=runstate.run_manifest_digest(_STUB_MANIFEST)
+    )
     assert ok, problems
 
 
@@ -879,7 +851,7 @@ def _finished(tmp_path, *, keys=None, rows=None, signature="sigABC", **kw):
         (tmp_path / name).write_text('{"a": 1}\n')
     IOU.write_json(tmp_path / "environment.json", _env())  # a COMPLETE record; the schema is validated
     return artifacts.write_run_complete(
-        tmp_path, signature=signature, expected_keys=keys, rows=rows, **kw
+        tmp_path, run_manifest_sha256=signature, expected_keys=keys, rows=rows, **kw
     )
 
 
@@ -897,7 +869,7 @@ def test_marker_refuses_when_a_required_artifact_is_absent(tmp_path) -> None:
     # summary.csv / deltas.csv / environment.json / split_manifest.json never written
 
     with pytest.raises(artifacts.IncompleteRunError, match="required artifact\\(s\\) absent"):
-        artifacts.write_run_complete(tmp_path, signature="s", expected_keys={_key()}, rows=rows)
+        artifacts.write_run_complete(tmp_path, run_manifest_sha256="s", expected_keys={_key()}, rows=rows)
 
     assert artifacts.read_run_complete(tmp_path) is None
 
@@ -1003,7 +975,7 @@ def test_validation_catches_rows_appended_after_completion(tmp_path) -> None:
 
 
 def test_a_started_but_unfinished_run_does_not_validate(tmp_path) -> None:
-    (tmp_path / "run_signature.txt").write_text("sigABC")
+    IOU.write_json(tmp_path / "run_manifest.json", {"stub": "started"})
     IOU.append_jsonl(tmp_path / "probe_results.jsonl", [_row()])
 
     ok, problems = artifacts.validate_run_complete(tmp_path)
@@ -1037,6 +1009,8 @@ def _historical(tmp_path, n=5):
     for name in ("probe_results.csv", "summary.csv", "deltas.csv", "split_manifest.json"):
         (tmp_path / name).write_text("a\n1\n")
     IOU.write_json(tmp_path / "environment.json", _env())
+    # A genuinely historical dir carries the OLD run_signature.txt; the (kept) run-complete backfill
+    # reads it to preserve that signature. New runs never need this path.
     (tmp_path / "run_signature.txt").write_text("historicalsig")
 
 

@@ -11,7 +11,7 @@ is invisible. ``environment.json`` puts the versions next to the numbers they pr
 resume that would append rows from a DIFFERENT numerical core is refused rather than silently
 mixing two environments into one results table.
 
-**Completion.** ``run_signature.txt`` is published BEFORE any work starts, so it marks *started*,
+**Completion.** ``run_manifest.json`` is published BEFORE any work starts, so it marks *started*,
 not *finished*. The derived artifacts (``summary.csv``, ``deltas.csv``, ``probe_results.csv``) are
 written only at the very end, so a pair killed mid-probe-loop leaves STALE derived files beside a
 now-larger ``probe_results.jsonl``, with nothing signalling that they disagree -- and those files
@@ -19,9 +19,9 @@ are read directly by the figure scripts. ``run_complete.json`` is written last, 
 only when the pair is provably complete: every required artifact present, every planned cell
 realized exactly once, and no declared regime dropped.
 
-This module is deliberately NOT in ``runstate.run_signature``'s hashed file list: recording what
-an environment was, or that a run finished, must never change the identity of the run it
-describes. Fields can be added here without invalidating a single existing results directory.
+This module is deliberately NOT part of the run manifest's identity: recording what an environment
+was, or that a run finished, must never change the identity of the run it describes. Fields can be
+added here without invalidating a single existing results directory.
 """
 
 from __future__ import annotations
@@ -29,7 +29,6 @@ from __future__ import annotations
 import collections
 import hashlib
 import json
-import os
 import platform
 import subprocess
 import sys
@@ -41,6 +40,7 @@ from utils import ioutils as IOU
 
 ENVIRONMENT_FILE = "environment.json"
 RUN_COMPLETE_FILE = "run_complete.json"
+RUN_MANIFEST_FILE = "run_manifest.json"
 SCHEMA_VERSION = 1
 
 #: Versions pinned for COMPARABILITY with the canonical run -- a drift in any of these silently
@@ -280,13 +280,6 @@ def capture_environment(repo: Path | None = None) -> dict[str, Any]:
         "cuda": cuda,
         "git": git_identity(repo),
     }
-
-
-def read_environment(results_dir: Path) -> dict[str, Any] | None:
-    """The recorded environment, or None if absent OR malformed. Callers that must tell those two
-    apart -- because they mean different things beside existing rows -- use environment_state."""
-    _state, env = environment_state(results_dir)
-    return env
 
 
 def environment_state(results_dir: Path) -> tuple[str, dict[str, Any] | None]:
@@ -552,7 +545,7 @@ def invalidate_run_complete(results_dir: Path) -> bool:
 def write_run_complete(
     results_dir: Path,
     *,
-    signature: str,
+    run_manifest_sha256: str,
     expected_keys: set[tuple],
     rows: list[dict[str, Any]],
     regime_problems: Any = (),
@@ -600,7 +593,7 @@ def write_run_complete(
 
     payload: dict[str, Any] = {
         "schema": SCHEMA_VERSION,
-        "signature": signature,
+        "run_manifest_sha256": run_manifest_sha256,
         "expected_cells": comp["expected"],
         "actual_rows": comp["actual_rows"],
         "completed_at": datetime.now(UTC).isoformat(),
@@ -641,8 +634,9 @@ def validate_run_complete(
         return False, [f"no readable {RUN_COMPLETE_FILE} -- the run is started, not known finished"]
 
     problems: list[str] = []
-    if expected_signature is not None and marker.get("signature") != expected_signature:
-        problems.append(f"signature mismatch: marker={marker.get('signature')} expected={expected_signature}")
+    marker_sig = marker.get("run_manifest_sha256", marker.get("signature"))  # legacy markers used "signature"
+    if expected_signature is not None and marker_sig != expected_signature:
+        problems.append(f"run_manifest_sha256 mismatch: marker={marker_sig} expected={expected_signature}")
 
     rows_path = results_dir / "probe_results.jsonl"
     rows: list[dict[str, Any]] | None
@@ -722,6 +716,11 @@ def backfill_run_complete(
     directory as complete, which is the precise failure this whole mechanism exists to catch.
     ``verified_by`` and ``note`` are mandatory so a backfill cannot be anonymous or swept over a
     tree in a loop.
+
+    TEMPORARY -- this backfill path (and its ``run_signature.txt`` read, the only remaining reference
+    to that retired file) is pre-release cleanup support for the pre-marker canonical directories. It
+    is removed once those directories are re-certified or retired; nothing in the frozen run writes
+    ``run_signature.txt`` any more.
     """
     if not verified_by or not note:
         raise ValueError("backfill_run_complete requires verified_by and note: a backfilled "
@@ -769,41 +768,3 @@ def backfill_run_complete(
         payload["artifacts"][name] = {"sha256": sha256_file(path), "bytes": path.stat().st_size}
     IOU.write_json(results_dir / RUN_COMPLETE_FILE, payload)
     return payload
-
-
-def probe_cap_setting() -> int | None:
-    """Normalized RB_PROBE_CAP: None for every spelling that means "no cap"."""
-    raw = os.environ.get("RB_PROBE_CAP", "").strip().lower()
-    if not raw or raw in ("0", "false", "no"):
-        return None
-    try:
-        cap = int(float(raw))
-    except ValueError:
-        return None
-    return cap if cap > 0 else None
-
-
-def probe_tuning_enabled() -> bool:
-    """Normalized RB_PROBE_TUNING (formerly RB_METHOD_TUNING -- see evals.probes)."""
-    return os.environ.get("RB_PROBE_TUNING", "").strip().lower() in ("1", "true", "yes")
-
-
-def result_defining_env_parts() -> list[str]:
-    """Signature parts for env knobs that change the numbers.
-
-    Both knobs are read into module-level constants at import, so ``run_signature``'s ``code=``
-    hash -- which digests file BYTES -- cannot see them: a capped and an uncapped run of the same
-    cell hash identically, and the per-row resume would then suppress the rerun. Only the
-    RB_OUTPUT_DIR convention has kept those apart.
-
-    Returns [] for the semantic default (both off), so every signature ever computed for a default
-    run is byte-identical to what it was before this existed and every canonical results
-    directory still resumes. Only an enabled knob adds a part.
-    """
-    parts: list[str] = []
-    cap = probe_cap_setting()
-    if cap is not None:
-        parts.append(f"probe_cap={cap}")
-    if probe_tuning_enabled():
-        parts.append("probe_tuning=1")
-    return parts

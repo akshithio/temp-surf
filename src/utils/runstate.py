@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+from pathlib import Path
 
 import numpy as np
 from joblib import Parallel, delayed
@@ -22,90 +25,102 @@ def validate_run_stages(run_stages: list[str]) -> set[str]:
     return stages
 
 
-def run_signature(
+def build_run_manifest(
     model_name: str,
-    tag: str,
+    benchmark: str,
+    artifact: str,
+    embedding_digest: str | None,
     split_regimes,
     seeds,
     enc_kwargs,
     *,
     active_probes,
     budget_regimes,
-    max_samples,
     max_dense_pixels,
     write_predictions: bool = True,
-) -> str:
-    src = cacheutils.REPO / "src"
-    code = cacheutils._hash_files(
-        src / "main.py",
-        *(p for p in [src / "evals" / "probes.py"] if p.exists()),
-        *sorted((src / "evals" / "probes").glob("*.py")),
-        src / "evals" / "evals.py",
-        src / "evals" / "confounds.py",
-        src / "evals" / "metrics.py",
-        src / "evals" / "regimes" / "base.py",
-        src / "utils" / "ioutils.py",
-        src / "utils" / "cacheutils.py",
-        src / "utils" / "perfutils.py",
-        src / "utils" / "runstate.py",
-        *cacheutils._model_source_files(model_name),
-        *sorted((src / "evals" / "regimes").glob("*.py")),
-    )
+) -> dict:
+    """A readable, exact-match final-run manifest. Records every result-affecting knob plus the
+    final commit, uv.lock digest, numerical-core deps, and the embedding's recorded content digest
+    (artifact SHA for tabular, tile-set digest for dense)."""
+    from evals import probes as _probes
+
+    fi = cacheutils.frozen_run_identity()
+    env = artifacts.capture_environment()
     enc = {k: v for k, v in sorted(enc_kwargs.items()) if k != "device"}
-    parts = [
-        f"tag={tag}",
-        f"ckpt={cacheutils._checkpoint_fingerprint(model_name, enc_kwargs.get('weights_path'))}",
-        f"probes={active_probes}",
-        # Literal: the harness is ERM-only by construction. Kept in the parts list so the
-        # signature string keeps its shape and self-documents that these rows are ERM.
-        "methods=['erm']",
-        f"budgets={budget_regimes}",
-        f"seeds={list(seeds)}",
-        f"regimes={sorted(split_regimes)}",
-        f"max_samples={max_samples}",
-        f"max_dense_pixels={max_dense_pixels}",
-        f"write_predictions={write_predictions}",
-        f"enc={enc}",
-        f"code={code}",
-    ]
-    # Env knobs that change the numbers but are invisible to `code=` (they are read into
-    # module-level constants at import, so the file bytes never move). Empty for the semantic
-    # default, which keeps every previously-computed signature byte-identical and every existing
-    # results directory resumable -- see artifacts.result_defining_env_parts.
-    parts.extend(artifacts.result_defining_env_parts())
-    return cacheutils._hash_str("|".join(map(str, parts)))
+    return {
+        "schema": artifacts.SCHEMA_VERSION,
+        "final_commit": fi["final_commit"],
+        "clean_tree": fi["clean"],
+        "tree_identity": fi["tree_identity"],
+        "uv_lock_digest": artifacts.sha256_file(cacheutils.REPO / "uv.lock"),
+        "deps": env.get("numerical_core", {}),
+        "python": env.get("python"),
+        "benchmark": benchmark,
+        "model": model_name,
+        "embedding": {"artifact": artifact, "digest": embedding_digest},
+        "seeds": sorted(int(s) for s in seeds),
+        "regimes": sorted(split_regimes),
+        "budgets": list(budget_regimes),
+        "probes": list(active_probes),
+        "probe_cap": perf.PROBE_CAP or 0,          # the committed PROBE_CAP main.py pushed into perfutils
+        "probe_tuning": bool(_probes.PROBE_TUNING),  # the committed PROBE_TUNING main.py pushed into probes
+        "max_dense_pixels": max_dense_pixels,
+        "write_predictions": bool(write_predictions),
+        "enc": enc,
+    }
 
 
-def check_run_signature(results_dir, signature: str, *, overwrite_mode: bool) -> None:
+def run_manifest_digest(manifest: dict) -> str:
+    """Canonical SHA-256 of a run manifest -- the stable id recorded in the completion marker."""
+    return hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _manifest_diffs(old: dict, new: dict) -> list[str]:
+    """Exact field-by-field differences, reported as ``key: old != new`` (recurses one level)."""
+    diffs: list[str] = []
+    for key in sorted(set(old) | set(new)):
+        a, b = old.get(key), new.get(key)
+        if a == b:
+            continue
+        if isinstance(a, dict) and isinstance(b, dict):
+            for sub in sorted(set(a) | set(b)):
+                if a.get(sub) != b.get(sub):
+                    diffs.append(f"{key}.{sub}: {a.get(sub)!r} != {b.get(sub)!r}")
+        else:
+            diffs.append(f"{key}: {a!r} != {b!r}")
+    return diffs
+
+
+def check_run_manifest(results_dir, manifest: dict, *, overwrite_mode: bool) -> None:
+    """Resume only under an EXACT final-run manifest match; otherwise refuse with the exact diffs."""
     if overwrite_mode:
         return
-    sig_path = results_dir / "run_signature.txt"
+    results_dir = Path(results_dir)
+    man_path = results_dir / artifacts.RUN_MANIFEST_FILE
     rows_path = results_dir / "probe_results.jsonl"
-    if sig_path.exists():
-        existing = sig_path.read_text().strip()
-        if existing != signature:
+    if man_path.exists():
+        try:
+            existing = json.loads(man_path.read_text())
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"Refusing to resume {results_dir}: {artifacts.RUN_MANIFEST_FILE} is unreadable ({exc}).") from exc
+        diffs = _manifest_diffs(existing, manifest)
+        if diffs:
             raise RuntimeError(
-                f"Refusing to resume {results_dir}: signature {existing[:10]!r} != {signature[:10]!r} "
-                "(different experiment config, or a corrupt/partial signature). Set OVERWRITE_MODE=True "
-                "or remove the directory."
+                f"Refusing to resume {results_dir}: final-run manifest differs from this run:\n  - "
+                + "\n  - ".join(diffs)
+                + "\nSet OVERWRITE_MODE=True or use a fresh results dir."
             )
     elif rows_path.exists() and rows_path.stat().st_size > 0:
         raise RuntimeError(
-            f"Refusing to resume {results_dir}: it has results but NO run_signature.txt (a pre-guard "
-            "or foreign run). Verify they match this config and write the signature, or use "
-            "OVERWRITE_MODE=True."
+            f"Refusing to resume {results_dir}: it has results but NO {artifacts.RUN_MANIFEST_FILE} "
+            "(a pre-guard or foreign run). Verify they match this config, or use OVERWRITE_MODE=True."
         )
 
 
-def publish_run_signature(results_dir, signature: str) -> None:
+def publish_run_manifest(results_dir, manifest: dict) -> None:
+    results_dir = Path(results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
-    sig_path = results_dir / "run_signature.txt"
-    tmp = cacheutils._atomic_tmp(sig_path)
-    try:
-        tmp.write_text(signature)
-        os.replace(tmp, sig_path)
-    finally:
-        tmp.unlink(missing_ok=True)
+    IOU.write_json(results_dir / artifacts.RUN_MANIFEST_FILE, manifest)
 
 
 def budget_row_key(row):
@@ -326,12 +341,12 @@ def _run_segmentation_pair(
     benchmark_name,
     model_name,
     seeds,
-    max_samples,
     max_dense_pixels,
     split_regimes,
     run_stages,
     active_probes,
     budget_regimes,
+    s2_only,
     overwrite_mode,
     strict_mode,
     write_predictions,
@@ -344,49 +359,48 @@ def _run_segmentation_pair(
     gen_embeddings, probing = "gen_embeddings" in stages, "probing" in stages
     source_budgets, target_budgets = EV._budget_lists(budget_regimes)
     bench_mod = EV.load_benchmark(benchmark_name)
-    bench_kwargs = dict(max_samples=max_samples, shuffle=True, seed=0)
-    tag = cacheutils.bench_tag(bench_mod.BENCHMARK, bench_kwargs)
     perf.reset()
-    bench = cacheutils.cached_bench(bench_mod.BENCHMARK, tag, **bench_kwargs)
+    bench = cacheutils.cached_bench(bench_mod.BENCHMARK)
     # S2-only common-input mode (mirrors _run_tabular_pair): restrict every model to the shared
     # Sentinel-2 (+ temporal) input so cross-model differences can't be a modality effect. The
     # __s2only suffix isolates the dense cache and results dir from the native run.
-    s2_only = os.environ.get("RB_S2_ONLY", "").strip().lower() not in ("", "0", "false", "no")
     suffix = "__s2only" if s2_only else ""
-    emb_tag = tag + suffix
+    artifact = cacheutils.artifact_name(s2_only)
     bench_for_emb = bench.s2_only() if s2_only else bench
     if gen_embeddings:
         cacheutils.extract_dense_and_cache(
             bench_for_emb,
             bench_mod.BENCHMARK,
             model_name,
-            emb_tag,
-            overwrite=overwrite_mode,
+            artifact,
             **enc_kwargs,
         )
     emb_dir = (
-        cacheutils.require_dense_cache(bench_for_emb, bench_mod.BENCHMARK, model_name, emb_tag, enc_kwargs.get("weights_path"))
+        cacheutils.require_dense_cache(bench_for_emb, bench_mod.BENCHMARK, model_name, artifact, enc_kwargs.get("weights_path"))
         if probing
-        else cacheutils.dense_embedding_cache_dir(bench_for_emb, bench_mod.BENCHMARK, model_name, emb_tag, enc_kwargs.get("weights_path"))
+        else cacheutils.dense_embedding_cache_dir(bench_mod.BENCHMARK, model_name, artifact)
     )
     results_dir = cacheutils.OUTPUT_DIR / "results" / model_name / (benchmark_name + suffix)
     if not probing:
         n_events = perf.write_log(results_dir / "perf.jsonl")
         print(f"  embedding stage complete; perf: {n_events} events logged", flush=True)
         return
-    signature = run_signature(
+    emb_digest = cacheutils.embedding_digest(bench_mod.BENCHMARK, model_name, artifact, dense=True)
+    manifest = build_run_manifest(
         model_name,
-        tag,
+        benchmark_name,
+        artifact,
+        emb_digest,
         split_regimes,
         seeds,
         enc_kwargs,
         active_probes=active_probes,
         budget_regimes=budget_regimes,
-        max_samples=max_samples,
         max_dense_pixels=max_dense_pixels,
         write_predictions=write_predictions,
     )
-    check_run_signature(results_dir, signature, overwrite_mode=overwrite_mode)
+    signature = run_manifest_digest(manifest)
+    check_run_manifest(results_dir, manifest, overwrite_mode=overwrite_mode)
     rows_path = results_dir / "probe_results.jsonl"
     if overwrite_mode:
         for path in (
@@ -396,7 +410,7 @@ def _run_segmentation_pair(
             results_dir / "deltas.csv",
             results_dir / "data_quality.json",
             results_dir / "split_manifest.json",
-            results_dir / "run_signature.txt",
+            results_dir / artifacts.RUN_MANIFEST_FILE,
             results_dir / artifacts.ENVIRONMENT_FILE,
             results_dir / artifacts.RUN_COMPLETE_FILE,
         ):
@@ -405,7 +419,7 @@ def _run_segmentation_pair(
     # ORDER MATTERS -- see main.py: every check that can REFUSE this resume runs before anything
     # is mutated, so a refused resume leaves an existing valid completion marker untouched.
     artifacts.write_environment(results_dir, overwrite_mode=overwrite_mode)
-    publish_run_signature(results_dir, signature)
+    publish_run_manifest(results_dir, manifest)
     # See main.py: a resume is about to make this directory incomplete again.
     artifacts.invalidate_run_complete(results_dir)
     # Attribute regime problems / skipped cells to THIS pair (both accumulators are shard-global).
@@ -581,7 +595,7 @@ def _run_segmentation_pair(
     # be the only benchmark whose directories can never be validated.
     artifacts.write_run_complete(
         results_dir,
-        signature=signature,
+        run_manifest_sha256=signature,
         expected_keys=expected_keys,
         # Absent file -> [] so write_run_complete reports it as a missing REQUIRED
         # artifact, rather than the caller dying here on FileNotFoundError.

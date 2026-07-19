@@ -215,7 +215,7 @@ def _budget_seed(seed: int, budget: float) -> int:
     return abs(seed + int(round(budget * 1000)))
 
 
-# ── Probe-capacity training-size cap (RB_PROBE_CAP) ───────────────────────────
+# ── Probe-capacity training-size cap (PROBE_CAP, set from main.py) ───────────────────────────
 # Caps probe TRAINING size so the (256,128) MLP is tractable on the full tabular benchmarks, for the
 # probe-capacity *sensitivity* ablation. Properties, all required for a defensible comparison:
 #   * ENCODER-INDEPENDENT: the sampling seed is keyed only on the cell identity (benchmark/seed/region/
@@ -231,16 +231,9 @@ def _budget_seed(seed: int, budget: float) -> int:
 _CAP_FAMILIES: frozenset[str] = frozenset({"logistic", "mlp", "knn"})
 
 
-def _probe_cap() -> int | None:
-    """Absolute training-size cap from ``RB_PROBE_CAP`` (unset / 0 → no cap; default run is uncapped)."""
-    raw = os.environ.get("RB_PROBE_CAP", "").strip().lower()
-    if not raw or raw in ("0", "false", "no"):
-        return None
-    try:
-        cap = int(float(raw))
-    except ValueError:
-        return None
-    return cap if cap > 0 else None
+# Absolute source-head training-size cap for the probe-capacity check. None = uncapped (the default
+# run). Set from the committed ``PROBE_CAP`` constant in main.py -- there is no env override.
+PROBE_CAP: int | None = None
 
 
 def _cap_seed(seed: int, budget_type: str, budget: float | int, meta: dict[str, Any] | None) -> int:
@@ -381,9 +374,9 @@ def _sweep_budgets(
         }
         sub = subset_indices(y_train, fit_budget, sub_seed, stratify=stratify)
 
-        # Probe-capacity cap: subsample the (already budget-selected) SOURCE train set to RB_PROBE_CAP.
+        # Probe-capacity cap: subsample the (already budget-selected) SOURCE train set to PROBE_CAP.
         # Encoder-independent + class-stratified + group-balanced; evaluation sets are untouched.
-        cap = _probe_cap()
+        cap = PROBE_CAP
         n_precap = len(sub)
         if cap is not None and family in _CAP_FAMILIES and n_precap > cap:
             sub = sub[_cap_stratified_indices(
@@ -574,8 +567,8 @@ def _sweep_target_budgets(
             n_source_train = len(y_source)
 
         # Probe-capacity cap (route-aware): budget 0 caps the source-only train; the oracle caps the
-        # target pool; few-shot KEEPS all k target labels and caps only the source head to RB_PROBE_CAP.
-        cap = _probe_cap()
+        # target pool; few-shot KEEPS all k target labels and caps only the source head to PROBE_CAP.
+        cap = PROBE_CAP
         n_precap = len(y_tr)
         cap_active = cap is not None and family in _CAP_FAMILIES and n_precap > cap
         if cap_active:

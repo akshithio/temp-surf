@@ -6,7 +6,6 @@ Each has its own hyper-parameter grid and build function.
 
 from __future__ import annotations
 
-import os
 import warnings
 from typing import Any
 
@@ -43,32 +42,16 @@ LINEAR_SOLVER = "liblinear"
 LINEAR_MULTICLASS_SOLVER = "lbfgs"
 LINEAR_MAX_ITER = 20_000
 LINEAR_TOL = 1e-5
-def _probe_tuning_enabled() -> bool:
-    """Whether to sweep the probe's hyperparameter grid (RB_PROBE_TUNING).
-
-    RB_METHOD_TUNING was the old spelling. It is refused rather than honoured or ignored: honouring
-    it would keep a name that describes machinery that no longer exists, and ignoring it would
-    silently change the probe grid out from under a launcher that still sets it -- which would move
-    published numbers with no error and no signature change.
-    """
-    if os.environ.get("RB_METHOD_TUNING", "").strip():
-        raise RuntimeError(
-            "RB_METHOD_TUNING is no longer supported: post-hoc adaptation has been removed and it "
-            "never tuned a method -- it sizes the PROBE hyperparameter grid. Use RB_PROBE_TUNING=1. "
-            "Refusing rather than ignoring, because silently dropping it would change the probe "
-            "grid, and therefore the numbers, without any error."
-        )
-    return os.environ.get("RB_PROBE_TUNING", "").strip().lower() in ("1", "true", "yes")
+# Whether to sweep the probe's hyperparameter grid. False = the collapsed single-point grid (the
+# default run). Set from the committed ``PROBE_TUNING`` constant in main.py -- no env override.
+PROBE_TUNING: bool = False
 
 
 # TRACTABILITY: the 5-value C-sweep costs 5x probe fits per cell. Collapsed to a single C=1.0 by
-# default on full EuroCropsML (706k); set RB_PROBE_TUNING=1 to restore the full grid.
-# (Formerly RB_METHOD_TUNING -- it never tuned a "method", it sizes the PROBE's hyperparameter
-# grid, and that name became actively misleading once post-hoc adaptation was removed. Supplying
-# the old name is a hard error rather than a silent no-op: see _probe_tuning_enabled.)
+# default on full EuroCropsML (706k); set PROBE_TUNING=True in main.py to restore the full grid.
 LINEAR_GRID: list[float] = (
     [0.01, 0.1, 1.0, 10.0, 100.0]
-    if _probe_tuning_enabled()
+    if PROBE_TUNING
     else [1.0]
 )
 LINEAR_DEFAULT_HP = 1.0
@@ -94,11 +77,11 @@ MLP_MAX_ITER = 500
 MLP_DEFAULT_HP = 1e-3
 # TRACTABILITY (mirrors LINEAR_GRID above): the probe-capacity ablation is a *sensitivity* check, not
 # a headline protocol, so by default we collapse the five-alpha MLP grid to the single default alpha.
-# Combined with the RB_PROBE_CAP training-size cap, this is what makes the capped MLP tractable on the
-# full tabular benchmarks. Set RB_PROBE_TUNING=1 to restore the full five-value sweep.
+# Combined with the PROBE_CAP training-size cap, this is what makes the capped MLP tractable on the
+# full tabular benchmarks. Set PROBE_TUNING=True in main.py to restore the full five-value sweep.
 MLP_GRID: list[float] = (
     [1e-4, 1e-3, 1e-2, 1e-1, 1.0]
-    if _probe_tuning_enabled()
+    if PROBE_TUNING
     else [MLP_DEFAULT_HP]
 )
 
@@ -140,6 +123,21 @@ PROBE_DEFAULT_HP: dict[str, float] = {
     "knn": KNN_DEFAULT_HP,
 }
 PROBE_C_GRID: list[float] = PROBE_GRIDS["logistic"]
+
+
+def configure(*, tuning: bool) -> None:
+    """Set PROBE_TUNING from main.py's committed constant and rebuild the grids accordingly.
+
+    The grids are module-level, so a plain assignment to PROBE_TUNING after import would leave them
+    stale; this rebuilds them. Probe functions read the grids at call time, so this takes effect for
+    all subsequent fits. Called once at startup from main.py -- there is no env override.
+    """
+    global PROBE_TUNING, LINEAR_GRID, MLP_GRID, PROBE_GRIDS, PROBE_C_GRID
+    PROBE_TUNING = tuning
+    LINEAR_GRID = [0.01, 0.1, 1.0, 10.0, 100.0] if tuning else [1.0]
+    MLP_GRID = [1e-4, 1e-3, 1e-2, 1e-1, 1.0] if tuning else [MLP_DEFAULT_HP]
+    PROBE_GRIDS = {"logistic": LINEAR_GRID, "mlp": MLP_GRID, "knn": KNN_GRID}
+    PROBE_C_GRID = PROBE_GRIDS["logistic"]
 
 
 def _build_probe(family: str, hp: float, *, solver: str, seed: int, n_fit: int) -> Any:

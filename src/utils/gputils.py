@@ -416,21 +416,14 @@ def fan_out(num_shards: int | None = None) -> int:
     env, and runs the disjoint, round-robin subset of (model, benchmark) pairs. Returns the max child
     exit code; falls back to a single process if no GPUs are visible.
 
-    MULTI-MACHINE: the (model, benchmark) pairs are sharded GLOBALLY across all participating GPUs.
-    Set two env vars per machine so each GPU gets a unique GLOBAL shard index out of the GLOBAL total
-    (see docs/multi_machine.md):
-      * ``RB_SHARD_BASE``  -- this machine's first global shard index (default 0). Set it to the sum
-        of GPU counts on the machines ordered before this one.
-      * ``RB_NUM_SHARDS``  -- the GLOBAL number of shards = total GPUs across all machines.
-    Single-box runs need neither (base 0, total = local GPU count) and behave exactly as before.
+    Each machine runs a DISJOINT set of (benchmark, model) pairs (assigned via BENCHMARKS /
+    ACTIVE_MODELS in main.py), so shards are numbered locally: this box fans its own pairs across
+    its own GPUs. No cross-machine global shard numbering is needed.
     """
     local_gpus = num_shards or max(1, gpu_count())
-    base = int(os.environ.get("RB_SHARD_BASE", "0"))
-    total = int(os.environ.get(NUM_SHARDS_ENV, str(base + local_gpus)))  # GLOBAL shard count
+    base, total = 0, local_gpus
     if local_gpus < 1:
         raise ValueError(f"local GPU shard count must be >= 1, got {local_gpus}")
-    if base < 0 or total < 1 or base + local_gpus > total:
-        raise ValueError(f"Invalid shard range: base={base}, local_gpus={local_gpus}, total={total}")
     scratch = REPO / "data"
     log_dir = scratch / "output" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)

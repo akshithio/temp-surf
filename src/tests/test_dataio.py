@@ -83,23 +83,40 @@ def test_summarize_rows_ignores_legacy_rows_missing_grouping_keys() -> None:
     assert summary[0]["mean_f1"] == 1.0
 
 
-def test_load_cached_embeddings_requires_existing_matrix(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(cacheutils, "EMBEDDINGS_DIR", tmp_path)
-    bench = SimpleNamespace(n_samples=2)
+def _isolate_cache(tmp_path, monkeypatch, benchmark, digest="d" * 64):
+    monkeypatch.setattr(cacheutils, "EMBEDDINGS_DIR", tmp_path / "emb")
+    monkeypatch.setattr(cacheutils, "DATASET_DIGEST_DIR", tmp_path / "dd")
+    (tmp_path / "dd").mkdir(exist_ok=True)
+    (tmp_path / "dd" / f"{benchmark}.txt").write_text(digest)
+    monkeypatch.setattr(cacheutils, "_FROZEN_IDENTITY", {"final_commit": None, "clean": None, "tree_identity": None})
 
-    with pytest.raises(FileNotFoundError, match="Embedding cache not found"):
-        cacheutils.load_cached_embeddings(bench, "cropharvest", "presto", "tag")
+
+def test_load_cached_embeddings_requires_existing_matrix(tmp_path, monkeypatch) -> None:
+    _isolate_cache(tmp_path, monkeypatch, "cropharvest")
+    bench = SimpleNamespace(n_samples=2, sample_ids=np.array(["a", "b"], dtype=object))
+
+    with pytest.raises(FileNotFoundError, match="not built"):
+        cacheutils.load_cached_embeddings(bench, "cropharvest", "presto", "baseline")
 
 
 def test_load_cached_embeddings_reads_existing_matrix(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(cacheutils, "EMBEDDINGS_DIR", tmp_path)
-    bench = SimpleNamespace(n_samples=2)
-    path = cacheutils.embedding_cache_path(bench, "cropharvest", "presto", "tag")
-    path.parent.mkdir(parents=True)
-    expected = np.arange(6, dtype=np.float16).reshape(2, 3)
-    np.save(path, expected)
+    from utils import artifacts
 
-    actual = cacheutils.load_cached_embeddings(bench, "cropharvest", "presto", "tag")
+    _isolate_cache(tmp_path, monkeypatch, "cropharvest")
+    bench = SimpleNamespace(n_samples=2, sample_ids=np.array(["a", "b"], dtype=object))
+    art = cacheutils.embedding_cache_path("cropharvest", "presto", "baseline")
+    art.parent.mkdir(parents=True)
+    expected = np.arange(6, dtype=np.float16).reshape(2, 3)
+    with open(art, "wb") as f:
+        np.save(f, expected)
+    cacheutils._write_manifest(cacheutils.embedding_manifest_path("cropharvest", "presto", "baseline"), {
+        "schema": 1, "benchmark": "cropharvest", "model": "presto", "artifact": "baseline",
+        "checkpoint_sha256": cacheutils.checkpoint_sha256("presto"), "dataset_digest": "d" * 64,
+        "sample_ids_digest": cacheutils.sample_ids_digest(bench.sample_ids),
+        "shape": [2, 3], "dtype": "float16", "artifact_sha256": artifacts.sha256_file(art),
+    })
+
+    actual = cacheutils.load_cached_embeddings(bench, "cropharvest", "presto", "baseline")
 
     np.testing.assert_array_equal(actual, expected.astype(np.float32))
 
@@ -108,6 +125,7 @@ def test_dense_cache_skips_tiles_without_valid_pixels(tmp_path, monkeypatch) -> 
     class EmptyDenseBench:
         n_samples = 1
         tile_size = 64
+        ignore_index = 255
         patches = ()
 
         def iter_tiles(self, cache_root=None, overwrite=False):
@@ -116,12 +134,12 @@ def test_dense_cache_skips_tiles_without_valid_pixels(tmp_path, monkeypatch) -> 
     def fail_build_model(*_args, **_kwargs):
         raise AssertionError("all-void dense tiles should not build a model")
 
-    monkeypatch.setattr(cacheutils, "dense_embedding_cache_dir", lambda *_args, **_kwargs: tmp_path / "dense")
+    _isolate_cache(tmp_path, monkeypatch, "pastis")
     monkeypatch.setattr(cacheutils, "build_model", fail_build_model)
 
-    root = cacheutils.extract_dense_and_cache(EmptyDenseBench(), "pastis", "raw", "full")
+    root = cacheutils.extract_dense_and_cache(EmptyDenseBench(), "pastis", "raw", "baseline")
 
-    assert root == tmp_path / "dense"
+    assert root == cacheutils.dense_embedding_cache_dir("pastis", "raw", "baseline")
     assert list(root.rglob("*.npy")) == []
 
 

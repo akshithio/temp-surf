@@ -19,106 +19,44 @@ from joblib import Parallel, delayed  # noqa: E402
 
 from evals import compat  # noqa: E402
 from evals import evals as EV  # noqa: E402
+from evals import probes as _probes  # noqa: E402
 from evals.regimes import base as regime_base  # noqa: E402
 from utils import artifacts, cacheutils, gputils, runstate  # noqa: E402
 from utils import ioutils as IOU  # noqa: E402
 from utils import perfutils as perf  # noqa: E402
 
 # === Configuration ===========================================================
+# The final protocol lives here: committed, reviewable, and unchangeable by a stale shell or a
+# Slurm export. The ONLY thing that differs across machines is which benchmarks/models this box
+# runs -- edit BENCHMARKS / ACTIVE_MODELS per machine; everything else is synced identically.
 BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis"]
-RUN_STAGES = ["gen_embeddings", "probing"]
-SPLIT_REGIMES = ["random_id", "official", "geographic_ood", "spatial_cluster_ood"]
+ACTIVE_MODELS = None  # None = all eligible models for BENCHMARKS; or a list to restrict this box
+SEEDS = [0, 1, 2]
 ACTIVE_PROBES = ["logistic"]
+SPLIT_REGIMES = ["random_id", "official", "geographic_ood", "spatial_cluster_ood"]
+RUN_STAGES = ["gen_embeddings", "probing"]
+PROBE_CAP = None       # None = uncapped source-head training; or an int cap (probe-capacity check)
+PROBE_TUNING = False   # True = sweep the probe hyperparameter grid
+S2_ONLY = False        # True = restrict every model to the shared Sentinel-2 input (fairness ablation)
 BUDGET_REGIMES = {
     "source": [0.05, 0.10, 0.25, 1.0],
     "target": [0, 5, 10, 25, 50, EV.TARGET_ID_UPPER_BOUND],
 }
-MAX_SAMPLES = None
 MAX_DENSE_PIXELS = 50_000  # sampled pixels per PASTIS fold partition
 OVERWRITE_MODE = False
 STRICT_MODE = False
 WRITE_PREDICTIONS = True
 LAUNCH_GPU_SHARDS = True
 GPU_SHARDS = None
-SEEDS = [0, 1, 2]
 # =============================================================================
 
-# --- Per-machine benchmark placement (the only value that differs across
-# machines; everything else above is uniform and synced identically). ---
-_rb_benchmarks = os.environ.get("RB_BENCHMARKS", "").strip()
-if _rb_benchmarks:
-    _requested = [b.strip() for b in _rb_benchmarks.split(",") if b.strip()]
-    _unknown = [b for b in _requested if b not in BENCHMARKS]
-    if _unknown:
-        raise ValueError(
-            f"RB_BENCHMARKS has unknown benchmark(s) {_unknown}; valid: {BENCHMARKS}"
-        )
-    BENCHMARKS = _requested
+# The two knobs deep probing code reads are pushed into their modules from the committed constants
+# above -- no env var can override them, and a worker subprocess (which re-imports this file) gets
+# exactly these values.
+perf.PROBE_CAP = PROBE_CAP
+_probes.configure(tuning=PROBE_TUNING)
 
-# --- Per-machine model restriction. Empty/unset = all eligible models for the
-# selected benchmarks (the normal case). Used only when splitting one
-# benchmark's models across machines (e.g. pastis presto/raw on one box, the
-# heavy encoders on another). Validated against eligibility in main(). ---
-_rb_models = os.environ.get("RB_MODELS", "").strip()
-RB_MODELS = [m.strip() for m in _rb_models.split(",") if m.strip()] if _rb_models else None
-
-# --- Per-machine seed restriction. Empty/unset = all seeds (the normal case).
-# Used only when splitting one (model, benchmark) cell's seeds across machines
-# to parallelize a slow probe; results merge cleanly at collation since the
-# embedding cache is content-addressed and rows are keyed by seed. ---
-_rb_seeds = os.environ.get("RB_SEEDS", "").strip()
-if _rb_seeds:
-    _requested_seeds = [int(s.strip()) for s in _rb_seeds.split(",") if s.strip()]
-    _unknown_seeds = [s for s in _requested_seeds if s not in SEEDS]
-    if _unknown_seeds:
-        raise ValueError(
-            f"RB_SEEDS has seed(s) {_unknown_seeds} not in {SEEDS}"
-        )
-    SEEDS = _requested_seeds
-
-# --- Probe-family override. Unset = ACTIVE_PROBES above (logistic, the headline
-# probe). Used for the probe-capacity robustness check: re-probe cached
-# embeddings with the MLP family into a fresh RB_OUTPUT_DIR, then compare the
-# decomposition to the logistic run. Validated against the known families. ---
-_rb_probes = os.environ.get("RB_ACTIVE_PROBES", "").strip()
-if _rb_probes:
-    _requested_probes = [p.strip() for p in _rb_probes.split(",") if p.strip()]
-    _unknown_probes = [p for p in _requested_probes if p not in ("logistic", "mlp", "knn")]
-    if _unknown_probes:
-        raise ValueError(
-            f"RB_ACTIVE_PROBES has unknown probe(s) {_unknown_probes}; known: logistic, mlp, knn"
-        )
-    ACTIVE_PROBES = _requested_probes
-
-# --- Split-regime restriction. Unset = SPLIT_REGIMES above (all regimes, the
-# normal case). Used for the probe-capacity cap-sensitivity check, which targets
-# a single regime (geographic_ood) so the decomposition verdict can be compared
-# across caps without recomputing every regime. Per-benchmark unsupported regimes
-# are still filtered downstream; this only narrows the global set. ---
-_rb_regimes = os.environ.get("RB_SPLIT_REGIMES", "").strip()
-if _rb_regimes:
-    _requested_regimes = [r.strip() for r in _rb_regimes.split(",") if r.strip()]
-    _unknown_regimes = [r for r in _requested_regimes if r not in SPLIT_REGIMES]
-    if _unknown_regimes:
-        raise ValueError(
-            f"RB_SPLIT_REGIMES has unknown regime(s) {_unknown_regimes}; valid: {SPLIT_REGIMES}"
-        )
-    SPLIT_REGIMES = _requested_regimes
-
-# --- Run-stage restriction. Unset = RUN_STAGES above (gen_embeddings + probing,
-# the normal case). Set to run embeddings-only (populate the content-addressed
-# cache on a GPU box and defer probing) or probing-only (re-probe an existing
-# cache on CPU) without editing this file. Validated against VALID_RUN_STAGES. ---
-_rb_stages = os.environ.get("RB_RUN_STAGES", "").strip()
-if _rb_stages:
-    _requested_stages = [s.strip() for s in _rb_stages.split(",") if s.strip()]
-    _unknown_stages = [s for s in _requested_stages if s not in runstate.VALID_RUN_STAGES]
-    if _unknown_stages:
-        raise ValueError(
-            f"RB_RUN_STAGES has unknown stage(s) {_unknown_stages}; "
-            f"valid: {sorted(runstate.VALID_RUN_STAGES)}"
-        )
-    RUN_STAGES = _requested_stages
+runstate.validate_run_stages(RUN_STAGES)  # fail fast on a bad config edit
 
 os.environ["STRICT_MODE"] = "1" if STRICT_MODE else ""
 
@@ -158,12 +96,12 @@ def _run_tabular_pair(
     benchmark_name,
     model_name,
     seeds,
-    max_samples,
     max_dense_pixels,
     split_regimes,
     run_stages,
     active_probes,
     budget_regimes,
+    s2_only,
     overwrite_mode,
     strict_mode,
     enc_kwargs,
@@ -188,22 +126,19 @@ def _run_tabular_pair(
         raise ValueError(f"Unknown/unsupported split regimes for {benchmark_name}: {unsupported}. Supported: {supported}")
     split_regimes = [r for r in split_regimes if r in supported]
 
-    bench_kwargs = dict(max_samples=max_samples, shuffle=True, seed=0)
-    tag = cacheutils.bench_tag(bench_mod.BENCHMARK, bench_kwargs)
     perf.reset()
-    bench = cacheutils.cached_bench(bench_mod.BENCHMARK, tag, **bench_kwargs)
-    s2_only = os.environ.get("RB_S2_ONLY", "").strip().lower() not in ("", "0", "false", "no")
+    bench = cacheutils.cached_bench(bench_mod.BENCHMARK)
     suffix = "__s2only" if s2_only else ""
-    emb_tag = tag + suffix
+    artifact = cacheutils.artifact_name(s2_only)
     y, _native_groups = bench_mod.make_targets(bench)
     bench_for_emb = bench.s2_only() if s2_only else bench
     if gen_embeddings:
         emb = cacheutils.extract_and_cache(
-            bench_for_emb, bench_mod.BENCHMARK, model_name, emb_tag, overwrite=overwrite_mode, **enc_kwargs
+            bench_for_emb, bench_mod.BENCHMARK, model_name, artifact, **enc_kwargs
         )
     else:
         emb = cacheutils.load_cached_embeddings(
-            bench_for_emb, bench_mod.BENCHMARK, model_name, emb_tag, enc_kwargs.get("weights_path")
+            bench_for_emb, bench_mod.BENCHMARK, model_name, artifact, enc_kwargs.get("weights_path")
         )
 
     results_dir = cacheutils.OUTPUT_DIR / "results" / model_name / (benchmark_name + suffix)
@@ -214,19 +149,22 @@ def _run_tabular_pair(
         n_events = perf.write_log(results_dir / "perf.jsonl")
         print(f"  embedding stage complete; perf: {n_events} events logged", flush=True)
         return
-    signature = runstate.run_signature(
+    emb_digest = cacheutils.embedding_digest(bench_mod.BENCHMARK, model_name, artifact)
+    manifest = runstate.build_run_manifest(
         model_name,
-        emb_tag,
+        benchmark_name,
+        artifact,
+        emb_digest,
         split_regimes,
         seeds,
         enc_kwargs,
         active_probes=active_probes,
         budget_regimes=budget_regimes,
-        max_samples=max_samples,
         max_dense_pixels=max_dense_pixels,
         write_predictions=write_predictions,
     )
-    runstate.check_run_signature(results_dir, signature, overwrite_mode=overwrite_mode)
+    signature = runstate.run_manifest_digest(manifest)
+    runstate.check_run_manifest(results_dir, manifest, overwrite_mode=overwrite_mode)
     rows_path = results_dir / "probe_results.jsonl"
     preds_path = results_dir / "predictions.jsonl"
 
@@ -239,18 +177,18 @@ def _run_tabular_pair(
             results_dir / "deltas.csv",
             results_dir / "data_quality.json",
             results_dir / "split_manifest.json",
-            results_dir / "run_signature.txt",
+            results_dir / artifacts.RUN_MANIFEST_FILE,
             results_dir / artifacts.ENVIRONMENT_FILE,
             results_dir / artifacts.RUN_COMPLETE_FILE,
         ]:
             if p.exists():
                 p.unlink()
     # ORDER MATTERS. Every check that can REFUSE this resume runs before anything is mutated:
-    # check_run_signature above, then the environment gate here. Only once the resume is known to
+    # check_run_manifest above, then the environment gate here. Only once the resume is known to
     # be allowed do we invalidate the completion marker -- otherwise a refused resume would
     # destroy the valid marker of the finished run it just declined to touch.
     artifacts.write_environment(results_dir, overwrite_mode=overwrite_mode)
-    runstate.publish_run_signature(results_dir, signature)
+    runstate.publish_run_manifest(results_dir, manifest)
     # This pair is about to be made incomplete again, so any completion marker from a previous
     # run must not survive it: a stale marker asserts a finished state that is being undone.
     artifacts.invalidate_run_complete(results_dir)
@@ -486,7 +424,7 @@ def _run_tabular_pair(
 
     # LAST write of the pair. Everything above -- probe_results.{jsonl,csv}, summary.csv,
     # deltas.csv -- is now final, which is exactly what this marker certifies: without it,
-    # run_signature.txt only says the pair STARTED, and a pair killed mid-probe-loop leaves stale
+    # run_manifest.json only says the pair STARTED, and a pair killed mid-probe-loop leaves stale
     # derived CSVs beside a newer probe_results.jsonl with nothing to say they disagree.
     #
     # Validated against the PARSED rows on disk, not the in-memory list: the point is to certify
@@ -494,7 +432,7 @@ def _run_tabular_pair(
     # run_pair records as a pair failure -> non-zero shard exit.
     artifacts.write_run_complete(
         results_dir,
-        signature=signature,
+        run_manifest_sha256=signature,
         expected_keys=expected_keys,
         # Absent file -> [] so write_run_complete reports it as a missing REQUIRED
         # artifact, rather than the caller dying here on FileNotFoundError.
@@ -510,12 +448,12 @@ def run_pair(
     benchmark_name,
     model_name,
     seeds,
-    max_samples,
     max_dense_pixels,
     split_regimes,
     run_stages,
     active_probes,
     budget_regimes,
+    s2_only,
     overwrite_mode,
     strict_mode,
     write_predictions,
@@ -528,12 +466,12 @@ def run_pair(
             benchmark_name,
             model_name,
             seeds,
-            max_samples,
             max_dense_pixels,
             split_regimes,
             run_stages,
             active_probes,
             budget_regimes,
+            s2_only,
             overwrite_mode,
             strict_mode,
             write_predictions,
@@ -544,12 +482,12 @@ def run_pair(
         benchmark_name,
         model_name,
         seeds,
-        max_samples,
         max_dense_pixels,
         split_regimes,
         run_stages,
         active_probes,
         budget_regimes,
+        s2_only,
         overwrite_mode,
         strict_mode,
         enc_kwargs,
@@ -571,20 +509,25 @@ def shard_exit_code(failures, regime_problems) -> int:
 def main() -> int:
     if LAUNCH_GPU_SHARDS and gputils.SHARD_ENV not in os.environ:
         return gputils.fan_out(GPU_SHARDS)
+    if cacheutils.frozen_run_identity()["final_commit"] is None:
+        raise RuntimeError(
+            "the deployed checkout has no .git commit -- the frozen run requires committed "
+            "provenance recorded in run_manifest.json. Deploy a real git checkout."
+        )
     regime_base.clear_regime_problems()
     enc_kwargs = {"device": gputils.device()}
 
     all_pairs = [(mod, bm) for bm in BENCHMARKS for mod in compat.eligible_models(bm)]
-    if RB_MODELS is not None:
+    if ACTIVE_MODELS is not None:
         _eligible = {mod for mod, _ in all_pairs}
-        _unknown = [m for m in RB_MODELS if m not in _eligible]
+        _unknown = [m for m in ACTIVE_MODELS if m not in _eligible]
         if _unknown:
             raise ValueError(
-                f"RB_MODELS has model(s) {_unknown} not eligible for "
+                f"ACTIVE_MODELS has model(s) {_unknown} not eligible for "
                 f"BENCHMARKS={BENCHMARKS}; eligible: {sorted(_eligible)}"
             )
-        all_pairs = [(mod, bm) for mod, bm in all_pairs if mod in RB_MODELS]
-        print(f"[main] RB_MODELS filter active -> {sorted(set(m for m, _ in all_pairs))}", flush=True)
+        all_pairs = [(mod, bm) for mod, bm in all_pairs if mod in ACTIVE_MODELS]
+        print(f"[main] ACTIVE_MODELS filter active -> {sorted(set(m for m, _ in all_pairs))}", flush=True)
     work = gputils.take_shard(all_pairs)
     shard, nshards = gputils.shard_indices()
     failures: list[tuple[str, str, str]] = []
@@ -598,12 +541,12 @@ def main() -> int:
                 benchmark_name=bm,
                 model_name=mod,
                 seeds=SEEDS,
-                max_samples=MAX_SAMPLES,
                 max_dense_pixels=MAX_DENSE_PIXELS,
                 split_regimes=SPLIT_REGIMES,
                 run_stages=RUN_STAGES,
                 active_probes=ACTIVE_PROBES,
                 budget_regimes=BUDGET_REGIMES,
+                s2_only=S2_ONLY,
                 overwrite_mode=OVERWRITE_MODE,
                 strict_mode=STRICT_MODE,
                 write_predictions=WRITE_PREDICTIONS,

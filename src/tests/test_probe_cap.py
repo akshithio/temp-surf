@@ -1,4 +1,4 @@
-"""Tests for the RB_PROBE_CAP probe-capacity training-size cap.
+"""Tests for the PROBE_CAP probe-capacity training-size cap.
 
 Covers the properties the capped protocol depends on: the cap is deterministic and ENCODER-INDEPENDENT
 (seeded only by cell identity, never the model), class-stratified, group-balanced where feasible,
@@ -8,7 +8,6 @@ target route keeps all ``k`` few-shot labels and caps only the source head.
 
 from __future__ import annotations
 
-import os
 from contextlib import contextmanager
 
 import numpy as np
@@ -20,18 +19,13 @@ from utils import perfutils as perf
 
 @contextmanager
 def _cap_env(value: str | None):
-    prev = os.environ.get("RB_PROBE_CAP")
-    if value is None:
-        os.environ.pop("RB_PROBE_CAP", None)
-    else:
-        os.environ["RB_PROBE_CAP"] = value
+    """Set the committed ``perf.PROBE_CAP`` constant for the duration of the block."""
+    prev = perf.PROBE_CAP
+    perf.PROBE_CAP = None if value is None else int(float(value))
     try:
         yield
     finally:
-        if prev is None:
-            os.environ.pop("RB_PROBE_CAP", None)
-        else:
-            os.environ["RB_PROBE_CAP"] = prev
+        perf.PROBE_CAP = prev
 
 
 def _synth(n, d=16, n_classes=5, n_groups=3, seed=0):

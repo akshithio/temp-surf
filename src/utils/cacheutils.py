@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
-import functools
 import hashlib
 import importlib
 import inspect
 import json
 import os
 import pickle
-import re
 import uuid
 from pathlib import Path
 from typing import Any, Protocol
@@ -24,11 +22,8 @@ REPO = Path(__file__).resolve().parents[2]
 SCRATCH = REPO / "data"
 INPUT_ROOT = Path(os.environ.get("ROBUSTNESS_INPUT", REPO / "data" / "input")) / "benchmarks"
 CACHE_DIR = SCRATCH / "cache"
-# OUTPUT_DIR can be redirected independently of the cache (RB_OUTPUT_DIR) so an
-# extra-seed run writes fresh results while reusing the existing embedding cache.
-OUTPUT_DIR = Path(os.environ["RB_OUTPUT_DIR"]) if os.environ.get("RB_OUTPUT_DIR") else SCRATCH / "output"
+OUTPUT_DIR = SCRATCH / "output"  # canonical results location (no override)
 EMBEDDINGS_DIR = CACHE_DIR / "embeddings"
-BENCH_SRC = REPO / "src" / "dataio" / "get_input.py"
 
 BENCHMARK_MODULES: dict[str, str] = {
     "cropharvest": "evals/benchmarks/cropharvest",
@@ -47,6 +42,7 @@ MODELS: dict[str, tuple[str, str]] = {
 }
 
 EMB_DTYPE = "float32"
+DENSE_LABEL_DTYPE = "uint8"  # dense label tiles are written as uint8 (class ids 0..IGNORE_INDEX)
 
 
 class MissingEmbeddingCache(FileNotFoundError):
@@ -59,26 +55,13 @@ class ModelWrapper(Protocol):
     def encode(self, bench: Any) -> np.ndarray: ...
 
 
-def _hash_files(*paths: str | Path) -> str:
-    h = hashlib.sha256()
-    for p in sorted(map(str, paths)):
-        try:
-            h.update(Path(p).read_bytes())
-        except OSError:
-            h.update(b"<missing>")
-    return h.hexdigest()[:10]
-
-
-def _hash_str(s: str) -> str:
-    return hashlib.sha256(s.encode()).hexdigest()[:10]
-
-
 def _atomic_tmp(path: Path) -> Path:
     return path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
 
 
 @contextlib.contextmanager
 def _cache_lock(path: Path):
+    """Exclusive advisory flock serializing writers to one cache artifact (or tile)."""
     lock_path = path.with_name(f".{path.name}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "w") as lock:
@@ -89,111 +72,50 @@ def _cache_lock(path: Path):
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def _update_file_content_hash(path: str | Path, h: Any) -> None:
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
+# The one production loader contract. Loader BEHAVIOR, not cache identity: the canonical pickle
+# always reflects exactly this configuration, so it is never encoded in the filename.
+_CANONICAL_LOADER = {"max_samples": None, "shuffle": True, "seed": 0}
 
 
-def _input_fingerprint(bench_dir: Path, mode: str | None = None) -> str:
-    h = hashlib.sha256()
-    mode = (mode or os.environ.get("DATA_FINGERPRINT", "deep")).strip().lower()
-    try:
-        if mode == "top":
-            for e in sorted(bench_dir.iterdir(), key=lambda x: x.name):
-                st = e.stat()
-                h.update(f"{e.name}:{st.st_size}:{int(st.st_mtime)}".encode())
-        else:
-            for root, dirs, files in os.walk(bench_dir):
-                dirs.sort()
-                rel = os.path.relpath(root, bench_dir)
-                for name in sorted(files):
-                    fp = os.path.join(root, name)
-                    try:
-                        h.update(f"{rel}/{name}\0".encode())
-                        _update_file_content_hash(fp, h)
-                    except OSError:
-                        h.update(f"{rel}/{name}:<missing>".encode())
-    except OSError:
-        h.update(b"<missing>")
-    return h.hexdigest()[:10]
+def benchmark_cache_path(benchmark: str) -> Path:
+    """The single canonical pickle path for a supported benchmark."""
+    if benchmark not in BENCHMARK_MODULES:
+        raise KeyError(f"Unknown benchmark {benchmark!r}. Known: {sorted(BENCHMARK_MODULES)}")
+    return CACHE_DIR / "benchmark" / f"{benchmark}.pkl"
 
 
-def _pastis_input_fingerprint(bench_dir: Path, mode: str | None = None) -> str:
-    """Fingerprint the PASTIS inputs actually consumed by the loader.
+def cached_bench(benchmark: str):
+    """Load-or-build the ONE canonical benchmark pickle at data/cache/benchmark/<benchmark>.pkl.
 
-    The release directory also contains large unused products such as descending-orbit
-    S1D and instance annotations. Walking and hashing every byte forces a tens-of-GB
-    reread before every resumed run, even when the dense tile cache is already complete.
-    PASTIS release arrays are immutable staged inputs here, so the manifest uses
-    metadata content plus array size/mtime identity for the S2, S1A, and TARGET files.
+    The pickle is always built with the fixed production contract (max_samples=None, shuffle=True,
+    seed=0), which is loader behavior -- not cache identity -- so it is not encoded in the filename.
+    No loader kwargs are accepted and no per-parameter fallback file is ever created; utilities that
+    need a subset must call ``dataio.get_input`` directly and must not write this cache. An
+    unreadable pickle is reported and rebuilt in place under the writer lock.
     """
-    mode = (mode or os.environ.get("DATA_FINGERPRINT", "deep")).strip().lower()
-    if mode == "top":
-        return _input_fingerprint(bench_dir, mode)
+    path = benchmark_cache_path(benchmark)
 
-    h = hashlib.sha256()
-    metadata = bench_dir / "metadata.geojson"
-    try:
-        h.update(b"metadata.geojson\0")
-        _update_file_content_hash(metadata, h)
-        geo = json.loads(metadata.read_text())
-        patch_ids = sorted({int(feature["properties"]["ID_PATCH"]) for feature in geo["features"]})
-    except Exception:
-        h.update(b"metadata.geojson:<missing-or-invalid>")
-        patch_ids = []
-
-    required = (
-        ("DATA_S2", "S2_{}.npy"),
-        ("DATA_S1A", "S1A_{}.npy"),
-        ("ANNOTATIONS", "TARGET_{}.npy"),
-    )
-    for patch_id in patch_ids:
-        for subdir, template in required:
-            rel = Path(subdir) / template.format(patch_id)
-            path = bench_dir / rel
-            try:
-                st = path.stat()
-                h.update(f"{rel.as_posix()}:{st.st_size}:{st.st_mtime_ns}".encode())
-            except OSError:
-                h.update(f"{rel.as_posix()}:<missing>".encode())
-    return h.hexdigest()[:10]
-
-
-@functools.lru_cache(maxsize=32)
-def _benchmark_input_fingerprint(benchmark: str, mode: str, _data_version: str) -> str:
-    if benchmark == "pastis":
-        return _pastis_input_fingerprint(INPUT_ROOT / benchmark, mode)
-    return _input_fingerprint(INPUT_ROOT / benchmark, mode)
-
-
-def bench_tag(benchmark: str, kwargs: dict) -> str:
-    params = "_".join(f"{k}-{kwargs[k]}" for k in sorted(kwargs)) or "default"
-    spec_path = REPO / "src" / (BENCHMARK_MODULES[benchmark].replace(".", "/") + ".py")
-    code = _hash_files(BENCH_SRC, spec_path)
-    data_version = os.environ.get("DATA_VERSION", "").strip()
-    data = _benchmark_input_fingerprint(benchmark, os.environ.get("DATA_FINGERPRINT", "deep").strip().lower(), data_version)
-    suffix = f"__dv-{data_version}" if data_version else ""
-    if os.environ.get("STRICT_MODE", "").strip().lower() not in ("", "0", "false", "no"):
-        suffix += "__strict"
-    return f"{params}__code-{code}__data-{data}{suffix}"
-
-
-def cached_bench(benchmark: str, tag: str, **kwargs):
-    path = CACHE_DIR / "benchmark" / f"{benchmark}__{tag}.pkl"
-    if path.exists():
+    def _try_read(p: Path):
         try:
-            return pickle.loads(path.read_bytes())
-        except Exception:
-            pass  # degraded/partial cache -> rebuild
+            with p.open("rb") as f:  # streaming unpickle -- no full-file bytes allocation
+                return pickle.load(f), None
+        except Exception as exc:  # unreadable / truncated / partial pickle
+            return None, exc
+
+    if path.exists():
+        bench, exc = _try_read(path)
+        if bench is not None:
+            return bench
+        print(f"  !! benchmark cache unreadable at {path}: {type(exc).__name__}: {exc} -- rebuilding", flush=True)
+
     with _cache_lock(path):
-        if path.exists():
-            try:
-                return pickle.loads(path.read_bytes())
-            except Exception:
-                pass
-        with perf.measure(f"bench.load/{benchmark}", tag=tag):
-            bench = GI.get_input(benchmark, root=INPUT_ROOT, **kwargs)
+        if path.exists():  # a concurrent writer may have just (re)built it
+            bench, exc = _try_read(path)
+            if bench is not None:
+                return bench
+            print(f"  !! benchmark cache still unreadable at {path}: {type(exc).__name__}: {exc} -- rebuilding", flush=True)
+        with perf.measure(f"bench.load/{benchmark}"):
+            bench = GI.get_input(benchmark, root=INPUT_ROOT, **_CANONICAL_LOADER)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = _atomic_tmp(path)
         try:
@@ -215,32 +137,8 @@ def build_model(name: str, **kwargs) -> ModelWrapper:
     return cls(**{k: v for k, v in kwargs.items() if k in accepted})
 
 
-def _model_source_files(model_name: str) -> list[Path]:
-    mod_src = REPO / "src" / (MODELS[model_name][0].replace(".", "/") + ".py")
-    files = [mod_src]
-    try:
-        text = mod_src.read_text()
-    except OSError:
-        return files
-    names = set(re.findall(r"utils\.models\.([A-Za-z_]\w*)", text))
-    for imports in re.findall(r"from\s+utils\.models\s+import\s+([^\n]+)", text):
-        names.update(part.strip().split(" as ", 1)[0] for part in imports.split(","))
-    for name in sorted(names):
-        util_path = REPO / "src" / "utils" / "models" / f"{name}.py"
-        if util_path.exists() and util_path not in files:
-            files.append(util_path)
-            try:
-                util_text = util_path.read_text()
-            except OSError:
-                util_text = ""
-            if re.search(r"from\s+utils\.gputils\s+import|import\s+utils\.gputils", util_text):
-                gputils_path = REPO / "src" / "utils" / "gputils.py"
-                if gputils_path not in files:
-                    files.append(gputils_path)
-    return files
-
-
-# Per-model checkpoint identity folded into embedding cache keys.
+# Per-model checkpoint resolution -- used to LOCATE the actual checkpoint whose full SHA-256 is the
+# frozen-run identity (see _resolve_checkpoint_path / checkpoint_sha256).
 _CHECKPOINT_SPECS: dict[str, tuple[str, str | None, str | None, str | None]] = {
     "presto": ("hf", None, None,
                "torchgeo/presto@44835fba5116ed5f000d5eea3973655985bf765b:model-f317d103.pth"
@@ -260,103 +158,218 @@ _HF_DEFAULTS = {
 }
 
 
-@functools.lru_cache(maxsize=128)
-def _hash_file_content(path_str: str, size: int, mtime_ns: int) -> str:
-    h = hashlib.sha256()
-    h.update(str(size).encode())
-    with open(path_str, "rb") as f:
-        for block in iter(lambda: f.read(8 << 20), b""):  # 8 MiB blocks
-            h.update(block)
-    return h.hexdigest()[:16]
-
-
-def _local_weight_id(path: Path) -> str:
-    if path.is_dir():
-        files = sorted(p for p in path.rglob("*") if p.is_file())
-        return _hash_str("|".join(f"{f.relative_to(path)}:{_local_weight_id(f)}" for f in files))
-    st = path.stat()
-    return _hash_file_content(str(path), st.st_size, st.st_mtime_ns)
-
-
 _INPUT_BASE = INPUT_ROOT.parent
 
 
-def _checkpoint_fingerprint(model_name: str, weights_override: str | Path | None = None) -> str:
+# ============================================================================
+# Frozen final-run embedding cache: fixed readable paths + identity manifests.
+# The cryptic ``n..._b..._e..._w...`` fingerprint directory is gone; identity now lives in a
+# readable ``<artifact>.manifest.json`` beside the artifact and is validated on every load.
+# ============================================================================
+
+# --- full checkpoint content digest (untruncated identity) -------------------
+
+_CHECKPOINT_SHA_CACHE: dict[str, str] = {}
+
+
+def _resolve_checkpoint_path(model_name: str, weights_override: str | Path | None = None) -> Path | None:
+    """The actual on-disk checkpoint file/dir the wrapper will load, or None (e.g. raw)."""
     if weights_override:
         p = Path(weights_override).expanduser()
-        if p.exists():
-            return _hash_str(f"override:{p.name}:{_local_weight_id(p)}")[:10]
-        return _hash_str(f"override-missing:{p}")[:10]
+        return p if p.exists() else None
     spec = _CHECKPOINT_SPECS.get(model_name)
     if not spec:
-        return ""
-    kind, env_name, default_rel, hf_pin = spec
+        return None
+    kind, env_name, default_rel, _hf_pin = spec
     if kind == "hf":
         local = _HF_DEFAULTS.get(model_name)
         if local:
             rel, required = local
             path = _INPUT_BASE / rel
-            if all((path / r).exists() for r in required) if path.is_dir() else path.exists():
-                return _hash_str(f"hf:{hf_pin}:local:{_local_weight_id(path)}")[:10]
-        return _hash_str(f"hf:{hf_pin}")[:10]
-    if kind == "raw":  # raw baseline has no weights; its output depends on the featurization mode
-        return _hash_str(f"raw:{os.environ.get('RAW_MODE', 'flatten')}")[:10]
+            ok = all((path / r).exists() for r in required) if path.is_dir() else path.exists()
+            if ok:
+                return path
+        return None
     if kind == "local":
         env_val = os.environ.get(env_name) if env_name else None
         path = Path(env_val).expanduser() if env_val else _INPUT_BASE / default_rel
-        if not path.exists():
-            return _hash_str(f"local-missing:{path}")[:10]  # stable even before the file is staged
-        return _hash_str(f"local:{path.name}:{_local_weight_id(path)}")[:10]
-    return ""
+        return path if path.exists() else None
+    return None  # raw: no checkpoint
 
 
-def _emb_sig(bench: Any, model_name: str, tag: str, weights_override=None) -> str:
-    base = f"n{bench.n_samples}_d{EMB_DTYPE}_b{_hash_str(tag)}_e{_hash_files(*_model_source_files(model_name))}"
-    fp = _checkpoint_fingerprint(model_name, weights_override)
-    return f"{base}_w{fp}" if fp else base
+def _content_sha256(path: Path) -> str:
+    """Full SHA-256 of a file's content, or a canonical aggregate over a directory (sorted relative
+    POSIX paths + each file's SHA). Reuses ``artifacts.sha256_file`` -- no duplicate hash helper."""
+    from utils import artifacts
+
+    path = Path(path)
+    if path.is_dir():
+        h = hashlib.sha256()
+        for rel in sorted(p.relative_to(path).as_posix() for p in path.rglob("*") if p.is_file()):
+            h.update(rel.encode())
+            h.update(b"\0")
+            h.update((artifacts.sha256_file(path / rel) or "").encode())
+            h.update(b"\n")
+        return h.hexdigest()
+    return artifacts.sha256_file(path) or ""
 
 
-def embedding_cache_path(bench: Any, benchmark: str, model_name: str, tag: str, weights_override=None) -> Path:
-    """Checkpoint-aware path for one benchmark-level frozen embedding matrix."""
-    return EMBEDDINGS_DIR / benchmark / model_name / _emb_sig(bench, model_name, tag, weights_override) / "baseline.npy"
+def checkpoint_sha256(model_name: str, weights_override: str | Path | None = None) -> str:
+    """Full SHA-256 identity of the checkpoint a model will load (dir-aware, memoized per process).
+    raw / no-checkpoint models hash a stable token so identity is always defined."""
+    path = _resolve_checkpoint_path(model_name, weights_override)
+    if path is None:
+        token = f"raw:{os.environ.get('RAW_MODE', 'flatten')}" if model_name == "raw" else f"no-checkpoint:{model_name}"
+        return hashlib.sha256(token.encode()).hexdigest()
+    key = str(path.resolve())
+    if key not in _CHECKPOINT_SHA_CACHE:
+        _CHECKPOINT_SHA_CACHE[key] = _content_sha256(path)
+    return _CHECKPOINT_SHA_CACHE[key]
 
 
-def dense_embedding_cache_dir(
-    bench: PastisBenchmark, benchmark: str, model_name: str, tag: str, weights_override=None
-) -> Path:
-    """Checkpoint-aware root directory for one dense frozen-feature tile cache."""
-    return EMBEDDINGS_DIR / benchmark / model_name / _emb_sig(bench, model_name, tag, weights_override) / "baseline"
+def sample_ids_digest(sample_ids: Any) -> str:
+    """Ordered digest over per-sample IDs -- pins the sample SET and its ROW ORDER."""
+    if sample_ids is None:
+        raise ValueError("sample_ids are required to identify a tabular embedding")
+    h = hashlib.sha256()
+    for sid in sample_ids:
+        h.update(str(sid).encode())
+        h.update(b"\0")
+    return h.hexdigest()
 
 
-def load_cached_embeddings(bench: Any, benchmark: str, model_name: str, tag: str, weights_override=None) -> np.ndarray:
-    """Load an existing frozen embedding matrix, failing if it has not been built."""
-    path = embedding_cache_path(bench, benchmark, model_name, tag, weights_override)
-    if not path.exists():
-        raise MissingEmbeddingCache(
-            f"Embedding cache not found for {model_name}/{benchmark}: {path}. "
-            "Run with RUN_STAGES including 'gen_embeddings' first."
-        )
-    return np.load(path).astype(np.float32, copy=False)
+def tile_set_digest(feature_rels: list[str], label_rels: list[str]) -> str:
+    """Ordered digest over the expected dense tile identities -- the dense analogue of sample IDs."""
+    h = hashlib.sha256()
+    for rel in sorted(feature_rels) + sorted(label_rels):
+        h.update(rel.encode())
+        h.update(b"\0")
+    return h.hexdigest()
 
 
-def require_dense_cache(bench: PastisBenchmark, benchmark: str, model_name: str, tag: str, weights_override=None) -> Path:
-    """Return an existing dense tile cache root, failing if it is absent OR INCOMPLETE.
+# --- portable dataset content digest (written once by the preflight utility) -
 
-    Validates the EXACT expected set of tile IDs (every patch × every subtile) -- both the
-    feature and the label file must exist for each. A bare count would let a missing expected
-    tile be masked by an extra stale one; matching identities catches that.
+DATASET_DIGEST_DIR = CACHE_DIR / "dataset_digests"
+
+
+def dataset_digest(benchmark: str) -> str:
+    """The frozen portable content digest for a benchmark's inputs.
+
+    Produced ONCE by ``tools/preflight_dataset_digests`` (a CPU job on Gilbreth) and read here.
+    Absent -> a hard error: the frozen run requires the preflight to have established and
+    cross-checked dataset identity first; there is no weaker fallback.
     """
-    root = dense_embedding_cache_dir(bench, benchmark, model_name, tag, weights_override)
-    if not root.exists():
+    path = DATASET_DIGEST_DIR / f"{benchmark}.txt"
+    try:
+        digest = path.read_text().strip()
+    except OSError as exc:
         raise MissingEmbeddingCache(
-            f"Dense embedding cache not found for {model_name}/{benchmark}: {root}. "
-            "Run with RUN_STAGES including 'gen_embeddings' first."
-        )
+            f"No frozen dataset digest for {benchmark!r} at {path}. Run "
+            "tools/preflight_dataset_digests to hash and cross-check the inputs first."
+        ) from exc
+    if not digest:
+        raise MissingEmbeddingCache(f"Empty dataset digest file for {benchmark!r} at {path}.")
+    return digest
+
+
+# --- frozen-run identity (recorded in the RUN manifest, NOT in embedding validity) -------
+
+_FROZEN_IDENTITY: dict[str, Any] | None = None
+
+
+def frozen_run_identity() -> dict[str, Any]:
+    """Final commit + clean-tree state, for the run manifest. Memoized per process.
+
+    The commit is read straight from the deployed ``.git`` checkout -- no env override. It gates
+    the RUN, never the embedding (an embedding is identified by its content). A checkout with no
+    ``.git`` yields ``final_commit=None``; the launch gate refuses to run without provenance.
+    """
+    global _FROZEN_IDENTITY
+    if _FROZEN_IDENTITY is None:
+        from utils import artifacts
+        git = artifacts.git_identity(REPO)
+        _FROZEN_IDENTITY = {
+            "final_commit": git.get("commit"),
+            "clean": (git.get("dirty") is False) if git.get("commit") else None,
+            "tree_identity": git.get("tree_identity"),
+        }
+    return _FROZEN_IDENTITY
+
+
+# --- fixed canonical paths ---------------------------------------------------
+
+
+def artifact_name(s2_only: bool) -> str:
+    """The one path component reflecting embedding-affecting inputs. Not a variant framework."""
+    return "s2only" if s2_only else "baseline"
+
+
+def _cell_dir(benchmark: str, model_name: str) -> Path:
+    return EMBEDDINGS_DIR / benchmark / model_name
+
+
+def embedding_cache_path(benchmark: str, model_name: str, artifact: str = "baseline") -> Path:
+    return _cell_dir(benchmark, model_name) / f"{artifact}.npy"
+
+
+def embedding_manifest_path(benchmark: str, model_name: str, artifact: str = "baseline") -> Path:
+    return _cell_dir(benchmark, model_name) / f"{artifact}.manifest.json"
+
+
+def dense_embedding_cache_dir(benchmark: str, model_name: str, artifact: str = "baseline") -> Path:
+    return _cell_dir(benchmark, model_name) / artifact
+
+
+def dense_manifest_path(benchmark: str, model_name: str, artifact: str = "baseline") -> Path:
+    return _cell_dir(benchmark, model_name) / f"{artifact}.manifest.json"
+
+
+# --- manifest + npy IO helpers ----------------------------------------------
+
+
+def _read_manifest(path: Path) -> dict[str, Any] | None:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    tmp = _atomic_tmp(path)
+    try:
+        with open(tmp, "w") as f:
+            json.dump(manifest, f, sort_keys=True, indent=2)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _npy_shape_dtype(path: Path) -> tuple[tuple[int, ...], str]:
+    """Inspect shape and dtype through NumPy's public mmap loader without reading the array body."""
+    array = np.load(path, mmap_mode="r", allow_pickle=False)
+    return array.shape, str(array.dtype)
+
+
+def embedding_digest(benchmark: str, model_name: str, artifact: str = "baseline", *, dense: bool = False) -> str | None:
+    """The embedding's recorded CONTENT digest -- artifact SHA (tabular) or tile-set digest (dense).
+    This is what the run manifest references to bind results to a specific embedding."""
+    man_path = dense_manifest_path(benchmark, model_name, artifact) if dense else embedding_manifest_path(benchmark, model_name, artifact)
+    manifest = _read_manifest(man_path)
+    if not manifest:
+        return None
+    return manifest.get("tile_set_digest") if dense else manifest.get("artifact_sha256")
+
+
+# --- expected dense tile set (shared by build + load) ------------------------
+
+
+def _dense_expected_rels(bench: PastisBenchmark) -> tuple[list[str], list[str]]:
+    """Sorted relative POSIX identities of every non-void (feature, label) tile the descriptor
+    expects. A void tile (all ignore_index) is skipped exactly as extraction skips it."""
     tiles_per_axis = 128 // bench.tile_size
-    expected: set[Path] = set()
-    missing: list[str] = []
+    feature_rels: list[str] = []
+    label_rels: list[str] = []
     for patch in bench.patches:
-        fold_dir = root / f"fold_{patch.fold}"
         target = None
         target_path = getattr(patch, "target_path", None)
         if target_path is not None:
@@ -365,44 +378,176 @@ def require_dense_cache(bench: PastisBenchmark, benchmark: str, model_name: str,
             for c in range(tiles_per_axis):
                 tile_id = f"{patch.patch_id}_{r}_{c}"
                 if target is not None:
-                    row = r * bench.tile_size
-                    col = c * bench.tile_size
+                    row, col = r * bench.tile_size, c * bench.tile_size
                     labels = target[row:row + bench.tile_size, col:col + bench.tile_size]
                     if not np.any(labels != bench.ignore_index):
                         continue
-                label_path = fold_dir / f"{tile_id}.labels.npy"
-                expected.add(label_path)
-                if not ((fold_dir / f"{tile_id}.npy").exists() and label_path.exists()):
-                    missing.append(tile_id)
+                feature_rels.append(f"fold_{patch.fold}/{tile_id}.npy")
+                label_rels.append(f"fold_{patch.fold}/{tile_id}.labels.npy")
+    return sorted(feature_rels), sorted(label_rels)
+
+
+def _dense_tile_set_problems(root: Path, feat_rels: list[str], lab_rels: list[str]) -> list[str]:
+    """Exact tile-set completeness of a dense cache dir against the descriptor's expected rel sets:
+    missing (feature OR label) tiles, plus UNEXPECTED feature files AND UNEXPECTED label files.
+
+    One helper shared by the runtime load path (``_dense_state``) and one-time adoption, so both
+    refuse the identical set -- a foreign or stale tile of either kind can never pass unnoticed.
+    """
+    problems: list[str] = []
+    missing = [rel for rel in feat_rels + lab_rels if not (root / rel).exists()]
     if missing:
-        raise MissingEmbeddingCache(
-            f"Dense cache INCOMPLETE for {model_name}/{benchmark}: {len(missing)} expected tiles "
-            f"are missing a feature/label file in {root} (e.g. {missing[:3]}). Extraction was "
-            "interrupted -- re-run RUN_STAGES with 'gen_embeddings'."
-        )
-    # Reject EXTRA tiles too: load_dense_samples globs every *.labels.npy, so a stale tile left from
-    # a different descriptor (e.g. a changed max_samples) would silently be evaluated.
-    extra = sorted(str(p.relative_to(root)) for p in root.glob("fold_*/*.labels.npy") if p not in expected)
-    if extra:
-        raise MissingEmbeddingCache(
-            f"Dense cache for {model_name}/{benchmark} has {len(extra)} UNEXPECTED tile(s) not in the "
-            f"descriptor in {root} (e.g. {extra[:3]}). These would contaminate evaluation -- clear the "
-            "cache dir and re-run 'gen_embeddings'."
-        )
-    return root
+        problems.append(f"{len(missing)} expected feature/label tile(s) missing (e.g. {missing[:3]})")
+    if root.exists():
+        on_disk = {p.relative_to(root).as_posix() for p in root.glob("fold_*/*.npy")}
+        disk_labels = {rel for rel in on_disk if rel.endswith(".labels.npy")}
+        extra_features = sorted((on_disk - disk_labels) - set(feat_rels))
+        extra_labels = sorted(disk_labels - set(lab_rels))
+        if extra_features:
+            problems.append(f"{len(extra_features)} UNEXPECTED feature tile(s) not in the descriptor (e.g. {extra_features[:3]})")
+        if extra_labels:
+            problems.append(f"{len(extra_labels)} UNEXPECTED label tile(s) not in the descriptor (e.g. {extra_labels[:3]})")
+    return problems
 
 
-def extract_and_cache(
-    bench: Any, benchmark, model_name, tag, overwrite=False, **enc_kwargs
-) -> np.ndarray:
-    """Cache and return the frozen-model embedding matrix for a benchmark."""
-    path = embedding_cache_path(bench, benchmark, model_name, tag, enc_kwargs.get("weights_path"))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and not overwrite:
-        return np.load(path).astype(np.float32, copy=False)
-    with _cache_lock(path):
-        if path.exists() and not overwrite:
-            return np.load(path).astype(np.float32, copy=False)
+def _tabular_state(bench, benchmark, model_name, artifact, weights_override):
+    """('absent'|'ok'|'mismatch', array_or_None, problems).
+
+    absent   -- no manifest -> the cache was never completed (regenerate).
+    ok       -- the sidecar certifies this array for THIS run (returns the loaded array).
+    mismatch -- a sidecar exists but disagrees (refuse; the operator must delete the leaf).
+    """
+    art_path = embedding_cache_path(benchmark, model_name, artifact)
+    man_path = embedding_manifest_path(benchmark, model_name, artifact)
+    manifest = _read_manifest(man_path)
+    if manifest is None:
+        return "absent", None, []
+    problems: list[str] = []
+    expected = {
+        "benchmark": benchmark, "model": model_name, "artifact": artifact,
+        "checkpoint_sha256": checkpoint_sha256(model_name, weights_override),
+        "dataset_digest": dataset_digest(benchmark),
+        "sample_ids_digest": sample_ids_digest(bench.sample_ids),
+    }
+    for key, want in expected.items():
+        if manifest.get(key) != want:
+            problems.append(f"{key}: {manifest.get(key)!r} != {want!r}")
+    if not art_path.exists():
+        problems.append(f"array missing: {art_path}")
+    else:
+        try:
+            shape, dtype = _npy_shape_dtype(art_path)
+            if list(shape) != manifest.get("shape"):
+                problems.append(f"shape {list(shape)} != manifest {manifest.get('shape')}")
+            if dtype != manifest.get("dtype"):
+                problems.append(f"dtype {dtype} != manifest {manifest.get('dtype')}")
+        except Exception as exc:  # noqa: BLE001 -- a malformed header is itself a validity failure
+            problems.append(f"unreadable .npy header: {exc}")
+    if problems:
+        return "mismatch", None, problems
+    return "ok", np.load(art_path).astype(np.float32, copy=False), []
+
+
+def load_cached_embeddings(bench: Any, benchmark: str, model_name: str, artifact: str = "baseline", weights_override=None) -> np.ndarray:
+    """Load a frozen embedding matrix, validating its sidecar manifest.
+
+    Raises MissingEmbeddingCache if the sidecar is absent (never built) or disagrees with THIS run
+    (benchmark/model/artifact/checkpoint/dataset/sample-order/shape/dtype). The array bytes are not
+    re-hashed on load.
+    """
+    state, arr, problems = _tabular_state(bench, benchmark, model_name, artifact, weights_override)
+    if state == "ok":
+        return arr
+    if state == "absent":
+        raise MissingEmbeddingCache(
+            f"Embedding cache not built for {model_name}/{benchmark}/{artifact} (no manifest). "
+            "Run RUN_STAGES including 'gen_embeddings'."
+        )
+    raise MissingEmbeddingCache(
+        f"Embedding cache for {model_name}/{benchmark}/{artifact} does not match this run -- REFUSING:\n  - "
+        + "\n  - ".join(problems) + "\nDelete the cache leaf to rebuild it deliberately."
+    )
+
+
+def _dense_state(bench, benchmark, model_name, artifact, weights_override):
+    """('absent'|'ok'|'mismatch', root, problems) -- same three-state contract as tabular.
+
+    Keeps the exact expected-tile-set completeness check (missing / unexpected) plus cheap identity
+    (checkpoint, dataset, tile-set digest, counts, feature dim, dtype). Tiles are NOT re-hashed.
+    """
+    root = dense_embedding_cache_dir(benchmark, model_name, artifact)
+    man_path = dense_manifest_path(benchmark, model_name, artifact)
+    manifest = _read_manifest(man_path)
+    if manifest is None:
+        return "absent", root, []
+    feat_rels, lab_rels = _dense_expected_rels(bench)
+    problems: list[str] = []
+    expected = {
+        "benchmark": benchmark, "model": model_name, "artifact": artifact,
+        "checkpoint_sha256": checkpoint_sha256(model_name, weights_override),
+        "dataset_digest": dataset_digest(benchmark),
+        "tile_set_digest": tile_set_digest(feat_rels, lab_rels),
+        "feature_tile_count": len(feat_rels), "label_tile_count": len(lab_rels),
+    }
+    for key, want in expected.items():
+        if manifest.get(key) != want:
+            problems.append(f"{key}: {manifest.get(key)!r} != {want!r}")
+    problems += _dense_tile_set_problems(root, feat_rels, lab_rels)
+    if feat_rels and (root / feat_rels[0]).exists():  # cheap header spot-check (NOT every tile)
+        try:
+            shape, dtype = _npy_shape_dtype(root / feat_rels[0])
+        except Exception as exc:  # noqa: BLE001 -- a malformed header is itself a validity failure
+            problems.append(f"unreadable dense tile header {feat_rels[0]}: {exc}")
+        else:
+            if dtype != manifest.get("dtype"):
+                problems.append(f"dtype {dtype} != manifest {manifest.get('dtype')}")
+            if (int(shape[1]) if len(shape) > 1 else 0) != manifest.get("feature_dim"):
+                problems.append(f"feature_dim {shape[1] if len(shape) > 1 else 0} != manifest {manifest.get('feature_dim')}")
+    if problems:
+        return "mismatch", root, problems
+    return "ok", root, []
+
+
+def require_dense_cache(bench: PastisBenchmark, benchmark: str, model_name: str, artifact: str = "baseline", weights_override=None) -> Path:
+    """Return a certified dense tile cache root, or raise: absent (never built) or mismatch (refuse)."""
+    state, root, problems = _dense_state(bench, benchmark, model_name, artifact, weights_override)
+    if state == "ok":
+        return root
+    if state == "absent":
+        raise MissingEmbeddingCache(
+            f"Dense cache not built for {model_name}/{benchmark}/{artifact} (no manifest). "
+            "Run RUN_STAGES including 'gen_embeddings'."
+        )
+    raise MissingEmbeddingCache(
+        f"Dense cache for {model_name}/{benchmark}/{artifact} does not match this run -- REFUSING:\n  - "
+        + "\n  - ".join(problems) + "\nDelete the cache dir to rebuild it deliberately."
+    )
+
+
+def extract_and_cache(bench: Any, benchmark, model_name, artifact: str = "baseline", **enc_kwargs) -> np.ndarray:
+    """Encode and publish the frozen embedding matrix + its sidecar manifest.
+
+    A matching sidecar is a hit; a MISMATCHED sidecar is refused (the operator must delete the leaf
+    to rebuild -- this frozen run never auto-replaces a completed artifact). Publication under the
+    existing writer lock: the array is written atomically, then the manifest is written LAST, so an
+    absent manifest always means "incomplete".
+    """
+    from utils import artifacts
+
+    weights_override = enc_kwargs.get("weights_path")
+    art_path = embedding_cache_path(benchmark, model_name, artifact)
+    man_path = embedding_manifest_path(benchmark, model_name, artifact)
+    art_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with _cache_lock(art_path):
+        state, arr, problems = _tabular_state(bench, benchmark, model_name, artifact, weights_override)
+        if state == "ok":
+            return arr
+        if state == "mismatch":
+            raise MissingEmbeddingCache(
+                f"Refusing to overwrite a completed {model_name}/{benchmark}/{artifact} that does not "
+                f"match this run:\n  - " + "\n  - ".join(problems) + "\nDelete the leaf to rebuild it."
+            )
         model = build_model(model_name, **enc_kwargs)
         print(f"  encoding {model_name} ...", flush=True)
         with perf.measure(f"encode/{model_name}", n_samples=bench.n_samples):
@@ -413,46 +558,43 @@ def extract_and_cache(
             except Exception as exc:
                 print(f"  (compute_macs failed for {model_name}: {type(exc).__name__}; recording 0)", flush=True)
                 model._macs = 0
-        perf.log_static(
-            f"encode/{model_name}",
-            macs=model._macs * bench.n_samples,
-            n_samples=bench.n_samples,
-            n_features=model.embedding_dim,
-        )
-        arr = arr.astype(EMB_DTYPE, copy=False)
-        tmp = _atomic_tmp(path)
+        perf.log_static(f"encode/{model_name}", macs=model._macs * bench.n_samples,
+                        n_samples=bench.n_samples, n_features=model.embedding_dim)
+        arr = np.ascontiguousarray(arr.astype(EMB_DTYPE, copy=False))
+        tmp = _atomic_tmp(art_path)
         try:
             with open(tmp, "wb") as f:
                 np.save(f, arr)
-            os.replace(tmp, path)
+            os.replace(tmp, art_path)
         finally:
             tmp.unlink(missing_ok=True)
-        return arr.astype(np.float32, copy=False)
+        _write_manifest(man_path, {  # manifest LAST -> its presence certifies a complete artifact
+            "schema": 1, "benchmark": benchmark, "model": model_name, "artifact": artifact,
+            "checkpoint_sha256": checkpoint_sha256(model_name, weights_override),
+            "dataset_digest": dataset_digest(benchmark),
+            "sample_ids_digest": sample_ids_digest(bench.sample_ids),
+            "shape": [int(x) for x in arr.shape], "dtype": str(arr.dtype),
+            "artifact_sha256": artifacts.sha256_file(art_path),
+        })
+    return arr.astype(np.float32, copy=False)
 
 
-def extract_dense_and_cache(
-    bench: PastisBenchmark,
-    benchmark: str,
-    model_name: str,
-    tag: str,
-    overwrite: bool = False,
-    **enc_kwargs,
-) -> Path:
-    """Encode a lazy spatial benchmark one tile at a time."""
-    root = dense_embedding_cache_dir(bench, benchmark, model_name, tag, enc_kwargs.get("weights_path"))
+def _encode_dense_into(bench: PastisBenchmark, model_name: str, root: Path, enc_kwargs: dict) -> None:
+    """Encode every non-void tile into ``root`` one tile at a time -- resumable (existing tiles are
+    skipped) with per-tile atomic writes and per-tile locks."""
     root.mkdir(parents=True, exist_ok=True)
     model = None
-    for tile_id, fold, tile, labels in bench.iter_tiles(cache_root=root, overwrite=overwrite):
+    for tile_id, fold, tile, labels in bench.iter_tiles(cache_root=root, overwrite=False):
         if len(labels) == 0:
             continue
         fold_dir = root / f"fold_{fold}"
         fold_dir.mkdir(parents=True, exist_ok=True)
         feature_path = fold_dir / f"{tile_id}.npy"
         label_path = fold_dir / f"{tile_id}.labels.npy"
-        if feature_path.exists() and label_path.exists() and not overwrite:
+        if feature_path.exists() and label_path.exists():
             continue
         with _cache_lock(feature_path):
-            if feature_path.exists() and label_path.exists() and not overwrite:
+            if feature_path.exists() and label_path.exists():
                 continue
             if model is None:
                 model = build_model(model_name, **enc_kwargs)
@@ -460,7 +602,7 @@ def extract_dense_and_cache(
                 features = model.encode_dense(tile) if hasattr(model, "encode_dense") else model.encode(tile.pixel_benchmark())
             if features.shape[0] != labels.shape[0]:
                 raise ValueError(f"Dense model returned {features.shape[0]} rows for {labels.shape[0]} valid pixels")
-            for path, values, dtype in ((feature_path, features, EMB_DTYPE), (label_path, labels, "uint8")):
+            for path, values, dtype in ((feature_path, features, EMB_DTYPE), (label_path, labels, DENSE_LABEL_DTYPE)):
                 tmp = _atomic_tmp(path)
                 try:
                     with open(tmp, "wb") as handle:
@@ -468,6 +610,55 @@ def extract_dense_and_cache(
                     os.replace(tmp, path)
                 finally:
                     tmp.unlink(missing_ok=True)
+
+
+def _build_dense_manifest(bench, benchmark, model_name, artifact, root, weights_override) -> dict[str, Any]:
+    """The slim dense sidecar: identity + tile counts + tile-set digest (no per-file arrays)."""
+    feat_rels, lab_rels = _dense_expected_rels(bench)
+    dtype, feature_dim = EMB_DTYPE, 0
+    if feat_rels:
+        shape, dtype = _npy_shape_dtype(root / feat_rels[0])
+        feature_dim = int(shape[1]) if len(shape) > 1 else 0
+    return {
+        "schema": 1, "benchmark": benchmark, "model": model_name, "artifact": artifact,
+        "checkpoint_sha256": checkpoint_sha256(model_name, weights_override),
+        "dataset_digest": dataset_digest(benchmark),
+        "feature_tile_count": len(feat_rels), "label_tile_count": len(lab_rels),
+        "tile_set_digest": tile_set_digest(feat_rels, lab_rels),
+        "feature_dim": feature_dim, "dtype": str(dtype),
+    }
+
+
+def extract_dense_and_cache(
+    bench: PastisBenchmark, benchmark: str, model_name: str, artifact: str = "baseline", **enc_kwargs
+) -> Path:
+    """Encode the dense tile cache in place (resumable), verify completeness, then publish the
+    manifest LAST. A matching sidecar is a hit; a mismatched one is refused (delete the dir to
+    rebuild). The absent manifest during the build is exactly what marks it incomplete."""
+    weights_override = enc_kwargs.get("weights_path")
+    root = dense_embedding_cache_dir(benchmark, model_name, artifact)
+    man_path = dense_manifest_path(benchmark, model_name, artifact)
+
+    state, _root, problems = _dense_state(bench, benchmark, model_name, artifact, weights_override)
+    if state == "ok":
+        return root
+    if state == "mismatch":
+        raise MissingEmbeddingCache(
+            f"Refusing to rebuild a completed dense {model_name}/{benchmark}/{artifact} that does not "
+            f"match this run:\n  - " + "\n  - ".join(problems) + "\nDelete the cache dir to rebuild it."
+        )
+
+    _encode_dense_into(bench, model_name, root, enc_kwargs=enc_kwargs)  # per-tile locks; resumable
+    man_path.parent.mkdir(parents=True, exist_ok=True)
+    with _cache_lock(man_path):
+        feat_rels, lab_rels = _dense_expected_rels(bench)
+        missing = [rel for rel in feat_rels + lab_rels if not (root / rel).exists()]
+        if missing:
+            raise MissingEmbeddingCache(
+                f"Dense build incomplete for {model_name}/{benchmark}/{artifact}: {len(missing)} "
+                f"expected tile(s) missing (e.g. {missing[:3]})."
+            )
+        _write_manifest(man_path, _build_dense_manifest(bench, benchmark, model_name, artifact, root, weights_override))
     return root
 
 

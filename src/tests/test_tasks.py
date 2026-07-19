@@ -159,16 +159,16 @@ def test_test_optimal_binary_metrics_are_not_aggregate_metrics() -> None:
     assert "diagnostic_calibrated_f1_target_optimal" in EV.METRIC_ROLES["binary"]["diagnostic"]
 
 
-def test_hf_default_checkpoint_key_tracks_local_bytes(tmp_path, monkeypatch) -> None:
+def test_hf_default_checkpoint_sha256_tracks_local_bytes(tmp_path, monkeypatch) -> None:
     path = tmp_path / "models" / "presto" / "model-f317d103.pth"
     path.parent.mkdir(parents=True)
     path.write_bytes(b"AAAA")
     monkeypatch.setattr(cacheutils, "_INPUT_BASE", tmp_path)
-    cacheutils._hash_file_content.cache_clear()
-    first = cacheutils._checkpoint_fingerprint("presto")
+    cacheutils._CHECKPOINT_SHA_CACHE.clear()
+    first = cacheutils.checkpoint_sha256("presto")
     path.write_bytes(b"BBBBB")
-    cacheutils._hash_file_content.cache_clear()
-    assert cacheutils._checkpoint_fingerprint("presto") != first
+    cacheutils._CHECKPOINT_SHA_CACHE.clear()
+    assert cacheutils.checkpoint_sha256("presto") != first
 
 
 def test_invalid_shard_config_raises(monkeypatch) -> None:
@@ -176,10 +176,6 @@ def test_invalid_shard_config_raises(monkeypatch) -> None:
     monkeypatch.setenv(gputils.NUM_SHARDS_ENV, "4")
     with pytest.raises(ValueError):
         gputils.take_shard([1, 2, 3])
-    monkeypatch.delenv(gputils.SHARD_ENV)
-    monkeypatch.setenv("RB_SHARD_BASE", "3")
-    with pytest.raises(ValueError):
-        gputils.fan_out(num_shards=2)
 
 
 def test_dense_training_sample_is_pixel_random_not_tile_balanced(tmp_path) -> None:

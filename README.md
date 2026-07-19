@@ -162,16 +162,16 @@ the row reports the worst test domain rather than only the average.
 
 ## Probing
 
-The pipeline fits ordinary probes (logistic by default; `mlp` / `knn` via
-`RB_ACTIVE_PROBES`) on the frozen embeddings. There is no post-hoc adaptation:
-the probe sees the cached features exactly as the encoder produced them, and each
-label-budget cell uses only the labels available to that row. Result rows carry a
-constant `method="erm"` column, which the canonical artifacts and the resume keys
-depend on.
+The pipeline fits ordinary probes (logistic by default; `mlp` / `knn` via the
+`ACTIVE_PROBES` constant in `main.py`) on the frozen embeddings. There is no
+post-hoc adaptation: the probe sees the cached features exactly as the encoder
+produced them, and each label-budget cell uses only the labels available to that
+row. Result rows carry a constant `method="erm"` column, which the canonical
+artifacts and the resume keys depend on.
 
-Set `RB_PROBE_TUNING=1` to restore the full probe hyperparameter grid (collapsed
-to a single value by default for tractability on 706k-row EuroCropsML); it is
-recorded in the run signature when enabled.
+Set `PROBE_TUNING = True` in `main.py` to restore the full probe hyperparameter
+grid (collapsed to a single value by default for tractability on 706k-row
+EuroCropsML); it is recorded in the run manifest when enabled.
 
 ---
 
@@ -330,7 +330,6 @@ BUDGET_REGIMES = {
     "source": [0.05, 0.10, 0.25, 1.0],
     "target": [0, 5, 10, 25, 50, EV.TARGET_ID_UPPER_BOUND],
 }
-MAX_SAMPLES = None            # None = all samples
 MAX_DENSE_PIXELS = 50_000     # sampled PASTIS pixels per fold partition
 SEEDS = [0]                   # expand to [0, 1, 2] for additional bulk runs
 OVERWRITE_MODE = False        # False resumes; True overwrites cached outputs
@@ -397,5 +396,5 @@ Deleting generated cache is safe since cache keys are content-aware and `data/in
 
 | Cache | Key includes | Rebuilds when you change |
 |---|---|---|
-| `data/cache/benchmark/<bench>__<tag>.pkl` | benchmark params, `get_input.py` hash, input-data fingerprint | loader code or staged benchmark inputs |
+| `data/cache/benchmark/<bench>.pkl` | fixed canonical loader contract (`max_samples=None, shuffle=True, seed=0`) | the pickle is missing or unreadable |
 | `data/cache/embeddings/<bench>/<model>/<signature>/baseline.npy` | benchmark identity and model source hash | benchmark inputs or model code |

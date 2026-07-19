@@ -39,7 +39,6 @@ def test_main_dispatches_config_to_run_pair(monkeypatch) -> None:
     assert call["benchmark_name"] == main.BENCHMARKS[0]
     assert call["model_name"] == "raw"
     assert call["seeds"] == main.SEEDS
-    assert call["max_samples"] == main.MAX_SAMPLES
     assert call["max_dense_pixels"] == main.MAX_DENSE_PIXELS
     assert call["split_regimes"] == main.SPLIT_REGIMES
     assert call["run_stages"] == main.RUN_STAGES
@@ -87,12 +86,10 @@ def test_s2_only_uses_original_coordinates_for_split_regimes(monkeypatch, tmp_pa
             return loaded.labels, loaded.groups
 
     seen = {}
-    monkeypatch.setenv("RB_S2_ONLY", "1")
     monkeypatch.setattr(main.EV, "load_benchmark", lambda _name: FakeBenchMod)
     monkeypatch.setattr(main.cacheutils, "OUTPUT_DIR", tmp_path)
-    monkeypatch.setattr(main.cacheutils, "bench_tag", lambda *_args, **_kwargs: "tag")
     monkeypatch.setattr(main.cacheutils, "cached_bench", lambda *_args, **_kwargs: bench)
-    monkeypatch.setattr(main.runstate, "run_signature", lambda *_args, **_kwargs: "sig")
+    monkeypatch.setattr(main.runstate, "build_run_manifest", lambda *_args, **_kwargs: {"stub": "s"})
     monkeypatch.setattr(main.compat, "input_modalities", lambda _model: set())
 
     def load_embeddings(loaded, *_args, **_kwargs):
@@ -117,15 +114,15 @@ def test_s2_only_uses_original_coordinates_for_split_regimes(monkeypatch, tmp_pa
             "fake",
             "raw",
             [0],
-            None,
             0,
             ["spatial_cluster_ood"],
             ["probing"],
             ["logistic"],
             {"source": [1.0], "target": [0]},
-            True,
-            False,
-            {},
+            True,   # s2_only
+            True,   # overwrite_mode
+            False,  # strict_mode
+            {},     # enc_kwargs
         )
 
     assert np.all(seen["embedding_latlon"] == 0.0)

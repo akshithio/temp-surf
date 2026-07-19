@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 
 import numpy as np
@@ -89,22 +88,16 @@ def test_sample_ci_filters_to_anchor_budgets():
     assert "delta_sample_pt" in out                                   # explicit CI centre present
 
 
-def test_hf_checkpoint_fingerprint_is_download_independent_and_revision_pinned():
-    fp_presto = C._checkpoint_fingerprint("presto")
-    assert fp_presto and fp_presto == C._checkpoint_fingerprint("presto")  # stable
-    saved = C._CHECKPOINT_SPECS["presto"]
-    try:
-        C._CHECKPOINT_SPECS["presto"] = ("hf", None, None, "torchgeo/presto@DIFFERENT:model.pth")
-        assert C._checkpoint_fingerprint("presto") != fp_presto           # revision baked into key
-    finally:
-        C._CHECKPOINT_SPECS["presto"] = saved
+def test_checkpoint_sha256_is_stable_and_raw_tracks_mode():
+    fp = C.checkpoint_sha256("presto")
+    assert fp and fp == C.checkpoint_sha256("presto") and len(fp) == 64  # stable full SHA
     import os as _os
     _saved = _os.environ.get("RAW_MODE")
     try:
         _os.environ["RAW_MODE"] = "flatten"
-        fp_flat = C._checkpoint_fingerprint("raw")
+        flat = C.checkpoint_sha256("raw")
         _os.environ["RAW_MODE"] = "stats"
-        assert C._checkpoint_fingerprint("raw") != fp_flat
+        assert C.checkpoint_sha256("raw") != flat        # raw identity tracks the featurization mode
     finally:
         if _saved is None:
             _os.environ.pop("RAW_MODE", None)
@@ -112,36 +105,26 @@ def test_hf_checkpoint_fingerprint_is_download_independent_and_revision_pinned()
             _os.environ["RAW_MODE"] = _saved
 
 
-def test_local_checkpoint_fingerprint_tracks_content(tmp_path, monkeypatch):
+def test_checkpoint_sha256_tracks_local_content(tmp_path, monkeypatch):
     wp = tmp_path / "AgriFM.pth"
     wp.write_bytes(b"weights-v1" + b"\0" * 1000)
     monkeypatch.setenv("AGRIFM_WEIGHTS", str(wp))
-    fp1 = C._checkpoint_fingerprint("agrifm")
+    C._CHECKPOINT_SHA_CACHE.clear()
+    fp1 = C.checkpoint_sha256("agrifm")
     mtime = wp.stat().st_mtime
     wp.write_bytes(b"weights-v2" + b"\0" * 1000)
-    os.utime(wp, (mtime, mtime))
-    C._hash_file_content.cache_clear()
-    assert C._checkpoint_fingerprint("agrifm") != fp1
+    os.utime(wp, (mtime, mtime))  # SAME mtime -> content hash must still move
+    C._CHECKPOINT_SHA_CACHE.clear()
+    assert C.checkpoint_sha256("agrifm") != fp1
 
 
-def test_embedding_key_changes_with_checkpoint():
-    class B:
-        n_samples = 10
-    a = C.embedding_cache_path(B(), "cropharvest", "presto", "tag")
-    assert "_w" in str(a)                       # checkpoint folded into the key
-    assert "_w" not in C.embedding_cache_path(B(), "cropharvest", "raw", "tag").name
-
-
-def test_input_fingerprint_recursive_catches_deep_edit(tmp_path, monkeypatch):
-    sub = tmp_path / "preprocess"
-    sub.mkdir()
-    (sub / "a.npz").write_bytes(b"x" * 10)
-    monkeypatch.setenv("DATA_FINGERPRINT", "deep")
-    fp1 = C._input_fingerprint(tmp_path)
-    (sub / "a.npz").write_bytes(b"y" * 20)      # deep in-place edit
-    assert C._input_fingerprint(tmp_path) != fp1
-    monkeypatch.setenv("DATA_FINGERPRINT", "top")
-    assert C._input_fingerprint(tmp_path)       # top mode still produces a value
+def test_embedding_identity_carries_checkpoint_in_manifest_not_path():
+    # Fixed readable path -- the checkpoint no longer perturbs it.
+    a = C.embedding_cache_path("cropharvest", "presto", "baseline")
+    assert a.name == "baseline.npy" and "_w" not in str(a)
+    # Checkpoint identity is a full SHA-256 recorded in the manifest, and distinct per model.
+    assert len(C.checkpoint_sha256("presto")) == 64
+    assert C.checkpoint_sha256("presto") != C.checkpoint_sha256("raw")
 
 
 def test_append_jsonl_roundtrips_batch(tmp_path):
@@ -225,20 +208,21 @@ def test_target_sweep_shared_test_and_full_pool_oracle():
     assert oracle["threshold_source"] == "target_internal_tuned_oof"
 
 
-def test_run_signature_guard_rejects_mismatch(tmp_path, monkeypatch):
+def test_run_manifest_guard_rejects_mismatch(tmp_path, monkeypatch):
     from utils import runstate
     d = tmp_path / "results"
     d.mkdir()
-    runstate.check_run_signature(d, "sigAAAA", overwrite_mode=False)                    # empty dir is fine
-    runstate.publish_run_signature(d, "sigAAAA")
-    runstate.check_run_signature(d, "sigAAAA", overwrite_mode=False)                    # same signature resumes fine
+    m = {"schema": 1, "seeds": [0]}
+    runstate.check_run_manifest(d, m, overwrite_mode=False)                             # empty dir is fine
+    runstate.publish_run_manifest(d, m)
+    runstate.check_run_manifest(d, m, overwrite_mode=False)                             # exact match resumes fine
     with pytest.raises(RuntimeError):
-        runstate.check_run_signature(d, "sigDIFFERENT", overwrite_mode=False)           # different config refuses to mix
+        runstate.check_run_manifest(d, {"schema": 1, "seeds": [1]}, overwrite_mode=False)  # different config refuses
     d2 = tmp_path / "results2"
     d2.mkdir()
     (d2 / "probe_results.jsonl").write_text('{"a": 1}\n')
     with pytest.raises(RuntimeError):
-        runstate.check_run_signature(d2, "sigAAAA", overwrite_mode=False)
+        runstate.check_run_manifest(d2, m, overwrite_mode=False)                        # rows but no manifest refuses
 
 
 def test_worst_region_uses_max_for_error_metrics():
@@ -323,40 +307,33 @@ def test_summarize_rows_keeps_scopes_separate():
     assert abs(by_es["full"]["mean_miou"] - 0.6) < 1e-9 and abs(by_es["held_out"]["mean_miou"] - 0.1) < 1e-9
 
 
-def test_require_dense_cache_rejects_extra_tile(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-
-    from utils import cacheutils as C
-    monkeypatch.setattr(C, "EMBEDDINGS_DIR", tmp_path)  # isolate from the real cache
-    patch = SimpleNamespace(patch_id=7, fold=1)
-    bench = SimpleNamespace(patches=(patch,), tile_size=128, n_samples=1)  # 1 patch, tiles_per_axis=1
-    fold = C.dense_embedding_cache_dir(bench, "pastis", "raw", "tag") / "fold_1"
-    fold.mkdir(parents=True, exist_ok=True)
-    for name in ("7_0_0.npy", "7_0_0.labels.npy", "999_0_0.npy", "999_0_0.labels.npy"):  # 999 is stale
-        (fold / name).write_bytes(b"x")
-    with pytest.raises(C.MissingEmbeddingCache):
-        C.require_dense_cache(bench, "pastis", "raw", "tag")
-
-
-def test_require_dense_cache_ignores_all_void_tiles(tmp_path, monkeypatch):
+def test_dense_expected_rels_full_grid(tmp_path):
+    """Every subtile of a non-void patch is expected (feature + matching labels)."""
     from types import SimpleNamespace
 
     from utils import cacheutils as C
 
-    monkeypatch.setattr(C, "EMBEDDINGS_DIR", tmp_path)
+    patch = SimpleNamespace(patch_id=7, fold=1, target_path=None)  # no target -> nothing is void
+    bench = SimpleNamespace(patches=(patch,), tile_size=64, ignore_index=255)  # 2x2 grid
+    feat, lab = C._dense_expected_rels(bench)
+    assert feat == ["fold_1/7_0_0.npy", "fold_1/7_0_1.npy", "fold_1/7_1_0.npy", "fold_1/7_1_1.npy"]
+    assert lab == [f"fold_1/7_{r}_{c}.labels.npy" for r in range(2) for c in range(2)]
+
+
+def test_dense_expected_rels_skips_void_tiles(tmp_path):
+    """A subtile whose labels are all ignore_index is skipped exactly as extraction skips it."""
+    from types import SimpleNamespace
+
+    from utils import cacheutils as C
+
     target = np.zeros((1, 128, 128), dtype=np.uint8)
-    target[0, 64:, 64:] = 19
+    target[0, 64:, 64:] = 19  # only the bottom-right 64x64 tile is all-void
     target_path = tmp_path / "target.npy"
     np.save(target_path, target)
     patch = SimpleNamespace(patch_id=7, fold=1, target_path=target_path)
-    bench = SimpleNamespace(patches=(patch,), tile_size=64, n_samples=4, ignore_index=19)
-    fold = C.dense_embedding_cache_dir(bench, "pastis", "raw", "tag") / "fold_1"
-    fold.mkdir(parents=True, exist_ok=True)
-    for tile_id in ("7_0_0", "7_0_1", "7_1_0"):
-        (fold / f"{tile_id}.npy").write_bytes(b"x")
-        (fold / f"{tile_id}.labels.npy").write_bytes(b"x")
-
-    assert C.require_dense_cache(bench, "pastis", "raw", "tag") == fold.parent
+    bench = SimpleNamespace(patches=(patch,), tile_size=64, ignore_index=19)
+    feat, _lab = C._dense_expected_rels(bench)
+    assert feat == ["fold_1/7_0_0.npy", "fold_1/7_0_1.npy", "fold_1/7_1_0.npy"]  # 7_1_1 dropped
 
 
 def test_dense_loaders_return_cached_features_unaltered(tmp_path):
@@ -377,13 +354,13 @@ def test_dense_loaders_return_cached_features_unaltered(tmp_path):
     np.testing.assert_allclose(tiles[0][0], x)
 
 
-def test_run_signature_rejects_empty_or_corrupt(tmp_path, monkeypatch):
+def test_run_manifest_rejects_corrupt(tmp_path, monkeypatch):
     from utils import runstate
     d = tmp_path / "r"
     d.mkdir()
-    (d / "run_signature.txt").write_text("")   # crashed/corrupt publish
+    (d / "run_manifest.json").write_text("{not json")   # crashed/corrupt publish
     with pytest.raises(RuntimeError):
-        runstate.check_run_signature(d, "sigAAAA", overwrite_mode=False)
+        runstate.check_run_manifest(d, {"schema": 1}, overwrite_mode=False)
 
 
 def test_leave_one_domain_out_dropped_domain_surfaced(monkeypatch):
@@ -421,31 +398,28 @@ def test_leave_one_domain_out_dropped_domain_surfaced(monkeypatch):
     assert any("C" in reason for _, reg, reason in RB.REGIME_PROBLEMS if reg == "geographic_ood")
 
 
-def test_run_signature_includes_seeds_and_enc_kwargs():
+def test_run_manifest_includes_seeds_and_enc_kwargs():
     from utils import runstate
-    kwargs = dict(
-        active_probes=["logistic"],
-        budget_regimes={"source": [1.0], "target": [0, 0.1]},
-        max_samples=None,
-        max_dense_pixels=50_000,
-    )
-    base = runstate.run_signature("raw", "tag", ["random_id"], [0, 1, 2], {"device": "cpu"}, **kwargs)
-    assert runstate.run_signature("raw", "tag", ["random_id"], [0, 1], {"device": "cpu"}, **kwargs) != base
-    assert runstate.run_signature(
-        "raw", "tag", ["random_id"], [0, 1, 2], {"device": "cpu", "weights_path": "/x"}, **kwargs
-    ) != base
-    # Methods can no longer vary -- the harness is ERM-only and the signature carries the literal
-    # methods=['erm']. Probe tuning is the knob that legitimately moves the signature now.
-    prev = os.environ.get("RB_PROBE_TUNING")
+
+    def sig(seeds, enc):
+        m = runstate.build_run_manifest(
+            "raw", "cropharvest", "baseline", "emb", ["random_id"], seeds, enc,
+            active_probes=["logistic"], budget_regimes={"source": [1.0], "target": [0, 0.1]},
+            max_dense_pixels=50_000, write_predictions=True,
+        )
+        return runstate.run_manifest_digest(m)
+
+    base = sig([0, 1, 2], {"device": "cpu"})
+    assert sig([0, 1], {"device": "cpu"}) != base                            # seed set is result-defining
+    assert sig([0, 1, 2], {"device": "cpu", "weights_path": "/x"}) != base   # enc kwargs are recorded
+    from evals import probes
+    prev = probes.PROBE_TUNING
     try:
-        os.environ["RB_PROBE_TUNING"] = "1"
-        assert runstate.run_signature("raw", "tag", ["random_id"], [0, 1, 2], {"device": "cpu"}, **kwargs) != base
+        probes.PROBE_TUNING = True
+        assert sig([0, 1, 2], {"device": "cpu"}) != base                     # probe tuning moves the manifest
     finally:
-        if prev is None:
-            os.environ.pop("RB_PROBE_TUNING", None)
-        else:
-            os.environ["RB_PROBE_TUNING"] = prev
-    assert runstate.run_signature("raw", "tag", ["random_id"], [0, 1, 2], {"device": "cuda"}, **kwargs) == base
+        probes.PROBE_TUNING = prev
+    assert sig([0, 1, 2], {"device": "cuda"}) == base                        # device is not result-defining
 
 
 def test_prune_partial_budgets_removes_surviving_scope(tmp_path):
@@ -468,86 +442,40 @@ def test_prune_partial_budgets_removes_surviving_scope(tmp_path):
     assert IOU.read_jsonl(preds_path) == []              # its prediction pruned too
 
 
-def test_custom_weights_path_changes_embedding_cache_key(tmp_path):
-    class B:
-        n_samples = 10
+def test_custom_weights_path_changes_checkpoint_identity(tmp_path):
     wa, wb = tmp_path / "a.pth", tmp_path / "b.pth"   # tiny overrides (avoid reading real weights)
     wa.write_bytes(b"AAAA")
     wb.write_bytes(b"BBBB")
-    C._hash_file_content.cache_clear()
-    ka = C.embedding_cache_path(B(), "cropharvest", "agrifm", "tag", weights_override=str(wa))
-    kb = C.embedding_cache_path(B(), "cropharvest", "agrifm", "tag", weights_override=str(wb))
-    assert ka != kb                                   # the override checkpoint is part of the cache key
+    C._CHECKPOINT_SHA_CACHE.clear()
+    ka = C.checkpoint_sha256("agrifm", weights_override=str(wa))
+    kb = C.checkpoint_sha256("agrifm", weights_override=str(wb))
+    assert ka != kb and len(ka) == 64                 # override checkpoint content is the identity
+    # The on-disk cache path is fixed regardless of checkpoint (identity lives in the manifest).
+    assert C.embedding_cache_path("cropharvest", "agrifm", "baseline").name == "baseline.npy"
 
 
-def test_input_fingerprint_hashes_file_content(tmp_path):
-    d = tmp_path / "bench"
-    d.mkdir()
-    f = d / "x.bin"
-    f.write_bytes(b"AAAA")
-    a = C._input_fingerprint(d)
-    mtime = f.stat().st_mtime
-    f.write_bytes(b"BBBB")
-    os.utime(f, (mtime, mtime))
-    assert C._input_fingerprint(d) != a
-
-
-def test_pastis_fingerprint_ignores_unused_heavy_products(tmp_path, monkeypatch):
-    bench = tmp_path / "pastis"
-    for name in ("DATA_S2", "DATA_S1A", "ANNOTATIONS", "DATA_S1D"):
-        (bench / name).mkdir(parents=True)
-    (bench / "metadata.geojson").write_text(json.dumps({
-        "type": "FeatureCollection",
-        "features": [
-            {"type": "Feature", "properties": {"ID_PATCH": 10001}, "geometry": None},
-        ],
-    }))
-    for path in (
-        bench / "DATA_S2" / "S2_10001.npy",
-        bench / "DATA_S1A" / "S1A_10001.npy",
-        bench / "ANNOTATIONS" / "TARGET_10001.npy",
-    ):
-        path.write_bytes(b"required")
-    unused = bench / "DATA_S1D" / "S1D_10001.npy"
-    unused.write_bytes(b"unused")
-
-    def guarded_hash(path, h):
-        assert "DATA_S1D" not in str(path)
-        return original_hash(path, h)
-
-    original_hash = C._update_file_content_hash
-    monkeypatch.setattr(C, "_update_file_content_hash", guarded_hash)
-    fp = C._pastis_input_fingerprint(bench, "deep")
-    unused.write_bytes(b"changed")
-    assert C._pastis_input_fingerprint(bench, "deep") == fp
-
-
-def test_run_signature_includes_cacheutils_in_code_hash():
+def test_run_manifest_digest_is_deterministic():
     from utils import runstate
-    kwargs = dict(
-        active_probes=["logistic"],
-        budget_regimes={"source": [1.0], "target": [0, 0.1]},
-        max_samples=None,
-        max_dense_pixels=50_000,
-    )
-    sig = runstate.run_signature("raw", "tag", ["random_id"], [0], {"device": "cpu"}, **kwargs)
-    assert sig and sig == runstate.run_signature("raw", "tag", ["random_id"], [0], {"device": "cpu"}, **kwargs)
+
+    def sig():
+        m = runstate.build_run_manifest(
+            "raw", "cropharvest", "baseline", "emb", ["random_id"], [0], {"device": "cpu"},
+            active_probes=["logistic"], budget_regimes={"source": [1.0], "target": [0, 0.1]},
+            max_dense_pixels=50_000, write_predictions=True,
+        )
+        return runstate.run_manifest_digest(m)
+
+    s = sig()
+    assert s and s == sig()
 
 
-def test_run_signature_reflects_override_checkpoint_content(tmp_path):
-    from utils import runstate
+def test_checkpoint_sha_reflects_override_content_not_mtime(tmp_path):
     wp = tmp_path / "agrifm.pth"
     wp.write_bytes(b"weights-v1" + b"\0" * 64)
-    enc = {"device": "cpu", "weights_path": str(wp)}
-    kwargs = dict(
-        active_probes=["logistic"],
-        budget_regimes={"source": [1.0], "target": [0, 0.1]},
-        max_samples=None,
-        max_dense_pixels=50_000,
-    )
-    sig1 = runstate.run_signature("agrifm", "tag", ["geographic_ood"], [0], enc, **kwargs)
+    C._CHECKPOINT_SHA_CACHE.clear()
+    sig1 = C.checkpoint_sha256("agrifm", weights_override=str(wp))
     mtime = wp.stat().st_mtime
     wp.write_bytes(b"weights-v2" + b"\0" * 64)
-    os.utime(wp, (mtime, mtime))
-    C._hash_file_content.cache_clear()
-    assert runstate.run_signature("agrifm", "tag", ["geographic_ood"], [0], enc, **kwargs) != sig1
+    os.utime(wp, (mtime, mtime))  # SAME mtime -> a content hash must still move
+    C._CHECKPOINT_SHA_CACHE.clear()
+    assert C.checkpoint_sha256("agrifm", weights_override=str(wp)) != sig1 and len(sig1) == 64
