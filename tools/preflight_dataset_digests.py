@@ -14,9 +14,10 @@ What it does, per benchmark in CONFIG["benchmarks"]:
     a downgrade to a weaker check.
 
 Publication is transactional: ALL digests are computed and EVERY configured reference validated
-before anything is written. On any mismatch the run returns failure and leaves every existing
-data/cache/dataset_digests/<benchmark>.txt unchanged; on full success each digest is published
-ATOMICALLY. ``write=False`` performs ZERO filesystem writes -- not even directory creation.
+before anything is written. On any mismatch the run returns failure and leaves cache.json
+unchanged; on full success every digest is merged into cache.json in ONE atomic replacement (so
+concurrently-written embedding records are preserved). ``write=False`` performs ZERO filesystem
+writes.
 
 Cross-machine use: run on each assigned machine, then paste each machine's printed digest into
 CONFIG["reference"] and re-run everywhere; a mismatch means the data differs and the run must stop.
@@ -51,15 +52,6 @@ def _aggregate_sha256(root, rels: list[str]) -> str:
         h.update(b"\n")
     return h.hexdigest()
 
-
-def _write_atomic(path: Path, text: str) -> None:
-    """Atomic publish via a temp file + rename (reuses cacheutils._atomic_tmp)."""
-    tmp = C._atomic_tmp(path)
-    try:
-        tmp.write_text(text)
-        tmp.replace(path)
-    finally:
-        tmp.unlink(missing_ok=True)
 
 # ===================== CONFIG (edit me; no CLI) =============================
 CONFIG = {
@@ -122,10 +114,8 @@ def main() -> int:
             print(f"  - {f}")
         return 1
     if CONFIG["write"]:
-        C.DATASET_DIGEST_DIR.mkdir(parents=True, exist_ok=True)
-        for benchmark, digest in computed.items():
-            _write_atomic(C.DATASET_DIGEST_DIR / f"{benchmark}.txt", digest + "\n")
-        print("[preflight] all benchmarks hashed and recorded")
+        C.update_cache(datasets=computed)  # one atomic merge; concurrent embedding records preserved
+        print("[preflight] all benchmarks hashed and recorded in cache.json")
     else:
         print("[preflight] all benchmarks hashed (dry run; no files written)")
     return 0

@@ -76,8 +76,6 @@ def test_digest_is_deterministic(tmp_path):
 
 
 def test_build_run_manifest_wires_embedding_and_probe_cap(tmp_path, monkeypatch):
-    monkeypatch.setattr(C, "DATASET_DIGEST_DIR", tmp_path / "dd")
-    (tmp_path / "dd").mkdir()
     monkeypatch.setattr(C, "_FROZEN_IDENTITY", {"final_commit": "deadbeef", "clean": True, "tree_identity": "t"})
     monkeypatch.setattr(perf, "PROBE_CAP", 50000)
     man = runstate.build_run_manifest(

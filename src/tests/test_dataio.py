@@ -85,9 +85,8 @@ def test_summarize_rows_ignores_legacy_rows_missing_grouping_keys() -> None:
 
 def _isolate_cache(tmp_path, monkeypatch, benchmark, digest="d" * 64):
     monkeypatch.setattr(cacheutils, "EMBEDDINGS_DIR", tmp_path / "emb")
-    monkeypatch.setattr(cacheutils, "DATASET_DIGEST_DIR", tmp_path / "dd")
-    (tmp_path / "dd").mkdir(exist_ok=True)
-    (tmp_path / "dd" / f"{benchmark}.txt").write_text(digest)
+    monkeypatch.setattr(cacheutils, "CACHE_JSON_PATH", tmp_path / "logs" / "cache.json")
+    cacheutils.update_cache(datasets={benchmark: digest})
     monkeypatch.setattr(cacheutils, "_FROZEN_IDENTITY", {"final_commit": None, "clean": None, "tree_identity": None})
 
 
@@ -109,12 +108,11 @@ def test_load_cached_embeddings_reads_existing_matrix(tmp_path, monkeypatch) -> 
     expected = np.arange(6, dtype=np.float16).reshape(2, 3)
     with open(art, "wb") as f:
         np.save(f, expected)
-    cacheutils._write_manifest(cacheutils.embedding_manifest_path("cropharvest", "presto", "baseline"), {
-        "schema": 1, "benchmark": "cropharvest", "model": "presto", "artifact": "baseline",
+    cacheutils.update_cache(embeddings={cacheutils._embedding_key("cropharvest", "presto", "baseline"): {
         "checkpoint_sha256": cacheutils.checkpoint_sha256("presto"), "dataset_digest": "d" * 64,
         "sample_ids_digest": cacheutils.sample_ids_digest(bench.sample_ids),
         "shape": [2, 3], "dtype": "float16", "artifact_sha256": artifacts.sha256_file(art),
-    })
+    }})
 
     actual = cacheutils.load_cached_embeddings(bench, "cropharvest", "presto", "baseline")
 

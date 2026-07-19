@@ -3,11 +3,11 @@
 This temporary migration utility never regenerates embeddings and never copies their data. Edit the
 CONFIG block and run it without command-line arguments. Report mode performs every validation but
 does not write. Apply mode validates every candidate before moving any candidate, then atomically
-renames each accepted cell on its filesystem and writes its manifest last.
+renames each accepted cell on its filesystem and records it in cache.json last.
 
-Each cell is independently resumable. If execution stops after a rename but before its manifest is
-written, rerunning validates the canonical artifact and finishes the manifest. A later cell failing
-does not roll back cells already completed successfully.
+Each cell is independently resumable. If execution stops after a rename but before its cache.json
+record is written, rerunning validates the canonical artifact and finishes the record. A later cell
+failing does not roll back cells already completed successfully.
 """
 
 from __future__ import annotations
@@ -159,7 +159,6 @@ def _prepare_tabular(cand, enc_kwargs) -> _Plan:
     report = {"candidate": f"{benchmark}/{model}/{artifact}", "legacy": str(legacy)}
     bench, bench_key = _load_bench(benchmark, cand.get("s2_only", False))
     destination = C.embedding_cache_path(bench_key, model, artifact)
-    manifest_path = C.embedding_manifest_path(bench_key, model, artifact)
 
     state, canonical_problems = _canonical_tabular_problem(
         bench, bench_key, model, artifact, weights
@@ -167,12 +166,10 @@ def _prepare_tabular(cand, enc_kwargs) -> _Plan:
     if state == "mismatch":
         return _refused(report, "invalid canonical cache: " + "; ".join(canonical_problems))
     already_adopted = state == "ok"
-    if state == "absent" and manifest_path.exists():
-        return _refused(report, f"unreadable canonical manifest: {manifest_path}")
 
     recovering = not already_adopted and destination.exists() and not legacy.exists()
     if not already_adopted and destination.exists() and legacy.exists() and destination != legacy:
-        return _refused(report, f"canonical destination already exists without a manifest: {destination}")
+        return _refused(report, f"canonical destination already exists without a cache.json record: {destination}")
     source = destination if already_adopted or recovering or destination == legacy else legacy
     if not source.is_file():
         return _refused(report, "legacy artifact missing")
@@ -217,36 +214,22 @@ def _prepare_tabular(cand, enc_kwargs) -> _Plan:
         )
     source_digest = artifacts.sha256_file(source)
     if already_adopted:
-        canonical_manifest = C._read_manifest(manifest_path)
-        if canonical_manifest.get("artifact_sha256") != source_digest:
-            return _refused(report, "canonical array content does not match its manifest", spot)
+        record = C._cache_record(bench_key, model, artifact)
+        if record.get("artifact_sha256") != source_digest:
+            return _refused(report, "canonical array content does not match its cache.json record", spot)
         return _Plan({**report, "status": "already-adopted", "spot_check": spot})
     if not recovering:
         cross_device = _cross_device_problem(source, destination)
         if cross_device:
             return _refused(report, cross_device, spot)
 
-    manifest = {
-        "schema": 1,
-        "benchmark": bench_key,
-        "model": model,
-        "artifact": artifact,
+    record = {
         "checkpoint_sha256": C.checkpoint_sha256(model, weights),
         "dataset_digest": C.dataset_digest(bench_key),
         "sample_ids_digest": C.sample_ids_digest(bench.sample_ids),
         "shape": [int(value) for value in arr.shape],
         "dtype": str(arr.dtype),
         "artifact_sha256": source_digest,
-        "adoption": {
-            "source_leaf": str(legacy),
-            "method": "validated-rename",
-            "spot_check": {
-                "k": len(idx),
-                "indices": idx,
-                "max_abs_err": max_err,
-                "tol": tolerance,
-            },
-        },
     }
 
     def apply() -> dict:
@@ -257,9 +240,10 @@ def _prepare_tabular(cand, enc_kwargs) -> _Plan:
             )
             if current_state == "ok":
                 return {**report, "status": "already-adopted", "spot_check": spot}
-            if current_state == "mismatch" or manifest_path.exists():
-                details = "; ".join(current_problems) or f"unreadable manifest {manifest_path}"
-                raise RuntimeError(f"canonical cache changed after validation: {details}")
+            if current_state == "mismatch":
+                raise RuntimeError(
+                    f"canonical cache changed after validation: {'; '.join(current_problems)}"
+                )
             if recovering:
                 if not destination.is_file():
                     raise RuntimeError(f"canonical recovery artifact disappeared: {destination}")
@@ -272,7 +256,7 @@ def _prepare_tabular(cand, enc_kwargs) -> _Plan:
                 if cross_device:
                     raise RuntimeError(cross_device)
                 os.replace(source, destination)
-            C._write_manifest(manifest_path, manifest)
+            C.update_cache(embeddings={C._embedding_key(bench_key, model, artifact): record})
         if legacy != destination:
             _remove_empty_fingerprint_parent(legacy)
         return {**report, "status": "adopted", "spot_check": spot}
@@ -289,7 +273,6 @@ def _prepare_dense(cand, enc_kwargs) -> _Plan:
     report = {"candidate": f"{benchmark}/{model}/{artifact}", "legacy": str(legacy)}
     bench, bench_key = _load_bench(benchmark, s2_only)
     destination = C.dense_embedding_cache_dir(bench_key, model, artifact)
-    manifest_path = C.dense_manifest_path(bench_key, model, artifact)
 
     state, _root, canonical_problems = C._dense_state(
         bench, bench_key, model, artifact, weights
@@ -297,12 +280,10 @@ def _prepare_dense(cand, enc_kwargs) -> _Plan:
     if state == "mismatch":
         return _refused(report, "invalid canonical cache: " + "; ".join(canonical_problems))
     already_adopted = state == "ok"
-    if state == "absent" and manifest_path.exists():
-        return _refused(report, f"unreadable canonical manifest: {manifest_path}")
 
     recovering = not already_adopted and destination.exists() and not legacy.exists()
     if not already_adopted and destination.exists() and legacy.exists() and destination != legacy:
-        return _refused(report, f"canonical destination already exists without a manifest: {destination}")
+        return _refused(report, f"canonical destination already exists without a cache.json record: {destination}")
     source = destination if already_adopted or recovering or destination == legacy else legacy
     if not source.is_dir():
         return _refused(report, "legacy dense cache directory missing")
@@ -405,26 +386,20 @@ def _prepare_dense(cand, enc_kwargs) -> _Plan:
         if cross_device:
             return _refused(report, cross_device, spot)
 
-    manifest = {
-        **C._build_dense_manifest(bench, bench_key, model, artifact, source, weights),
-        "adoption": {
-            "source_leaf": str(legacy),
-            "method": "validated-rename",
-            "spot_check": {**spot, "picks": sorted(picks)},
-        },
-    }
+    record = C._dense_record(bench, bench_key, model, source, weights)
 
     def apply() -> dict:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with C._cache_lock(manifest_path):
+        with C._cache_lock(destination):
             current_state, _current_root, current_problems = C._dense_state(
                 bench, bench_key, model, artifact, weights
             )
             if current_state == "ok":
                 return {**report, "status": "already-adopted", "spot_check": spot}
-            if current_state == "mismatch" or manifest_path.exists():
-                details = "; ".join(current_problems) or f"unreadable manifest {manifest_path}"
-                raise RuntimeError(f"canonical cache changed after validation: {details}")
+            if current_state == "mismatch":
+                raise RuntimeError(
+                    f"canonical cache changed after validation: {'; '.join(current_problems)}"
+                )
             if recovering:
                 if not destination.is_dir():
                     raise RuntimeError(f"canonical recovery directory disappeared: {destination}")
@@ -442,7 +417,7 @@ def _prepare_dense(cand, enc_kwargs) -> _Plan:
             )
             if final_problems:
                 raise RuntimeError("canonical completeness failed: " + "; ".join(final_problems))
-            C._write_manifest(manifest_path, manifest)
+            C.update_cache(embeddings={C._embedding_key(bench_key, model, artifact): record})
         if legacy != destination:
             _remove_empty_fingerprint_parent(legacy)
         return {**report, "status": "adopted", "spot_check": spot}

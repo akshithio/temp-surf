@@ -198,9 +198,10 @@ _INPUT_BASE = INPUT_ROOT.parent
 
 
 # ============================================================================
-# Frozen final-run embedding cache: fixed readable paths + identity manifests.
-# The cryptic ``n..._b..._e..._w...`` fingerprint directory is gone; identity now lives in a
-# readable ``<artifact>.manifest.json`` beside the artifact and is validated on every load.
+# Frozen final-run embedding cache: fixed readable paths + one shared identity file.
+# The cryptic ``n..._b..._e..._w...`` fingerprint directory is gone; all cache identity (dataset
+# digests + per-cell embedding records) lives in one readable ``data/logs/cache.json`` and is
+# validated on every load.
 # ============================================================================
 
 # --- full checkpoint content digest (untruncated identity) -------------------
@@ -283,28 +284,71 @@ def tile_set_digest(feature_rels: list[str], label_rels: list[str]) -> str:
     return h.hexdigest()
 
 
-# --- portable dataset content digest (written once by the preflight utility) -
+# --- one shared cache-metadata file: data/logs/cache.json --------------------
+# Replaces the per-cell ``*.manifest.json`` sidecars and the per-benchmark dataset-digest text
+# files with ONE readable document::
+#     {"datasets": {benchmark: digest},
+#      "embeddings": {"<benchmark>/<model>/<artifact>": {identity + shape/dtype validation}}}
+# Writers merge under a single lock via an atomic read-modify-write replacement, so concurrent
+# model writers never drop each other's records; readers take an atomic snapshot and never re-hash
+# large artifacts. A missing file is an empty doc; a corrupt file is a hard error (never a silent
+# reset of shared metadata).
 
-DATASET_DIGEST_DIR = CACHE_DIR / "dataset_digests"
+CACHE_JSON_PATH = SCRATCH / "logs" / "cache.json"
+
+
+def _read_cache_doc() -> dict[str, Any]:
+    try:
+        doc = json.loads(CACHE_JSON_PATH.read_text())
+    except FileNotFoundError:
+        doc = {}
+    doc.setdefault("datasets", {})
+    doc.setdefault("embeddings", {})
+    return doc
+
+
+def _atomic_write_json(path: Path, obj: dict[str, Any]) -> None:
+    tmp = _atomic_tmp(path)
+    try:
+        with open(tmp, "w") as f:
+            json.dump(obj, f, sort_keys=True, indent=2)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _embedding_key(benchmark: str, model_name: str, artifact: str) -> str:
+    return f"{benchmark}/{model_name}/{artifact}"
+
+
+def _cache_record(benchmark: str, model_name: str, artifact: str) -> dict[str, Any] | None:
+    return _read_cache_doc()["embeddings"].get(_embedding_key(benchmark, model_name, artifact))
+
+
+def update_cache(*, datasets: dict[str, str] | None = None,
+                 embeddings: dict[str, dict[str, Any]] | None = None) -> None:
+    """Merge dataset digests and/or embedding records into cache.json under ONE lock via an atomic
+    read-modify-write replacement, so concurrent writers merge instead of clobbering."""
+    CACHE_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _cache_lock(CACHE_JSON_PATH):
+        doc = _read_cache_doc()
+        if datasets:
+            doc["datasets"].update(datasets)
+        if embeddings:
+            doc["embeddings"].update(embeddings)
+        _atomic_write_json(CACHE_JSON_PATH, doc)
 
 
 def dataset_digest(benchmark: str) -> str:
-    """The frozen portable content digest for a benchmark's inputs.
-
-    Produced ONCE by ``tools/preflight_dataset_digests`` (a CPU job on Gilbreth) and read here.
-    Absent -> a hard error: the frozen run requires the preflight to have established and
-    cross-checked dataset identity first; there is no weaker fallback.
-    """
-    path = DATASET_DIGEST_DIR / f"{benchmark}.txt"
-    try:
-        digest = path.read_text().strip()
-    except OSError as exc:
-        raise MissingEmbeddingCache(
-            f"No frozen dataset digest for {benchmark!r} at {path}. Run "
-            "tools/preflight_dataset_digests to hash and cross-check the inputs first."
-        ) from exc
+    """The frozen portable content digest for a benchmark's inputs, recorded in cache.json by
+    ``tools/preflight_dataset_digests``. Absent -> a hard error: the frozen run requires the
+    preflight to have established and cross-checked dataset identity first (no weaker fallback)."""
+    digest = _read_cache_doc()["datasets"].get(benchmark)
     if not digest:
-        raise MissingEmbeddingCache(f"Empty dataset digest file for {benchmark!r} at {path}.")
+        raise MissingEmbeddingCache(
+            f"No frozen dataset digest for {benchmark!r} in {CACHE_JSON_PATH}. Run "
+            "tools/preflight_dataset_digests to hash and cross-check the inputs first."
+        )
     return digest
 
 
@@ -348,36 +392,11 @@ def embedding_cache_path(benchmark: str, model_name: str, artifact: str = "basel
     return _cell_dir(benchmark, model_name) / f"{artifact}.npy"
 
 
-def embedding_manifest_path(benchmark: str, model_name: str, artifact: str = "baseline") -> Path:
-    return _cell_dir(benchmark, model_name) / f"{artifact}.manifest.json"
-
-
 def dense_embedding_cache_dir(benchmark: str, model_name: str, artifact: str = "baseline") -> Path:
     return _cell_dir(benchmark, model_name) / artifact
 
 
-def dense_manifest_path(benchmark: str, model_name: str, artifact: str = "baseline") -> Path:
-    return _cell_dir(benchmark, model_name) / f"{artifact}.manifest.json"
-
-
-# --- manifest + npy IO helpers ----------------------------------------------
-
-
-def _read_manifest(path: Path) -> dict[str, Any] | None:
-    try:
-        return json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
-def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
-    tmp = _atomic_tmp(path)
-    try:
-        with open(tmp, "w") as f:
-            json.dump(manifest, f, sort_keys=True, indent=2)
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
+# --- npy IO helper ----------------------------------------------------------
 
 
 def _npy_shape_dtype(path: Path) -> tuple[tuple[int, ...], str]:
@@ -389,11 +408,10 @@ def _npy_shape_dtype(path: Path) -> tuple[tuple[int, ...], str]:
 def embedding_digest(benchmark: str, model_name: str, artifact: str = "baseline", *, dense: bool = False) -> str | None:
     """The embedding's recorded CONTENT digest -- artifact SHA (tabular) or tile-set digest (dense).
     This is what the run manifest references to bind results to a specific embedding."""
-    man_path = dense_manifest_path(benchmark, model_name, artifact) if dense else embedding_manifest_path(benchmark, model_name, artifact)
-    manifest = _read_manifest(man_path)
-    if not manifest:
+    record = _cache_record(benchmark, model_name, artifact)
+    if not record:
         return None
-    return manifest.get("tile_set_digest") if dense else manifest.get("artifact_sha256")
+    return record.get("tile_set_digest") if dense else record.get("artifact_sha256")
 
 
 # --- expected dense tile set (shared by build + load) ------------------------
@@ -449,34 +467,32 @@ def _dense_tile_set_problems(root: Path, feat_rels: list[str], lab_rels: list[st
 def _tabular_state(bench, benchmark, model_name, artifact, weights_override):
     """('absent'|'ok'|'mismatch', array_or_None, problems).
 
-    absent   -- no manifest -> the cache was never completed (regenerate).
-    ok       -- the sidecar certifies this array for THIS run (returns the loaded array).
-    mismatch -- a sidecar exists but disagrees (refuse; the operator must delete the leaf).
+    absent   -- no cache.json record -> the cache was never completed (regenerate).
+    ok       -- the record certifies this array for THIS run (returns the loaded array).
+    mismatch -- a record exists but disagrees (refuse; the operator must delete the leaf).
     """
     art_path = embedding_cache_path(benchmark, model_name, artifact)
-    man_path = embedding_manifest_path(benchmark, model_name, artifact)
-    manifest = _read_manifest(man_path)
-    if manifest is None:
+    record = _cache_record(benchmark, model_name, artifact)
+    if record is None:
         return "absent", None, []
     problems: list[str] = []
     expected = {
-        "benchmark": benchmark, "model": model_name, "artifact": artifact,
         "checkpoint_sha256": checkpoint_sha256(model_name, weights_override),
         "dataset_digest": dataset_digest(benchmark),
         "sample_ids_digest": sample_ids_digest(bench.sample_ids),
     }
     for key, want in expected.items():
-        if manifest.get(key) != want:
-            problems.append(f"{key}: {manifest.get(key)!r} != {want!r}")
+        if record.get(key) != want:
+            problems.append(f"{key}: {record.get(key)!r} != {want!r}")
     if not art_path.exists():
         problems.append(f"array missing: {art_path}")
     else:
         try:
             shape, dtype = _npy_shape_dtype(art_path)
-            if list(shape) != manifest.get("shape"):
-                problems.append(f"shape {list(shape)} != manifest {manifest.get('shape')}")
-            if dtype != manifest.get("dtype"):
-                problems.append(f"dtype {dtype} != manifest {manifest.get('dtype')}")
+            if list(shape) != record.get("shape"):
+                problems.append(f"shape {list(shape)} != recorded {record.get('shape')}")
+            if dtype != record.get("dtype"):
+                problems.append(f"dtype {dtype} != recorded {record.get('dtype')}")
         except Exception as exc:  # noqa: BLE001 -- a malformed header is itself a validity failure
             problems.append(f"unreadable .npy header: {exc}")
     if problems:
@@ -485,18 +501,17 @@ def _tabular_state(bench, benchmark, model_name, artifact, weights_override):
 
 
 def load_cached_embeddings(bench: Any, benchmark: str, model_name: str, artifact: str = "baseline", weights_override=None) -> np.ndarray:
-    """Load a frozen embedding matrix, validating its sidecar manifest.
+    """Load a frozen embedding matrix, validating its cache.json record.
 
-    Raises MissingEmbeddingCache if the sidecar is absent (never built) or disagrees with THIS run
-    (benchmark/model/artifact/checkpoint/dataset/sample-order/shape/dtype). The array bytes are not
-    re-hashed on load.
+    Raises MissingEmbeddingCache if the record is absent (never built) or disagrees with THIS run
+    (checkpoint/dataset/sample-order/shape/dtype). The array bytes are not re-hashed on load.
     """
     state, arr, problems = _tabular_state(bench, benchmark, model_name, artifact, weights_override)
     if state == "ok":
         return arr
     if state == "absent":
         raise MissingEmbeddingCache(
-            f"Embedding cache not built for {model_name}/{benchmark}/{artifact} (no manifest). "
+            f"Embedding cache not built for {model_name}/{benchmark}/{artifact} (no cache.json record). "
             "Run RUN_STAGES including 'gen_embeddings'."
         )
     raise MissingEmbeddingCache(
@@ -512,22 +527,20 @@ def _dense_state(bench, benchmark, model_name, artifact, weights_override):
     (checkpoint, dataset, tile-set digest, counts, feature dim, dtype). Tiles are NOT re-hashed.
     """
     root = dense_embedding_cache_dir(benchmark, model_name, artifact)
-    man_path = dense_manifest_path(benchmark, model_name, artifact)
-    manifest = _read_manifest(man_path)
-    if manifest is None:
+    record = _cache_record(benchmark, model_name, artifact)
+    if record is None:
         return "absent", root, []
     feat_rels, lab_rels = _dense_expected_rels(bench)
     problems: list[str] = []
     expected = {
-        "benchmark": benchmark, "model": model_name, "artifact": artifact,
         "checkpoint_sha256": checkpoint_sha256(model_name, weights_override),
         "dataset_digest": dataset_digest(benchmark),
         "tile_set_digest": tile_set_digest(feat_rels, lab_rels),
         "feature_tile_count": len(feat_rels), "label_tile_count": len(lab_rels),
     }
     for key, want in expected.items():
-        if manifest.get(key) != want:
-            problems.append(f"{key}: {manifest.get(key)!r} != {want!r}")
+        if record.get(key) != want:
+            problems.append(f"{key}: {record.get(key)!r} != {want!r}")
     problems += _dense_tile_set_problems(root, feat_rels, lab_rels)
     if feat_rels and (root / feat_rels[0]).exists():  # cheap header spot-check (NOT every tile)
         try:
@@ -535,10 +548,10 @@ def _dense_state(bench, benchmark, model_name, artifact, weights_override):
         except Exception as exc:  # noqa: BLE001 -- a malformed header is itself a validity failure
             problems.append(f"unreadable dense tile header {feat_rels[0]}: {exc}")
         else:
-            if dtype != manifest.get("dtype"):
-                problems.append(f"dtype {dtype} != manifest {manifest.get('dtype')}")
-            if (int(shape[1]) if len(shape) > 1 else 0) != manifest.get("feature_dim"):
-                problems.append(f"feature_dim {shape[1] if len(shape) > 1 else 0} != manifest {manifest.get('feature_dim')}")
+            if dtype != record.get("dtype"):
+                problems.append(f"dtype {dtype} != recorded {record.get('dtype')}")
+            if (int(shape[1]) if len(shape) > 1 else 0) != record.get("feature_dim"):
+                problems.append(f"feature_dim {shape[1] if len(shape) > 1 else 0} != recorded {record.get('feature_dim')}")
     if problems:
         return "mismatch", root, problems
     return "ok", root, []
@@ -551,7 +564,7 @@ def require_dense_cache(bench: PastisBenchmark, benchmark: str, model_name: str,
         return root
     if state == "absent":
         raise MissingEmbeddingCache(
-            f"Dense cache not built for {model_name}/{benchmark}/{artifact} (no manifest). "
+            f"Dense cache not built for {model_name}/{benchmark}/{artifact} (no cache.json record). "
             "Run RUN_STAGES including 'gen_embeddings'."
         )
     raise MissingEmbeddingCache(
@@ -560,19 +573,30 @@ def require_dense_cache(bench: PastisBenchmark, benchmark: str, model_name: str,
     )
 
 
-def extract_and_cache(bench: Any, benchmark, model_name, artifact: str = "baseline", **enc_kwargs) -> np.ndarray:
-    """Encode and publish the frozen embedding matrix + its sidecar manifest.
-
-    A matching sidecar is a hit; a MISMATCHED sidecar is refused (the operator must delete the leaf
-    to rebuild -- this frozen run never auto-replaces a completed artifact). Publication under the
-    existing writer lock: the array is written atomically, then the manifest is written LAST, so an
-    absent manifest always means "incomplete".
-    """
+def _tabular_record(bench, benchmark, model_name, art_path: Path, weights_override) -> dict[str, Any]:
+    """The cache.json record for a tabular embedding cell: identity + shape/dtype validation."""
     from utils import artifacts
 
+    shape, dtype = _npy_shape_dtype(art_path)
+    return {
+        "checkpoint_sha256": checkpoint_sha256(model_name, weights_override),
+        "dataset_digest": dataset_digest(benchmark),
+        "sample_ids_digest": sample_ids_digest(bench.sample_ids),
+        "shape": [int(x) for x in shape], "dtype": dtype,
+        "artifact_sha256": artifacts.sha256_file(art_path),
+    }
+
+
+def extract_and_cache(bench: Any, benchmark, model_name, artifact: str = "baseline", **enc_kwargs) -> np.ndarray:
+    """Encode the frozen embedding matrix and record it in cache.json.
+
+    A matching record is a hit; a MISMATCHED record is refused (the operator must delete the leaf
+    to rebuild -- this frozen run never auto-replaces a completed artifact). Publication under the
+    existing writer lock: the array is written atomically, then the cache.json record is written
+    LAST, so an absent record always means "incomplete".
+    """
     weights_override = enc_kwargs.get("weights_path")
     art_path = embedding_cache_path(benchmark, model_name, artifact)
-    man_path = embedding_manifest_path(benchmark, model_name, artifact)
     art_path.parent.mkdir(parents=True, exist_ok=True)
 
     with _cache_lock(art_path):
@@ -604,13 +628,10 @@ def extract_and_cache(bench: Any, benchmark, model_name, artifact: str = "baseli
             os.replace(tmp, art_path)
         finally:
             tmp.unlink(missing_ok=True)
-        _write_manifest(man_path, {  # manifest LAST -> its presence certifies a complete artifact
-            "schema": 1, "benchmark": benchmark, "model": model_name, "artifact": artifact,
-            "checkpoint_sha256": checkpoint_sha256(model_name, weights_override),
-            "dataset_digest": dataset_digest(benchmark),
-            "sample_ids_digest": sample_ids_digest(bench.sample_ids),
-            "shape": [int(x) for x in arr.shape], "dtype": str(arr.dtype),
-            "artifact_sha256": artifacts.sha256_file(art_path),
+        # record LAST -> its presence in cache.json certifies a complete artifact
+        update_cache(embeddings={
+            _embedding_key(benchmark, model_name, artifact):
+                _tabular_record(bench, benchmark, model_name, art_path, weights_override),
         })
     return arr.astype(np.float32, copy=False)
 
@@ -648,15 +669,14 @@ def _encode_dense_into(bench: PastisBenchmark, model_name: str, root: Path, enc_
                     tmp.unlink(missing_ok=True)
 
 
-def _build_dense_manifest(bench, benchmark, model_name, artifact, root, weights_override) -> dict[str, Any]:
-    """The slim dense sidecar: identity + tile counts + tile-set digest (no per-file arrays)."""
+def _dense_record(bench, benchmark, model_name, root, weights_override) -> dict[str, Any]:
+    """The slim dense cache.json record: identity + tile counts + tile-set digest (no per-file arrays)."""
     feat_rels, lab_rels = _dense_expected_rels(bench)
     dtype, feature_dim = EMB_DTYPE, 0
     if feat_rels:
         shape, dtype = _npy_shape_dtype(root / feat_rels[0])
         feature_dim = int(shape[1]) if len(shape) > 1 else 0
     return {
-        "schema": 1, "benchmark": benchmark, "model": model_name, "artifact": artifact,
         "checkpoint_sha256": checkpoint_sha256(model_name, weights_override),
         "dataset_digest": dataset_digest(benchmark),
         "feature_tile_count": len(feat_rels), "label_tile_count": len(lab_rels),
@@ -668,12 +688,11 @@ def _build_dense_manifest(bench, benchmark, model_name, artifact, root, weights_
 def extract_dense_and_cache(
     bench: PastisBenchmark, benchmark: str, model_name: str, artifact: str = "baseline", **enc_kwargs
 ) -> Path:
-    """Encode the dense tile cache in place (resumable), verify completeness, then publish the
-    manifest LAST. A matching sidecar is a hit; a mismatched one is refused (delete the dir to
-    rebuild). The absent manifest during the build is exactly what marks it incomplete."""
+    """Encode the dense tile cache in place (resumable), verify completeness, then write the
+    cache.json record LAST. A matching record is a hit; a mismatched one is refused (delete the dir
+    to rebuild). The absent record during the build is exactly what marks it incomplete."""
     weights_override = enc_kwargs.get("weights_path")
     root = dense_embedding_cache_dir(benchmark, model_name, artifact)
-    man_path = dense_manifest_path(benchmark, model_name, artifact)
 
     state, _root, problems = _dense_state(bench, benchmark, model_name, artifact, weights_override)
     if state == "ok":
@@ -685,8 +704,7 @@ def extract_dense_and_cache(
         )
 
     _encode_dense_into(bench, model_name, root, enc_kwargs=enc_kwargs)  # per-tile locks; resumable
-    man_path.parent.mkdir(parents=True, exist_ok=True)
-    with _cache_lock(man_path):
+    with _cache_lock(root):
         feat_rels, lab_rels = _dense_expected_rels(bench)
         missing = [rel for rel in feat_rels + lab_rels if not (root / rel).exists()]
         if missing:
@@ -694,7 +712,10 @@ def extract_dense_and_cache(
                 f"Dense build incomplete for {model_name}/{benchmark}/{artifact}: {len(missing)} "
                 f"expected tile(s) missing (e.g. {missing[:3]})."
             )
-        _write_manifest(man_path, _build_dense_manifest(bench, benchmark, model_name, artifact, root, weights_override))
+        update_cache(embeddings={  # record LAST -> its presence in cache.json certifies completeness
+            _embedding_key(benchmark, model_name, artifact):
+                _dense_record(bench, benchmark, model_name, root, weights_override),
+        })
     return root
 
 
