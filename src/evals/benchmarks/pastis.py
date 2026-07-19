@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -141,6 +142,38 @@ class PastisBenchmark:
     def latlon(self) -> np.ndarray:
         tiles_per_patch = (128 // self.tile_size) ** 2
         return np.repeat([patch.latlon for patch in self.patches], tiles_per_patch, axis=0).astype(np.float32)
+
+    def patch_ids(self, folds: set[int] | None = None) -> list[int]:
+        """Cache-free patch universe: original patch IDs in ``folds`` (or all folds), sorted.
+
+        Equivalent to ``cacheutils.dense_fold_patches(emb_dir, folds)`` on a *complete* cache, but
+        derived from the benchmark descriptor instead of cached tile filenames -- so split
+        preprocessing never needs an embedding cache. Splitting stays at the original-patch level:
+        tiles and pixels are never split units.
+        """
+        want = None if folds is None else {int(f) for f in folds}
+        return sorted(
+            int(p.patch_id) for p in self.patches if want is None or int(p.fold) in want
+        )
+
+    def patch_class_sets(self, patch_ids: Iterable[int] | None = None) -> dict[int, set[int]]:
+        """Cache-free per-patch class sets from the raw ANNOTATIONS/TARGET arrays.
+
+        Mirrors ``spatial_cluster_ood._patch_class_sets`` (which reads the cached label tiles): the
+        set of non-ignore class labels present in each patch. A patch's cached label tiles store
+        exactly ``labels[labels != ignore_index]`` per tile, so the union over its tiles equals the
+        unique non-ignore labels of the whole target here -- identical to the complete-cache result.
+        """
+        want = None if patch_ids is None else {int(p) for p in patch_ids}
+        out: dict[int, set[int]] = {}
+        for patch in self.patches:
+            pid = int(patch.patch_id)
+            if want is not None and pid not in want:
+                continue
+            target = np.asarray(np.load(patch.target_path, mmap_mode="r")[0], dtype=np.int64)
+            classes = target[target != self.ignore_index]
+            out[pid] = {int(c) for c in np.unique(classes)}
+        return out
 
     def iter_tiles(self, folds: set[int] | None = None, cache_root: Path | None = None, overwrite: bool = False):
         """Yield native-cadence tiles."""

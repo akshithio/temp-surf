@@ -10,7 +10,7 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import BallTree
 
-from evals.regimes.base import DOMAIN_CENSUS, DenseSplit, Split, geography_domains
+from evals.regimes.base import DOMAIN_CENSUS, DenseSplit, Split, emit_split_audit_event, geography_domains
 from utils import cacheutils
 
 NAME = "geographic_ood"
@@ -161,6 +161,7 @@ def _source_diag_indices(y: np.ndarray, train: np.ndarray, seed: int):
             train_val, test_size=0.1111111111, random_state=seed + 102, stratify=y[train_val]
         )
     except ValueError:
+        emit_split_audit_event("stratification_fallback", where="_source_diag_indices", stage="source_diag")
         train_val, source_test = train_test_split(train, test_size=0.10, random_state=seed + 101)
         source_train, source_val = train_test_split(train_val, test_size=0.1111111111, random_state=seed + 102)
     if len(source_train) == 0 or len(np.unique(y[source_train])) < 2:
@@ -237,6 +238,18 @@ def _purge_train_near_ood(train: np.ndarray, val: np.ndarray, test: np.ndarray, 
     keep_valid = dist > (radius_km / EARTH_RADIUS_KM)
     keep = np.ones(len(train), dtype=bool)
     keep[np.flatnonzero(train_valid_mask)] = keep_valid
+    purged = np.asarray(train)[~keep]
+    if len(purged):
+        # Behavior-neutral: record exactly which training rows the (unchanged) purge removed and
+        # why, so preprocessing can attach a PROVEN exclusion reason instead of guessing.
+        emit_split_audit_event(
+            "purge",
+            where="_purge_train_near_ood",
+            reference="val_test",
+            radius_km=float(radius_km),
+            n_purged=int(len(purged)),
+            purged_train_indices=[int(i) for i in purged.tolist()],
+        )
     return np.sort(train[keep])
 
 
@@ -305,6 +318,10 @@ def make_strict_holdout_splits(
     try:
         train, val = train_test_split(train_val, test_size=0.10, random_state=seed, stratify=y[train_val])
     except ValueError:
+        emit_split_audit_event(
+            "stratification_fallback", where="make_strict_holdout_splits", stage="train_vs_val",
+            holdout=str(heldout_group),
+        )
         train, val = train_test_split(train_val, test_size=0.10, random_state=seed, stratify=None)
     return np.sort(train), np.sort(val), np.sort(test), np.sort(train_val)
 
@@ -330,6 +347,10 @@ def _iter_lodo_splits(y, groups, *, seed, holdouts, bench, purge_km):
     for row in census:
         domain = row["domain"]
         if not row["valid_target"]:
+            emit_split_audit_event(
+                "dropped_holdout", regime=NAME, holdout=str(domain), reason="ineligible_target",
+                excluded_because=list(row["excluded_because"]), n=int(row["n"]), n_classes=int(row["n_classes"]),
+            )
             print(
                 f"   !! geographic_ood: domain {domain!r} (n={row['n']}, "
                 f"{row['n_classes']} class(es)) is not an eligible target: "
@@ -348,6 +369,9 @@ def _iter_lodo_splits(y, groups, *, seed, holdouts, bench, purge_km):
             _check_split(y, train, val, test, str(domain), allow_one_class_test=allow_one_class)
             train, source_val, source_test = _source_diag_indices(y, train, seed)
         except ValueError as exc:
+            emit_split_audit_event(
+                "dropped_holdout", regime=NAME, holdout=str(domain), reason=str(exc), stage="lodo_fold",
+            )
             print(f"   !! geographic_ood: LODO fold {domain!r} dropped ({exc})", flush=True)
             continue
         yield Split(str(domain), train, np.sort(test), np.sort(val), source_val, source_test, domain=str(domain))
@@ -397,6 +421,7 @@ def iter_splits(y, groups, *, seed, holdouts, n_folds=None, val_group=None, benc
             )
             return
     except ValueError as exc:
+        emit_split_audit_event("dropped_split", regime=NAME, reason=str(exc), stage="strategy_split")
         print(f"   !! geographic_ood: split dropped ({exc})", flush=True)
         return
     for holdout in holdouts:
@@ -408,6 +433,9 @@ def iter_splits(y, groups, *, seed, holdouts, n_folds=None, val_group=None, benc
             _check_split(y, train, val, test, str(holdout))
             train, source_val, source_test = _source_diag_indices(y, train, seed)
         except ValueError as exc:
+            emit_split_audit_event(
+                "dropped_holdout", regime=NAME, holdout=str(holdout), reason=str(exc), stage="curated_holdout",
+            )
             print(f"   !! geographic_ood: holdout {holdout!r} dropped ({exc})", flush=True)
             continue
         yield Split(str(holdout), train, test, val, source_val, source_test)
@@ -433,8 +461,16 @@ def iter_fold_splits(bench_mod):
 def iter_dense_splits(bench_mod, *, emb_dir, seed, bench=None):
     for label, train_folds, val_folds, test_folds in iter_fold_splits(bench_mod):
         patch_classes = getattr(bench, "patch_classes", None) if bench is not None else None
+        # Cache-free seam: emb_dir=None sources the patch universe from the benchmark descriptor.
+        # patch_classes stays as-is (currently None) so behavior is unchanged either way.
+        if emb_dir is None:
+            if bench is None:
+                raise ValueError("cache-free dense split needs the benchmark object (bench=...)")
+            fold_patches = bench.patch_ids(set(train_folds))
+        else:
+            fold_patches = cacheutils.dense_fold_patches(emb_dir, set(train_folds))
         train_patches, source_val, source_test = _source_diag_patches(
-            cacheutils.dense_fold_patches(emb_dir, set(train_folds)),
+            fold_patches,
             seed,
             patch_classes=patch_classes,
         )

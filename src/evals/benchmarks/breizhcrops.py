@@ -135,6 +135,10 @@ def load_benchmark(
     labels: list[int] = []
     groups: list[str] = []
     latlons: list[tuple[float, float]] = []
+    # Stable per-parcel id (additive metadata only): the breizhcrops field id, qualified by region
+    # because field ids are not unique across NUTS-3 regions. Carried through the exact same order
+    # as every other column, so it never affects sample membership, ordering, labels, or embeddings.
+    sample_ids: list[str] = []
     for region in regions:
         ds = bzh.BreizhCrops(region, root=str(base), level="L1C", load_timeseries=True, verbose=False)
         latlon_map = _bz_parcel_latlon(ds)
@@ -151,6 +155,7 @@ def load_benchmark(
             labels.append(int(y))
             groups.append(region)
             latlons.append(latlon_map.get(int(fid), (np.nan, np.nan)))
+            sample_ids.append(f"{region}:{int(fid)}")
 
     if not series:
         raise ValueError(f"No BreizhCrops parcels parsed from {base}")
@@ -164,6 +169,7 @@ def load_benchmark(
     labels_arr = np.asarray([labels[i] for i in order], dtype=np.int64)
     groups_arr = np.asarray([groups[i] for i in order], dtype=object)
     latlon_arr = np.asarray([latlons[i] for i in order], dtype=np.float32)
+    sample_ids_arr = np.asarray([sample_ids[i] for i in order], dtype=object)
 
     n = len(series)
     months = [np.clip((np.arange(len(s)) / max(len(s) - 1, 1) * 11).round().astype(np.int64), 0, 11) for s in series]
@@ -183,6 +189,7 @@ def load_benchmark(
         latlon=latlon_arr,
         label_names=_bz_class_names(base),
         years=np.full(n, 2017, np.int64),
+        sample_ids=sample_ids_arr,
     )
 
 

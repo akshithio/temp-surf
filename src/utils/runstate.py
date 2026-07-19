@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from joblib import Parallel, delayed
@@ -38,16 +39,18 @@ def build_run_manifest(
     budget_regimes,
     max_dense_pixels,
     write_predictions: bool = True,
+    consumed_splits: list[str] | None = None,
 ) -> dict:
     """A readable, exact-match final-run manifest. Records every result-affecting knob plus the
-    final commit, uv.lock digest, numerical-core deps, and the embedding's recorded content digest
-    (artifact SHA for tabular, tile-set digest for dense)."""
+    final commit, uv.lock digest, numerical-core deps, the embedding's recorded content digest
+    (artifact SHA for tabular, tile-set digest for dense), and the sorted canonical relative
+    consumed-split leaf paths (regime-partitions-only) that this run bound itself to."""
     from evals import probes as _probes
 
     fi = cacheutils.frozen_run_identity()
     env = artifacts.capture_environment()
     enc = {k: v for k, v in sorted(enc_kwargs.items()) if k != "device"}
-    return {
+    manifest = {
         "schema": artifacts.SCHEMA_VERSION,
         "final_commit": fi["final_commit"],
         "clean_tree": fi["clean"],
@@ -68,6 +71,16 @@ def build_run_manifest(
         "write_predictions": bool(write_predictions),
         "enc": enc,
     }
+    # PHASE B: bind the consumed regime-level split leaf paths (canonical, relative) to resume
+    # identity. Because check_run_manifest does an exact field-by-field match, a run whose manifest
+    # LACKS this field is refused (not backfilled), and any added/removed/changed leaf path rejects
+    # resume unless overwrite is requested. No hashes -- the readable paths ARE the record.
+    if consumed_splits is not None:
+        manifest["consumed_splits"] = {
+            "scope": "regime_partitions_only",
+            "leaves": sorted({str(p) for p in consumed_splits}),
+        }
+    return manifest
 
 
 def run_manifest_digest(manifest: dict) -> str:
@@ -352,7 +365,7 @@ def _run_segmentation_pair(
     write_predictions,
     enc_kwargs,
 ) -> None:
-    from evals import compat, evals as EV  # noqa: I001
+    from evals import compat, evals as EV, split_artifacts  # noqa: I001
     from evals.regimes import base as regime_base
 
     stages = validate_run_stages(run_stages)
@@ -366,6 +379,30 @@ def _run_segmentation_pair(
     # __s2only suffix isolates the dense cache and results dir from the native run.
     suffix = "__s2only" if s2_only else ""
     artifact = cacheutils.artifact_name(s2_only)
+    results_dir = cacheutils.OUTPUT_DIR / "results" / model_name / (benchmark_name + suffix)
+
+    # Regime compatibility, then FAIL-FAST SPLIT VALIDATION -- both moved ABOVE embeddings so an
+    # unsupported regime or an invalid/missing patch split refuses the pair BEFORE any dense
+    # extraction, cache require, embedding digest, or results-directory mutation (byte-for-byte, even
+    # under OVERWRITE). Embedding-only runs (probing disabled) never require split artifacts.
+    supported = getattr(bench_mod, "SPLIT_REGIMES", ["random_id"])
+    unsupported = [r for r in split_regimes if r not in supported]
+    if unsupported:
+        raise ValueError(f"Unknown/unsupported split regimes for {benchmark_name}: {unsupported}. Supported: {supported}")
+    regimes = [r for r in supported if r in split_regimes]
+
+    fold_configs_by_seed: dict[int, list[tuple[str, Any]]] = {}
+    consumed_leaves: list[str] = []
+    if probing:
+        # patch_fold is the CURRENT benchmark patch->fold mapping, used both as the eligible patch set
+        # and for the fold-consistency check (every assigned patch must sit in its partition's declared
+        # fold set, else refuse).
+        splits_root = cacheutils.SCRATCH / "splits"
+        patch_fold = {int(p.patch_id): int(p.fold) for p in getattr(bench, "patches", [])}
+        fold_configs_by_seed, consumed_leaves = split_artifacts.load_dense_splits(
+            splits_root, bench_mod.BENCHMARK, patch_fold, regimes, seeds
+        )
+
     bench_for_emb = bench.s2_only() if s2_only else bench
     if gen_embeddings:
         cacheutils.extract_dense_and_cache(
@@ -380,28 +417,22 @@ def _run_segmentation_pair(
         if probing
         else cacheutils.dense_embedding_cache_dir(bench_mod.BENCHMARK, model_name, artifact)
     )
-    results_dir = cacheutils.OUTPUT_DIR / "results" / model_name / (benchmark_name + suffix)
     if not probing:
         n_events = perf.write_log(results_dir / "perf.jsonl")
         print(f"  embedding stage complete; perf: {n_events} events logged", flush=True)
         return
     emb_digest = cacheutils.embedding_digest(bench_mod.BENCHMARK, model_name, artifact, dense=True)
+    rows_path = results_dir / "probe_results.jsonl"
+
+    # Build/check the run manifest only AFTER split loading fixed the consumed path set (validate
+    # before mutation: nothing above this point wrote into results_dir).
     manifest = build_run_manifest(
-        model_name,
-        benchmark_name,
-        artifact,
-        emb_digest,
-        split_regimes,
-        seeds,
-        enc_kwargs,
-        active_probes=active_probes,
-        budget_regimes=budget_regimes,
-        max_dense_pixels=max_dense_pixels,
-        write_predictions=write_predictions,
+        model_name, benchmark_name, artifact, emb_digest, split_regimes, seeds, enc_kwargs,
+        active_probes=active_probes, budget_regimes=budget_regimes, max_dense_pixels=max_dense_pixels,
+        write_predictions=write_predictions, consumed_splits=consumed_leaves,
     )
     signature = run_manifest_digest(manifest)
     check_run_manifest(results_dir, manifest, overwrite_mode=overwrite_mode)
-    rows_path = results_dir / "probe_results.jsonl"
     if overwrite_mode:
         for path in (
             rows_path,
@@ -409,19 +440,20 @@ def _run_segmentation_pair(
             results_dir / "summary.csv",
             results_dir / "deltas.csv",
             results_dir / "data_quality.json",
-            results_dir / "split_manifest.json",
+            results_dir / split_artifacts.SPLIT_REF_FILE,
+            results_dir / "split_manifest.json",   # legacy per-model artifact -- retired, remove on resume
             results_dir / artifacts.RUN_MANIFEST_FILE,
             results_dir / artifacts.ENVIRONMENT_FILE,
             results_dir / artifacts.RUN_COMPLETE_FILE,
         ):
             if path.exists():
                 path.unlink()
-    # ORDER MATTERS -- see main.py: every check that can REFUSE this resume runs before anything
-    # is mutated, so a refused resume leaves an existing valid completion marker untouched.
+    # ORDER MATTERS -- see main.py: every refusal (split loading, then check_run_manifest) ran above;
+    # only now do we mutate.
     artifacts.write_environment(results_dir, overwrite_mode=overwrite_mode)
     publish_run_manifest(results_dir, manifest)
-    # See main.py: a resume is about to make this directory incomplete again.
     artifacts.invalidate_run_complete(results_dir)
+    split_artifacts.write_split_ref(results_dir, benchmark=bench_mod.BENCHMARK, consumed=consumed_leaves)
     # Attribute regime problems / skipped cells to THIS pair (both accumulators are shard-global).
     regime_problems_before = len(regime_base.REGIME_PROBLEMS)
     cell_failures_before = len(perf.CELL_FAILURES)
@@ -438,19 +470,6 @@ def _run_segmentation_pair(
         present_by_family.setdefault(_fam_key(r), set()).add(
             (r.get("budget_type"), r.get("label_budget"), r.get("evaluation_split"))
         )
-    supported = getattr(bench_mod, "SPLIT_REGIMES", ["random_id"])
-    unsupported = [r for r in split_regimes if r not in supported]
-    if unsupported:
-        raise ValueError(f"Unknown/unsupported split regimes for {benchmark_name}: {unsupported}. Supported: {supported}")
-    regimes = [r for r in supported if r in split_regimes]
-    fold_configs_by_seed = {
-        seed: list(
-            regime_base.segmentation_fold_configs(
-                bench_mod, regimes, seed=seed, emb_dir=emb_dir, strict_mode=strict_mode, bench=bench
-            )
-        )
-        for seed in seeds
-    }
     has_source_diag = {
         (seed, regime, cfg.label): bool(cfg.source_val_patches and cfg.source_test_patches)
         for seed in seeds for regime, cfg in fold_configs_by_seed[seed]
@@ -483,27 +502,9 @@ def _run_segmentation_pair(
             tmp_rows.touch()
         os.replace(tmp_rows, rows_path)
 
-    EV._write_split_manifest(
-        results_dir,
-        [
-            EV._segmentation_split_manifest_entry(
-                model_name=model_name,
-                benchmark_name=benchmark_name,
-                seed=seed,
-                split_regime=regime,
-                holdout=cfg.label,
-                train_folds=cfg.train_folds,
-                val_folds=cfg.val_folds,
-                test_folds=cfg.test_folds,
-                train_patches=cfg.train_patches,
-                val_patches=cfg.val_patches,
-                test_patches=cfg.test_patches,
-                emb_dir=emb_dir,
-            )
-            for seed in seeds
-            for regime, cfg in fold_configs_by_seed[seed]
-        ],
-    )
+    # PHASE B: the per-model split_manifest.json is retired -- canonical patch-level splits under
+    # data/splits/ plus the split_ref.json written above are the source of truth; no model-specific
+    # split definition is written here.
     # Every cell this pair is supposed to produce, from the config and the REALIZED fold configs.
     # `_expected` already encodes the per-family scope rules (source budgets x {validation,test}
     # plus source diagnostics, and the target sweep on non-random_id regimes); reuse it so the

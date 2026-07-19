@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 from sklearn.model_selection import train_test_split
 
-from evals.regimes.base import DenseSplit, Split, geography_domains
+from evals.regimes.base import DenseSplit, Split, emit_split_audit_event, geography_domains
 from utils import cacheutils
 
 NAME = "random_id"
@@ -20,6 +20,9 @@ def make_splits(y: np.ndarray, seed: int) -> tuple[np.ndarray, np.ndarray, np.nd
     try:
         train_val, test = train_test_split(idx, test_size=0.10, random_state=seed, stratify=y)
     except ValueError:
+        # Behavior-preserving: the existing silent unstratified fallback. We ONLY record that it
+        # happened (membership is unchanged); we do not fix or suppress it in this phase.
+        emit_split_audit_event("stratification_fallback", regime="random_id", stage="trainval_vs_test")
         train_val, test = train_test_split(idx, test_size=0.10, random_state=seed, stratify=None)
     try:
         train, val = train_test_split(
@@ -29,6 +32,7 @@ def make_splits(y: np.ndarray, seed: int) -> tuple[np.ndarray, np.ndarray, np.nd
             stratify=y[train_val],
         )
     except ValueError:
+        emit_split_audit_event("stratification_fallback", regime="random_id", stage="train_vs_val")
         train, val = train_test_split(
             train_val,
             test_size=0.1111111111,
@@ -52,9 +56,16 @@ def make_patch_splits(patches: np.ndarray, seed: int) -> tuple[set[int], set[int
 
 
 def iter_dense_splits(bench_mod, *, emb_dir, seed, bench=None):
-    del bench
     all_folds = sorted(set(bench_mod.TRAIN_FOLDS) | set(bench_mod.VAL_FOLDS) | set(bench_mod.TEST_FOLDS))
-    patches = np.asarray(cacheutils.dense_fold_patches(emb_dir, set(all_folds)), dtype=np.int64)
+    # Cache-free seam (split preprocessing): with emb_dir=None the patch universe comes from the
+    # benchmark descriptor instead of the embedding cache. Runtime always passes a real emb_dir, so
+    # its behavior is unchanged.
+    if emb_dir is None:
+        if bench is None:
+            raise ValueError("cache-free dense split needs the benchmark object (bench=...)")
+        patches = np.asarray(bench.patch_ids(set(all_folds)), dtype=np.int64)
+    else:
+        patches = np.asarray(cacheutils.dense_fold_patches(emb_dir, set(all_folds)), dtype=np.int64)
     train, val, test = make_patch_splits(patches, seed)
     yield DenseSplit(
         "random_patch",

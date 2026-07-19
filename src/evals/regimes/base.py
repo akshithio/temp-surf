@@ -74,6 +74,24 @@ def clear_domain_census() -> None:
     DOMAIN_CENSUS.clear()
 
 
+#: Structured, behavior-neutral audit events emitted from the split-construction path itself
+#: (silent stratification fallbacks, dropped folds/holdouts, purges). The split-preprocessing
+#: generator clears this before each (regime, seed) call and snapshots it into ``generation.json``
+#: / ``manifest.json`` / ``exclusions.csv`` so current imperfect behavior is *recorded exactly*
+#: rather than inferred from stdout or class counts. Appending an event NEVER changes split
+#: membership; the runtime does not consume this list.
+SPLIT_AUDIT_EVENTS: list[dict[str, Any]] = []
+
+
+def clear_split_audit_events() -> None:
+    SPLIT_AUDIT_EVENTS.clear()
+
+
+def emit_split_audit_event(kind: str, **fields: Any) -> None:
+    """Record a behavior-neutral split-construction audit event (see SPLIT_AUDIT_EVENTS)."""
+    SPLIT_AUDIT_EVENTS.append({"kind": str(kind), **fields})
+
+
 def load_regime(regime_name: str):
     """Import a split-regime module."""
     return importlib.import_module(f"evals.regimes.{regime_name}")
@@ -427,6 +445,24 @@ def _value_counts(values: np.ndarray) -> dict[str, int]:
     return {str(label): int(count) for label, count in zip(labels, counts, strict=True)}
 
 
+def partition_stats(domains: np.ndarray, labels: np.ndarray, idx: np.ndarray) -> dict[str, Any]:
+    """Model-agnostic composition of one partition: counts + domain/class breakdowns.
+
+    Neutral by design -- carries no model or partition-name identity -- so both the legacy
+    per-model split manifest and the canonical (model-free) split-preprocessing artifacts compute
+    partition composition from a single implementation.
+    """
+    idx = np.asarray(idx, dtype=np.int64)
+    dom = np.asarray(domains)[idx]
+    lab = np.asarray(labels)[idx]
+    return {
+        "n": int(len(idx)),
+        "domains": sorted({str(v) for v in dom.tolist()}),
+        "domain_counts": _value_counts(dom),
+        "class_counts": _value_counts(lab),
+    }
+
+
 def _split_manifest_entry(
     *,
     model_name: str,
@@ -444,12 +480,12 @@ def _split_manifest_entry(
     """Describe one tabular split with domain and class composition."""
 
     def part(prefix: str, idx: np.ndarray) -> dict[str, Any]:
-        idx = np.asarray(idx, dtype=np.int64)
+        stats = partition_stats(domains, labels, idx)
         return {
-            f"n_{prefix}": int(len(idx)),
-            f"{prefix}_domains": sorted({str(v) for v in np.asarray(domains)[idx].tolist()}),
-            f"{prefix}_domain_counts": _value_counts(np.asarray(domains)[idx]),
-            f"{prefix}_class_counts": _value_counts(np.asarray(labels)[idx]),
+            f"n_{prefix}": stats["n"],
+            f"{prefix}_domains": stats["domains"],
+            f"{prefix}_domain_counts": stats["domain_counts"],
+            f"{prefix}_class_counts": stats["class_counts"],
         }
 
     row: dict[str, Any] = {

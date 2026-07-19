@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any
 
 for _thread_var in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"]:
     os.environ.setdefault(_thread_var, "1")
@@ -17,7 +16,7 @@ for _thread_var in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"
 import numpy as np  # noqa: E402
 from joblib import Parallel, delayed  # noqa: E402
 
-from evals import compat  # noqa: E402
+from evals import compat, split_artifacts  # noqa: E402
 from evals import evals as EV  # noqa: E402
 from evals import probes as _probes  # noqa: E402
 from evals.regimes import base as regime_base  # noqa: E402
@@ -131,6 +130,24 @@ def _run_tabular_pair(
     suffix = "__s2only" if s2_only else ""
     artifact = cacheutils.artifact_name(s2_only)
     y, _native_groups = bench_mod.make_targets(bench)
+    results_dir = cacheutils.OUTPUT_DIR / "results" / model_name / (benchmark_name + suffix)
+
+    # PHASE B -- FAIL-FAST SPLIT VALIDATION. When probing is requested, consume and structurally
+    # validate every requested split from the single canonical data/splits/ location (committed
+    # config; no machine-specific root) immediately after loading the benchmark and validating regime
+    # compatibility -- BEFORE any embedding extraction, cache load, embedding digest, or
+    # results-directory mutation. An invalid/missing split therefore refuses the pair WITHOUT running
+    # the encoder or touching existing results (byte-for-byte, even under OVERWRITE_MODE=True).
+    # Partitions AND per-sample domains come entirely from the artifacts. Embedding-only runs
+    # (probing disabled) never require split artifacts.
+    split_specs: list[tuple] = []
+    consumed_leaves: list[str] = []
+    if probing:
+        splits_root = cacheutils.SCRATCH / "splits"
+        split_specs, consumed_leaves = split_artifacts.load_tabular_splits(
+            splits_root, bench_mod.BENCHMARK, bench.sample_ids, bench, bench_mod, split_regimes, seeds
+        )
+
     bench_for_emb = bench.s2_only() if s2_only else bench
     if gen_embeddings:
         emb = cacheutils.extract_and_cache(
@@ -141,7 +158,6 @@ def _run_tabular_pair(
             bench_for_emb, bench_mod.BENCHMARK, model_name, artifact, enc_kwargs.get("weights_path")
         )
 
-    results_dir = cacheutils.OUTPUT_DIR / "results" / model_name / (benchmark_name + suffix)
     data_quality = getattr(bench, "data_quality", None)
     if not probing:
         if data_quality:
@@ -150,23 +166,21 @@ def _run_tabular_pair(
         print(f"  embedding stage complete; perf: {n_events} events logged", flush=True)
         return
     emb_digest = cacheutils.embedding_digest(bench_mod.BENCHMARK, model_name, artifact)
+    rows_path = results_dir / "probe_results.jsonl"
+    preds_path = results_dir / "predictions.jsonl"
+
+    # split_specs / consumed_leaves were loaded + structurally validated ABOVE, before any embedding
+    # work AND before any mutation (validate-before-mutation still holds: a refused split here leaves
+    # existing rows, split_ref.json, environment.json, run_manifest.json, and run_complete.json
+    # untouched). Build the run manifest (and check its resume identity) only AFTER split loading has
+    # fixed the consumed path set, so that set is bound to resume identity.
     manifest = runstate.build_run_manifest(
-        model_name,
-        benchmark_name,
-        artifact,
-        emb_digest,
-        split_regimes,
-        seeds,
-        enc_kwargs,
-        active_probes=active_probes,
-        budget_regimes=budget_regimes,
-        max_dense_pixels=max_dense_pixels,
-        write_predictions=write_predictions,
+        model_name, benchmark_name, artifact, emb_digest, split_regimes, seeds, enc_kwargs,
+        active_probes=active_probes, budget_regimes=budget_regimes, max_dense_pixels=max_dense_pixels,
+        write_predictions=write_predictions, consumed_splits=consumed_leaves,
     )
     signature = runstate.run_manifest_digest(manifest)
     runstate.check_run_manifest(results_dir, manifest, overwrite_mode=overwrite_mode)
-    rows_path = results_dir / "probe_results.jsonl"
-    preds_path = results_dir / "predictions.jsonl"
 
     if overwrite_mode:
         for p in [
@@ -176,22 +190,23 @@ def _run_tabular_pair(
             results_dir / "summary.csv",
             results_dir / "deltas.csv",
             results_dir / "data_quality.json",
-            results_dir / "split_manifest.json",
+            results_dir / split_artifacts.SPLIT_REF_FILE,
+            results_dir / "split_manifest.json",   # legacy per-model artifact -- retired, remove on resume
+            results_dir / "domain_census.json",     # legacy per-model artifact -- retired, remove on resume
             results_dir / artifacts.RUN_MANIFEST_FILE,
             results_dir / artifacts.ENVIRONMENT_FILE,
             results_dir / artifacts.RUN_COMPLETE_FILE,
         ]:
             if p.exists():
                 p.unlink()
-    # ORDER MATTERS. Every check that can REFUSE this resume runs before anything is mutated:
-    # check_run_manifest above, then the environment gate here. Only once the resume is known to
-    # be allowed do we invalidate the completion marker -- otherwise a refused resume would
-    # destroy the valid marker of the finished run it just declined to touch.
+    # ORDER MATTERS. Every check that can REFUSE this resume already ran above (split loading, then
+    # check_run_manifest). Only now, once the resume is known to be allowed, do we mutate.
     artifacts.write_environment(results_dir, overwrite_mode=overwrite_mode)
     runstate.publish_run_manifest(results_dir, manifest)
-    # This pair is about to be made incomplete again, so any completion marker from a previous
-    # run must not survive it: a stale marker asserts a finished state that is being undone.
+    # This pair is about to be made incomplete again, so any completion marker from a previous run
+    # must not survive it.
     artifacts.invalidate_run_complete(results_dir)
+    split_artifacts.write_split_ref(results_dir, benchmark=bench_mod.BENCHMARK, consumed=consumed_leaves)
     if data_quality:
         IOU.write_json(results_dir / "data_quality.json", data_quality)
 
@@ -224,52 +239,11 @@ def _run_tabular_pair(
         ]
 
     rerun_keys: set = set()
-    split_specs: list[tuple] = []
-    split_manifest: list[dict[str, Any]] = []
-    # DOMAIN_CENSUS is a process-global accumulator; reset it per (model, benchmark) pair so a
-    # pair's census artifact describes only that pair's data.
-    regime_base.clear_domain_census()
-    # REGIME_PROBLEMS accumulates across every pair in the shard, so slice from here to attribute
-    # problems to THIS pair -- a pair must not be blocked by another pair's dropped regime, nor
-    # excused by having been the first.
+    # split_specs were loaded + structurally validated ABOVE, before any mutation. Nothing appends to
+    # REGIME_PROBLEMS here -- split validity is a generation-time concern -- but `regime_problems_before`
+    # is retained for the completeness marker.
     regime_problems_before = len(regime_base.REGIME_PROBLEMS)
     cell_failures_before = len(perf.CELL_FAILURES)
-
-    for seed in seeds:
-        for split_regime in split_regimes:
-            holdouts = regime_base.holdouts_for(bench_mod, split_regime)
-            for split_label, train, val, test, groups, has_target, domain_basis, source_val, source_test in regime_base.iter_splits(
-                split_regime,
-                bench,
-                y,
-                holdouts,
-                seed,
-                strict_mode=strict_mode,
-                val_group=regime_base.val_group_for(bench_mod, split_regime),
-            ):
-                split_specs.append(
-                    (
-                        seed, split_regime, split_label, train, val, test, groups, has_target,
-                        domain_basis, source_val, source_test,
-                    )
-                )
-                split_manifest.append(
-                    EV._split_manifest_entry(
-                        model_name=model_name,
-                        benchmark_name=benchmark_name,
-                        seed=seed,
-                        split_regime=split_regime,
-                        domain_basis=domain_basis,
-                        holdout=split_label,
-                        train=train,
-                        val=val,
-                        test=test,
-                        domains=groups,
-                        labels=y,
-                    )
-                )
-    EV._write_split_manifest(results_dir, split_manifest)
-    EV._write_domain_census(results_dir, benchmark_name)
 
     # The complete set of cells this pair is supposed to produce, built from the config and the
     # REALIZED splits -- independently of whatever happens to be on disk. Compared against the

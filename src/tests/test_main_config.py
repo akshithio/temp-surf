@@ -97,13 +97,16 @@ def test_s2_only_uses_original_coordinates_for_split_regimes(monkeypatch, tmp_pa
         seen["embedding_modalities"] = loaded.available_modalities()
         return np.zeros((n, 2), dtype=np.float32)
 
-    def iter_splits(_regime, loaded, *_args, **_kwargs):
+    # PHASE B: main consumes splits via split_artifacts.load_tabular_splits, which receives the
+    # ORIGINAL (non-s2only) bench -- capture there to assert the split path sees original coordinates
+    # while the embedding path sees the s2only-zeroed ones.
+    def load_tabular_splits(_root, _benchmark, _sample_ids, loaded, _bench_mod, _regimes, _seeds):
         seen["regime_latlon"] = np.asarray(loaded.latlon).copy()
         seen["regime_modalities"] = loaded.available_modalities()
-        yield from ()
+        return [], []
 
     monkeypatch.setattr(main.cacheutils, "load_cached_embeddings", load_embeddings)
-    monkeypatch.setattr(main.regime_base, "iter_splits", iter_splits)
+    monkeypatch.setattr(main.split_artifacts, "load_tabular_splits", load_tabular_splits)
 
     # The stub yields no splits, so this pair evaluates nothing and cannot be certified
     # complete -- which is the correct verdict, not an artifact of the test. The coordinate

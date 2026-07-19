@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from evals.regimes.base import DenseSplit, Split, geography_domains
+from evals.regimes.base import DenseSplit, Split, emit_split_audit_event, geography_domains
 from evals.regimes.geographic_ood import make_strict_holdout_splits
 
 NAME = "official"
@@ -20,6 +20,9 @@ def iter_splits(y, groups, *, seed, holdouts, n_folds=None, val_group=None, **_)
         for holdout in holdouts:
             spec = exact.get(str(holdout))
             if not spec:
+                emit_split_audit_event(
+                    "dropped_holdout", regime="official", holdout=str(holdout), reason="not_found_in_metadata"
+                )
                 print(f"   !! official: split {holdout!r} not found in benchmark metadata", flush=True)
                 continue
             train = np.asarray(spec.get("train", []), dtype=np.int64)
@@ -31,6 +34,9 @@ def iter_splits(y, groups, *, seed, holdouts, n_folds=None, val_group=None, **_)
                 if len(np.unique(y[train])) < 2 or len(np.unique(y[test])) < 2:
                     raise ValueError("train or test split is one-class")
             except ValueError as exc:
+                emit_split_audit_event(
+                    "dropped_holdout", regime="official", holdout=str(holdout), reason=str(exc)
+                )
                 print(f"   !! official: split {holdout!r} dropped ({exc})", flush=True)
                 continue
             yield Split(str(holdout), np.sort(train), np.sort(test), np.sort(val), has_target=False)
@@ -41,6 +47,9 @@ def iter_splits(y, groups, *, seed, holdouts, n_folds=None, val_group=None, **_)
                 y, groups, holdout, seed, val_group=val_group
             )
         except ValueError as exc:
+            emit_split_audit_event(
+                "dropped_holdout", regime="official", holdout=str(holdout), reason=str(exc)
+            )
             print(f"   !! official: holdout {holdout!r} dropped ({exc})", flush=True)
             continue
         yield Split(str(holdout), train, test, val)

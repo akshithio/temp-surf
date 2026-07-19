@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 from sklearn.cluster import KMeans
 
-from evals.regimes.base import DenseSplit, Split
+from evals.regimes.base import DenseSplit, Split, emit_split_audit_event
 from evals.regimes.geographic_ood import (
     _check_split,
     _idx_for,
@@ -175,6 +175,7 @@ def iter_splits(y, groups, *, seed, holdouts=None, n_folds=None, val_group=None,
         _check_split(y, train, val, test, label)
         train, source_val, source_test = _source_diag_indices(y, train, seed)
     except ValueError as exc:
+        emit_split_audit_event("dropped_split", regime=NAME, reason=str(exc), stage="tabular")
         print(f"   !! spatial_cluster_ood: split dropped ({exc})", flush=True)
         return
     yield Split(label, np.sort(train), np.sort(test), np.sort(val), source_val, source_test)
@@ -191,7 +192,11 @@ def _patch_class_sets(emb_dir, folds: set[int], patch_ids: np.ndarray) -> dict[i
 def iter_dense_splits(bench_mod, *, emb_dir, seed, bench=None):
     try:
         all_folds = sorted(set(bench_mod.TRAIN_FOLDS) | set(bench_mod.VAL_FOLDS) | set(bench_mod.TEST_FOLDS))
-        available = set(cacheutils.dense_fold_patches(emb_dir, set(all_folds)))
+        # Cache-free seam: emb_dir=None sources the patch universe from the benchmark descriptor.
+        if emb_dir is None:
+            available = set(bench.patch_ids(set(all_folds))) if bench is not None else set()
+        else:
+            available = set(cacheutils.dense_fold_patches(emb_dir, set(all_folds)))
         if bench is None or not hasattr(bench, "patch_latlon"):
             raise ValueError("PASTIS spatial_cluster_ood needs patch coordinates")
         patch_latlon = {
@@ -212,7 +217,12 @@ def iter_dense_splits(bench_mod, *, emb_dir, seed, bench=None):
         if len(sizes) < 3:
             raise ValueError("PASTIS spatial_cluster_ood needs at least three clusters")
 
-        patch_classes = _patch_class_sets(emb_dir, set(all_folds), patch_ids)
+        # Cache-free seam: emb_dir=None computes per-patch class sets from raw TARGET arrays; this
+        # equals the cached-label result on a complete cache (parity-tested).
+        if emb_dir is None:
+            patch_classes = bench.patch_class_sets(patch_ids)
+        else:
+            patch_classes = _patch_class_sets(emb_dir, set(all_folds), patch_ids)
         domain_classes = {
             d: set().union(*(patch_classes[int(pid)] for pid in patch_ids[groups.astype(str) == d]))
             for d in sizes
@@ -243,6 +253,7 @@ def iter_dense_splits(bench_mod, *, emb_dir, seed, bench=None):
             if not pids or len(set().union(*(patch_classes[p] for p in pids))) < 2:
                 raise ValueError(f"PASTIS spatial_cluster_ood has invalid {name} patch partition")
     except ValueError as exc:
+        emit_split_audit_event("dropped_split", regime=NAME, reason=str(exc), stage="dense")
         print(f"   !! spatial_cluster_ood: dense split dropped ({exc})", flush=True)
         return
     yield DenseSplit(

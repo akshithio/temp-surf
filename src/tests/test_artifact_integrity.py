@@ -419,7 +419,7 @@ def _seed_finished_dir(results_dir, env: dict) -> bytes:
     results_dir.mkdir(parents=True, exist_ok=True)
     rows = [_row()]
     IOU.append_jsonl(results_dir / "probe_results.jsonl", rows)
-    for name in ("probe_results.csv", "summary.csv", "deltas.csv", "split_manifest.json"):
+    for name in ("probe_results.csv", "summary.csv", "deltas.csv", "split_ref.json"):
         (results_dir / name).write_text('{"a": 1}\n')
     IOU.write_json(results_dir / "environment.json", env)
     IOU.write_json(results_dir / "run_manifest.json", _STUB_MANIFEST)
@@ -474,7 +474,10 @@ def _run_tabular(monkeypatch, tmp_path, *, overwrite=False):
     monkeypatch.setattr(main.compat, "input_modalities", lambda _m: set())
     monkeypatch.setattr(main.cacheutils, "load_cached_embeddings",
                         lambda *a, **k: np.zeros((6, 2), dtype=np.float32))
-    monkeypatch.setattr(main.regime_base, "iter_splits", lambda *a, **k: iter(()))
+    # PHASE B: main consumes splits from data/splits/ instead of constructing them; stub the
+    # consumption to yield no splits (the old iter_splits stub's intent) so this exercises the
+    # environment/overwrite/marker contract on an empty run.
+    monkeypatch.setattr(main.split_artifacts, "load_tabular_splits", lambda *a, **k: ([], []))
     main._run_tabular_pair(
         "fake", "raw", [0], 0, ["random_id"], ["probing"], ["logistic"],
         {"source": [1.0], "target": [0]}, False, overwrite, False, {},  # s2_only=False
@@ -531,9 +534,137 @@ def test_tabular_overwrite_removes_rows_before_recording_the_environment(monkeyp
     assert env["numerical_core"]["scikit-learn"] == "1.9.0"
 
 
-def _dense_stubs(monkeypatch, tmp_path):
+def test_tabular_split_refusal_preserves_finished_dir_even_under_overwrite(monkeypatch, tmp_path) -> None:
+    """PHASE B req 1: splits are validated BEFORE any mutation, so a split refusal leaves the finished
+    dir (rows / split_ref / environment / run_manifest / run_complete) byte-for-byte unchanged even
+    with overwrite_mode=True."""
+    import main
+    from evals import split_artifacts as SA
+
+    results_dir = tmp_path / "results" / "raw" / "fake"
+    _seed_finished_dir(results_dir, _env(sklearn="1.9.0"))
+    snap = {n: (results_dir / n).read_bytes() for n in
+            ("probe_results.jsonl", "split_ref.json", "environment.json", "run_manifest.json", "run_complete.json")}
+
+    class FakeBenchMod:
+        BENCHMARK = "fake"
+        LABEL_KIND = "binary"
+        SPLIT_REGIMES = ["random_id"]
+
+        @staticmethod
+        def make_targets(loaded):
+            return loaded.labels, loaded.groups
+
+    monkeypatch.setattr(main.EV, "load_benchmark", lambda _n: FakeBenchMod)
+    monkeypatch.setattr(main.cacheutils, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(main.cacheutils, "cached_bench", lambda *a, **k: _tabular_bench())
+    monkeypatch.setattr(main.compat, "input_modalities", lambda _m: set())
+    monkeypatch.setattr(main.cacheutils, "load_cached_embeddings", lambda *a, **k: np.zeros((6, 2), dtype=np.float32))
+    monkeypatch.setattr(main.cacheutils, "SCRATCH", tmp_path / "empty_splits")  # no data/splits -> refuse
+
+    with pytest.raises(SA.SplitArtifactError, match="no canonical splits"):
+        main._run_tabular_pair(
+            "fake", "raw", [0], 0, ["random_id"], ["probing"], ["logistic"],
+            {"source": [1.0], "target": [0]}, False, True, False, {},  # overwrite_mode=True
+        )
+    for n, b in snap.items():
+        assert (results_dir / n).read_bytes() == b, f"{n} was mutated by a REFUSED split load under OVERWRITE"
+
+
+def test_dense_split_refusal_preserves_finished_dir_even_under_overwrite(monkeypatch, tmp_path) -> None:
+    """PHASE B req 1, dense path."""
+    from evals import split_artifacts as SA
     from utils import runstate as RS
 
+    results_dir = tmp_path / "results" / "raw" / "pastis"
+    _seed_finished_dir(results_dir, _env(sklearn="1.9.0"))
+    snap = {n: (results_dir / n).read_bytes() for n in
+            ("probe_results.jsonl", "split_ref.json", "environment.json", "run_manifest.json", "run_complete.json")}
+
+    monkeypatch.setattr(RS.cacheutils, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(RS.cacheutils, "cached_bench", lambda *a, **k: SimpleNamespace(
+        name="pastis", data_quality=None, patch_classes=None, n_samples=4, patches=[]))
+    monkeypatch.setattr(RS.cacheutils, "require_dense_cache", lambda *a, **k: tmp_path / "emb")
+    monkeypatch.setattr(RS.cacheutils, "SCRATCH", tmp_path / "empty_splits")  # no data/splits -> refuse
+
+    with pytest.raises(SA.SplitArtifactError, match="no canonical splits"):
+        RS._run_segmentation_pair(
+            "pastis", "raw", [0], 10, ["random_id"], ["probing"], ["logistic"],
+            {"source": [1.0], "target": [0]}, False, True, True, False, {},  # overwrite_mode=True
+        )
+    for n, b in snap.items():
+        assert (results_dir / n).read_bytes() == b, f"{n} was mutated by a REFUSED dense split load under OVERWRITE"
+
+
+# --- PHASE B req 1: split validation is FAIL-FAST (before the encoder ever runs) ----------
+#
+# With RUN_STAGES = ["gen_embeddings", "probing"], the encoder is scheduled to run. But splits are
+# loaded + validated immediately after the benchmark, BEFORE extract_and_cache /
+# extract_dense_and_cache, cache require, digest, or any results-dir mutation. So a missing/invalid
+# split refuses the pair WITHOUT ever invoking the (multi-GPU-hour) encoder or touching the tree.
+
+
+def test_tabular_missing_splits_refuse_before_the_encoder_runs(monkeypatch, tmp_path) -> None:
+    import main
+    from evals import split_artifacts as SA
+
+    class FakeBenchMod:
+        BENCHMARK = "fake"
+        LABEL_KIND = "binary"
+        SPLIT_REGIMES = ["random_id"]
+
+        @staticmethod
+        def make_targets(loaded):
+            return loaded.labels, loaded.groups
+
+    def _never(*_a, **_k):
+        raise AssertionError("the encoder ran despite missing splits")
+
+    monkeypatch.setattr(main.EV, "load_benchmark", lambda _n: FakeBenchMod)
+    monkeypatch.setattr(main.cacheutils, "OUTPUT_DIR", tmp_path / "out")
+    monkeypatch.setattr(main.cacheutils, "cached_bench", lambda *a, **k: _tabular_bench())
+    monkeypatch.setattr(main.cacheutils, "SCRATCH", tmp_path / "empty")  # no data/splits -> refuse
+    monkeypatch.setattr(main.cacheutils, "extract_and_cache", _never)
+    monkeypatch.setattr(main.cacheutils, "load_cached_embeddings", _never)
+
+    with pytest.raises(SA.SplitArtifactError, match="no canonical splits"):
+        main._run_tabular_pair(
+            "fake", "raw", [0], 0, ["random_id"], ["gen_embeddings", "probing"], ["logistic"],
+            {"source": [1.0], "target": [0]}, False, False, False, {},
+        )
+    # never called (both stubs raise AssertionError, which is not SplitArtifactError) AND no tree
+    assert not (tmp_path / "out").exists(), "a refused split load created/mutated the results tree"
+
+
+def test_dense_missing_splits_refuse_before_the_encoder_runs(monkeypatch, tmp_path) -> None:
+    from evals import split_artifacts as SA
+    from utils import runstate as RS
+
+    def _never(*_a, **_k):
+        raise AssertionError("the dense encoder ran despite missing splits")
+
+    monkeypatch.setattr(RS.cacheutils, "OUTPUT_DIR", tmp_path / "out")
+    monkeypatch.setattr(RS.cacheutils, "cached_bench", lambda *a, **k: SimpleNamespace(
+        name="pastis", data_quality=None, patch_classes=None, n_samples=4, patches=[]))
+    monkeypatch.setattr(RS.cacheutils, "SCRATCH", tmp_path / "empty")  # no data/splits -> refuse
+    monkeypatch.setattr(RS.cacheutils, "extract_dense_and_cache", _never)
+    monkeypatch.setattr(RS.cacheutils, "require_dense_cache", _never)
+
+    with pytest.raises(SA.SplitArtifactError, match="no canonical splits"):
+        RS._run_segmentation_pair(
+            "pastis", "raw", [0], 10, ["random_id"], ["gen_embeddings", "probing"], ["logistic"],
+            {"source": [1.0], "target": [0]}, False, False, True, False, {},
+        )
+    assert not (tmp_path / "out").exists(), "a refused dense split load created/mutated the results tree"
+
+
+def _dense_stubs(monkeypatch, tmp_path):
+    from evals import split_artifacts as SA
+    from utils import runstate as RS
+
+    # PHASE B: runstate consumes dense splits from data/splits/ (function-local import, so patch the
+    # module object). Empty configs reproduce the old segmentation_fold_configs stub's intent.
+    monkeypatch.setattr(SA, "load_dense_splits", lambda *a, **k: ({0: []}, []))
     monkeypatch.setattr(RS.cacheutils, "OUTPUT_DIR", tmp_path)
     monkeypatch.setattr(RS, "build_run_manifest", lambda *a, **k: _STUB_MANIFEST)
     monkeypatch.setattr(RS.cacheutils, "cached_bench", lambda *a, **k: SimpleNamespace(
@@ -633,14 +764,54 @@ def _dense_cache_on_disk(root, *, folds=(1, 2, 3, 4, 5), patches=12, pixels=30, 
     return root
 
 
+def _publish_dense_random_splits(splits_root, emb_dir, *, seed=0):
+    """Generate + publish random_id dense split artifacts matching a real dense cache (Phase B).
+
+    This is the dense integration fixture: the runtime now CONSUMES patch splits from data/splits/,
+    so a real dense-cell test must first publish canonical artifacts for the cache's patches.
+    """
+    import evals.benchmarks.pastis as pastis_mod
+    from evals import split_artifacts as SA
+    from evals.regimes import base as RB
+    from utils import cacheutils as C
+
+    all_folds = set(pastis_mod.TRAIN_FOLDS) | set(pastis_mod.VAL_FOLDS) | set(pastis_mod.TEST_FOLDS)
+    pids = [int(p) for p in C.dense_fold_patches(emb_dir, all_folds)]
+    bench = SimpleNamespace(name="pastis", patch_ids=lambda folds=None, _p=pids: list(_p))
+    dense_cache = dict(
+        all_patch_ids=pids,
+        fold_of={p: sorted(all_folds)[0] for p in pids},  # random_id has no exclusions; stats unchecked here
+        class_sets={p: {0, 1, 2} for p in pids},
+        patch_latlon={},
+    )
+    cfgs = list(RB.segmentation_fold_configs(pastis_mod, ["random_id"], seed=seed, emb_dir=emb_dir, bench=bench))
+    for _regime, cfg in cfgs:
+        params = {"train_folds": sorted(cfg.train_folds), "val_folds": sorted(cfg.val_folds),
+                  "test_folds": sorted(cfg.test_folds), "assembly_seed": 0}
+        spec, eligible = SA.build_dense_leaf("pastis", "random_id", seed, cfg=cfg, bench=bench,
+                                             params=params, audit_events=[], **dense_cache)
+        SA.publish_leaf(splits_root, spec, eligible)
+    SA.write_generation(splits_root, "pastis", "random_id", seed, requested=["random_patch"],
+                        yielded=[c.label for _, c in cfgs], dropped=[], audit_events=[], regime_problems=[])
+    return pids
+
+
 def _run_dense_healthy(monkeypatch, tmp_path):
     from utils import runstate as RS
 
     emb_dir = _dense_cache_on_disk(tmp_path / "emb")
+    pids = _publish_dense_random_splits(tmp_path / "splits", emb_dir, seed=0)
+    # PHASE B: the runtime reads splits from the single canonical location cacheutils.SCRATCH/"splits"
+    # (no RB_SPLITS_DIR); redirect SCRATCH so the pair consumes the temp artifacts.
+    monkeypatch.setattr(RS.cacheutils, "SCRATCH", tmp_path)
 
     monkeypatch.setattr(RS.cacheutils, "OUTPUT_DIR", tmp_path / "out")
+    # PHASE B: runtime builds patch_fold from bench.patches; the synthetic cache reuses patch ids
+    # across folds, and random_id spans all folds, so any single fold is consistent for every patch.
+    patches = [SimpleNamespace(patch_id=p, fold=1) for p in pids]
     monkeypatch.setattr(RS.cacheutils, "cached_bench", lambda *a, **k: SimpleNamespace(
-        name="pastis", data_quality=None, patch_classes=None, n_samples=4))
+        name="pastis", data_quality=None, patch_classes=None, n_samples=4,
+        patches=patches, patch_ids=lambda folds=None, _p=pids: list(_p)))
     monkeypatch.setattr(RS.cacheutils, "require_dense_cache", lambda *a, **k: emb_dir)
     monkeypatch.setattr(RS, "build_run_manifest", lambda *a, **k: _STUB_MANIFEST)
     monkeypatch.setattr(artifacts, "capture_environment", lambda repo=None: _env(sklearn="1.9.0"))
@@ -705,6 +876,120 @@ def test_dense_pair_feeds_the_probe_the_cached_embedding_width(monkeypatch, tmp_
     _run_dense_healthy(monkeypatch, tmp_path)
 
     assert seen["width"] == 5, "the dense loader augmented the frozen embedding"
+
+
+# --- the HEALTHY tabular path: consume published splits end-to-end -----------------------
+#
+# The dense healthy tests above prove the dense caller reaches its cell. This proves the tabular
+# caller does too -- over REAL published canonical split artifacts, a real _run_tabular_pair probing
+# cell, real logistic probes, and the full completion contract. build_run_manifest is NOT stubbed, so
+# the run manifest actually carries the consumed split set it bound itself to (req 3 checks that).
+
+
+def _ch_like_bench(n_per=12):
+    """A synthetic cropharvest-shaped bench the real ch.make_targets accepts, with enough samples for
+    a stratified random_id split. Only the attributes _run_tabular_pair touches are populated."""
+    centers = {"kenya": (0.5, 37.0), "togo": (8.0, 1.0), "ethiopia": (9.0, 40.0)}
+    rng = np.random.default_rng(0)
+    groups, labels, latlon, sids = [], [], [], []
+    for dom, (clat, clon) in centers.items():
+        for i in range(n_per):
+            groups.append(dom)
+            labels.append(i % 2)  # balanced two classes per domain
+            latlon.append((clat + rng.normal(0, 0.05), clon + rng.normal(0, 0.05)))
+            sids.append(f"{dom}_{i}")
+    return SimpleNamespace(
+        name="cropharvest",
+        groups=np.asarray(groups, dtype=object),
+        labels=np.asarray(labels, dtype=np.int64),
+        latlon=np.asarray(latlon, dtype=float),
+        sample_ids=np.asarray(sids, dtype=object),
+        years=None,
+        data_quality=None,
+        available_modalities=lambda: {"s2"},
+    )
+
+
+def _publish_tabular_random_splits(splits_root, bench, *, seed=0):
+    """Publish random_id tabular split artifacts for `bench` -- the runtime CONSUMES these."""
+    from evals import split_artifacts as SA
+    from evals.benchmarks import cropharvest as ch
+    from evals.regimes import base as RB
+
+    y, _g = ch.make_targets(bench)
+    labels_seen = []
+    for (label, train, val, test, domains, has_target, group_kind, source_val, source_test) in \
+            RB.iter_splits("random_id", bench, y, None, seed):
+        spec, eligible = SA.build_tabular_leaf(
+            "cropharvest", "random_id", seed, label=label,
+            train=train, val=val, test=test, source_val=source_val, source_test=source_test,
+            domains=domains, labels=y, sample_ids=bench.sample_ids, has_target=has_target,
+            group_kind=group_kind, params={"assembly_seed": 0}, audit_events=[],
+        )
+        SA.publish_leaf(splits_root, spec, eligible)
+        labels_seen.append(str(label))
+    SA.write_generation(splits_root, "cropharvest", "random_id", seed, requested=["random_id"],
+                        yielded=labels_seen, dropped=[], audit_events=[], regime_problems=[])
+    return labels_seen
+
+
+def _run_tabular_healthy(monkeypatch, tmp_path):
+    import main
+    from evals.benchmarks import cropharvest as ch
+
+    bench = _ch_like_bench()
+    labels = _publish_tabular_random_splits(tmp_path / "splits", bench, seed=0)
+
+    # embeddings linearly separable by label so the logistic probe fits and emits rows
+    y, _g = ch.make_targets(bench)
+    emb = np.zeros((len(bench.sample_ids), 4), dtype=np.float32)
+    emb[np.asarray(y) == 1] = 1.0
+
+    monkeypatch.setattr(main.EV, "load_benchmark", lambda _n: ch)  # the REAL cropharvest module
+    monkeypatch.setattr(main.cacheutils, "SCRATCH", tmp_path)              # splits under tmp_path/"splits"
+    monkeypatch.setattr(main.cacheutils, "OUTPUT_DIR", tmp_path / "out")
+    monkeypatch.setattr(main.cacheutils, "cached_bench", lambda *a, **k: bench)
+    monkeypatch.setattr(main.cacheutils, "load_cached_embeddings", lambda *a, **k: emb)
+    monkeypatch.setattr(main.compat, "input_modalities", lambda _m: {"s2"})
+    monkeypatch.setattr(artifacts, "capture_environment", lambda repo=None: _env(sklearn="1.9.0"))
+    # build_run_manifest is intentionally NOT stubbed: only the real builder records consumed_splits.
+
+    main._run_tabular_pair(
+        "cropharvest", "raw", [0], 0, ["random_id"], ["probing"], ["logistic"],
+        {"source": [1.0], "target": [0]}, False, False, False, {},  # s2_only / overwrite / strict = False
+    )
+    return tmp_path / "out" / "results" / "raw" / "cropharvest", labels
+
+
+def test_tabular_pair_consumes_published_splits_end_to_end(monkeypatch, tmp_path) -> None:
+    from evals import split_artifacts as SA
+
+    results_dir, labels = _run_tabular_healthy(monkeypatch, tmp_path)
+
+    rows = IOU.read_jsonl(results_dir / "probe_results.jsonl")
+    assert rows, "the healthy tabular pair scheduled no work -- no cell was executed"
+    assert {r["seed"] for r in rows} == {0}
+    assert {r["split_regime"] for r in rows} == {"random_id"}
+    assert {r["holdout"] for r in rows} == set(labels)
+    assert {r["model"] for r in rows} == {"raw"}
+    assert {r["benchmark"] for r in rows} == {"cropharvest"}
+    assert {r["probe_family"] for r in rows} == {"logistic"}
+
+    # split_ref.json records the consumed relative leaf paths (canonical committed location)
+    expected = [f"cropharvest/random_id/0/{SA.holdout_dirname(labels[0])}"]
+    ref = json.loads((results_dir / "split_ref.json").read_text())
+    assert ref["consumed_leaves"] == expected
+    assert ref["splits_location"] == "data/splits"
+
+    # run_manifest.json binds the SAME consumed split set (resume identity)
+    man = json.loads((results_dir / "run_manifest.json").read_text())
+    assert man["consumed_splits"]["leaves"] == expected
+
+    # completion validation succeeds against the run's own manifest signature
+    ok, problems = artifacts.validate_run_complete(
+        results_dir, expected_signature=runstate.run_manifest_digest(man)
+    )
+    assert ok, problems
 
 
 # --- dirty-tree identity is content-sensitive --------------------------------
@@ -847,7 +1132,7 @@ def _finished(tmp_path, *, keys=None, rows=None, signature="sigABC", **kw):
     keys = keys if keys is not None else {_key(lb=b) for b in (0.05, 1.0)}
     rows = rows if rows is not None else [_row(lb=b) for b in (0.05, 1.0)]
     IOU.append_jsonl(tmp_path / "probe_results.jsonl", rows)
-    for name in ("probe_results.csv", "summary.csv", "deltas.csv", "split_manifest.json"):
+    for name in ("probe_results.csv", "summary.csv", "deltas.csv", "split_ref.json"):
         (tmp_path / name).write_text('{"a": 1}\n')
     IOU.write_json(tmp_path / "environment.json", _env())  # a COMPLETE record; the schema is validated
     return artifacts.write_run_complete(
@@ -905,13 +1190,13 @@ def test_marker_refuses_when_a_probe_cell_was_skipped(tmp_path) -> None:
         ])
 
 
-def test_marker_hashes_environment_and_split_manifest(tmp_path) -> None:
+def test_marker_hashes_environment_and_split_ref(tmp_path) -> None:
     marker = _finished(tmp_path)
 
     for name in artifacts.REQUIRED_ARTIFACTS:
         assert marker["artifacts"][name]["sha256"], f"{name} not hashed"
     assert "environment.json" in marker["artifacts"]
-    assert "split_manifest.json" in marker["artifacts"]
+    assert "split_ref.json" in marker["artifacts"]
 
 
 def test_validation_catches_a_stale_derived_csv(tmp_path) -> None:
@@ -1006,7 +1291,7 @@ def test_a_corrupt_marker_is_treated_as_absent(tmp_path) -> None:
 
 def _historical(tmp_path, n=5):
     IOU.append_jsonl(tmp_path / "probe_results.jsonl", [_row(lb=float(i)) for i in range(n)])
-    for name in ("probe_results.csv", "summary.csv", "deltas.csv", "split_manifest.json"):
+    for name in ("probe_results.csv", "summary.csv", "deltas.csv", "split_ref.json"):
         (tmp_path / name).write_text("a\n1\n")
     IOU.write_json(tmp_path / "environment.json", _env())
     # A genuinely historical dir carries the OLD run_signature.txt; the (kept) run-complete backfill
