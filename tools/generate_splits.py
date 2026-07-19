@@ -13,8 +13,9 @@ No command-line arguments: edit the CONFIG block below and run it.
 
     python tools/generate_splits.py
 
-``AUDIT_ONLY = True`` constructs and validates every split and reports, but writes NO assignments.csv
-under ``data/splits/`` and NO ``data/logs/splits.json``. It is not a pure no-op: loading a benchmark
+``AUDIT_ONLY = True`` constructs and validates every split (and every geographic_ood label_access
+order) and reports, but writes NO assignments.csv / label_access.csv under ``data/splits/`` and NO
+``data/logs/splits.json``. It is not a pure no-op: loading a benchmark
 still reads and MAY populate the benchmark pickle cache under ``data/cache/benchmark/`` via
 ``cacheutils.cached_bench`` (the same loader the runtime uses).
 
@@ -49,7 +50,7 @@ LOGS_PATH = SA.default_log_path(SPLITS_ROOT)          # data/logs/splits.json
 BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis"]
 REGIMES = ["random_id", "official", "geographic_ood", "spatial_cluster_ood"]
 SEEDS = [0, 1, 2]
-AUDIT_ONLY = False    # True = validate + report; writes NO assignments.csv / splits.json (may
+AUDIT_ONLY = False    # True = validate + report; writes NO assignments.csv / label_access.csv / splits.json (may
 #                       populate/read the benchmark pickle cache via cached_bench). False = write.
 # =============================================================================
 
@@ -130,9 +131,32 @@ def generate_tabular(root, bench, bench_mod, regime, seed, *, audit_only):
             split=split, domains=domains, labels=y, sample_ids=sample_ids,
             audit_events=window, purge_km=purge_km,
         )
+        # Validation-before-write (NOT atomic publication): both artifacts are constructed + validated
+        # against the frozen split BEFORE either is written, so a validation failure (feasibility /
+        # structure) never publishes anything for the leaf. The two writes below remain sequential --
+        # there is no staging/atomic rename -- so a write-time I/O failure after assignments.csv could
+        # still leave a partial leaf. Assignments rows were validated in build_tabular_leaf; the
+        # geographic_ood label-access order is constructed + validated here in BOTH audit and write
+        # mode. An included headline target that cannot support every configured count is a hard failure
+        # -- never clamped. Supplementary / no-target-training targets stay out.
+        la_rows = None
+        if regime == SA.LABEL_ACCESS_REGIME and split.supports_target_labels:
+            src_ids = [str(sample_ids[int(i)]) for i in split.source_train]
+            pool_ids = [str(sample_ids[int(i)]) for i in split.target_label_pool]
+            test_ids = [str(sample_ids[int(i)]) for i in split.target_test]
+            where = f"{bench_mod.BENCHMARK}/{regime}/{seed}/{split.label}/{SA.LABEL_ACCESS_FILENAME}"
+            SA.assert_label_access_feasible(len(src_ids), len(pool_ids), where=where)
+            la_rows = SA.build_label_access_rows(
+                seed=seed, source_ids=src_ids, target_pool_ids=pool_ids, target_test_ids=test_ids, where=where,
+            )
+            SA.validate_label_access_rows(
+                la_rows, source_ids=src_ids, target_pool_ids=pool_ids, target_test_ids=test_ids, where=where,
+            )
         if not audit_only:
             _path, sha = SA.write_assignments(root, bench_mod.BENCHMARK, regime, seed, str(split.label), rows)
             summary["sha256"] = sha
+            if la_rows is not None:
+                SA.write_label_access(root, bench_mod.BENCHMARK, seed, str(split.label), la_rows)
         entries.append(summary)
     _check_expected_coverage(
         regime, bench_mod.BENCHMARK, seed, _expected_tabular_labels(regime, bench_mod), [e["holdout"] for e in entries]
@@ -165,9 +189,28 @@ def generate_dense(root, bench, bench_mod, regime, seed, *, audit_only, dense_ca
             all_patch_ids=dense_cache["all_patch_ids"], domain_of=domain_of,
             class_sets=dense_cache["class_sets"], patch_latlon=dense_cache["patch_latlon"], purge_km=purge_km,
         )
+        # Same label-access contract as tabular, at PATCH granularity: the geographic_ood headline target
+        # carries a frozen label_access.csv over stable patch ids (two source orders + one target order),
+        # constructed + validated in BOTH audit and write mode. Feasibility is a hard failure -- never
+        # clamped. Patches are never split; the orders rank WHOLE patches.
+        la_rows = None
+        if regime == SA.LABEL_ACCESS_REGIME and dense_split.supports_target_labels:
+            src_ids = [str(int(p)) for p in sorted(dense_split.source_train_patches)]
+            pool_ids = [str(int(p)) for p in sorted(dense_split.target_label_pool_patches)]
+            test_ids = [str(int(p)) for p in sorted(dense_split.target_test_patches)]
+            where = f"{bench_mod.BENCHMARK}/{regime}/{seed}/{dense_split.label}/{SA.LABEL_ACCESS_FILENAME}"
+            SA.assert_label_access_feasible(len(src_ids), len(pool_ids), where=where)
+            la_rows = SA.build_label_access_rows(
+                seed=seed, source_ids=src_ids, target_pool_ids=pool_ids, target_test_ids=test_ids, where=where,
+            )
+            SA.validate_label_access_rows(
+                la_rows, source_ids=src_ids, target_pool_ids=pool_ids, target_test_ids=test_ids, where=where,
+            )
         if not audit_only:
             _path, sha = SA.write_assignments(root, bench_mod.BENCHMARK, regime, seed, str(dense_split.label), rows)
             summary["sha256"] = sha
+            if la_rows is not None:
+                SA.write_label_access(root, bench_mod.BENCHMARK, seed, str(dense_split.label), la_rows)
         entries.append(summary)
     _check_expected_coverage(
         regime, bench_mod.BENCHMARK, seed, _expected_dense_labels(regime, bench_mod), [e["holdout"] for e in entries]
@@ -278,7 +321,7 @@ def build_provenance() -> dict:
 
 def main() -> int:
     root = Path(SPLITS_ROOT)
-    mode = "AUDIT-ONLY (no assignments.csv / splits.json written)" if AUDIT_ONLY else f"WRITE -> {root} + {LOGS_PATH}"
+    mode = "AUDIT-ONLY (no assignments.csv / label_access.csv / splits.json written)" if AUDIT_ONLY else f"WRITE -> {root} + {LOGS_PATH}"
     print(f"[generate_splits] mode={mode}; benchmarks={BENCHMARKS}; regimes={REGIMES}; seeds={SEEDS}", flush=True)
     failed, entries = [], []
     for benchmark in BENCHMARKS:

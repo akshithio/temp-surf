@@ -84,22 +84,28 @@ def rewrite_jsonl_dropping(path: Path, should_drop: Any) -> int:
     """Stream-filter a JSONL file in place, dropping rows where ``should_drop(parsed_row)`` is
     True. Bounded memory (one line at a time) so it is safe on the multi-GB multiclass
     ``predictions.jsonl`` that would OOM a whole-file ``read_jsonl``. Returns the number dropped;
-    only rewrites the file if at least one row was dropped."""
+    only rewrites the file if at least one row was dropped.
+
+    A torn final line left by a hard crash is repaired FIRST (``repair_jsonl_tail``), confining the
+    damage to the one row already lost. Any JSON error remaining after that is a CORRUPT INTERIOR row --
+    a hard error, never silently dropped, because dropping it would hide real data loss."""
     path = Path(path)
     if not path.exists():
         return 0
+    repair_jsonl_tail(path)
     tmp = path.parent / (path.name + ".prune.tmp")
     tmp.unlink(missing_ok=True)
     dropped = 0
     with path.open("r", encoding="utf-8") as fin, tmp.open("w", encoding="utf-8") as fout:
-        for line in fin:
+        for lineno, line in enumerate(fin, 1):
             s = line.strip()
             if not s:
                 continue
             try:
                 row = json.loads(s)
-            except json.JSONDecodeError:
-                continue  # drop corrupt / unterminated trailing line
+            except json.JSONDecodeError as exc:
+                tmp.unlink(missing_ok=True)
+                raise ValueError(f"corrupt interior JSONL row {lineno} in {path}: {exc}") from exc
             if should_drop(row):
                 dropped += 1
                 continue
@@ -206,11 +212,21 @@ def summarize_rows(
     rows: list[dict[str, Any]],
     keys: list[str],
     metrics: list[str],
+    *,
+    count_aggregates: list[str] = (),
+    passthrough: list[str] = (),
 ) -> list[dict[str, Any]]:
     """Group rows by ``keys`` and report mean/std of each metric (over seeds/holdouts).
 
     Adds ``n_rows`` always, ``n_seeds`` / ``n_holdouts`` when those columns exist,
     and aggregates probe-convergence bookkeeping when present.
+
+    ``count_aggregates`` are integer size columns (e.g. the label-access supervision counts) reported as
+    ``min_/max_/mean_`` over the group. They are deliberately NOT group keys: label-access rows for the
+    same (route, budget, ...) differ in n_source/n_target/n_total ACROSS holdouts (full-pool sizes vary
+    by region), so keying on them would fragment the equal-region aggregation. ``passthrough`` are
+    columns constant within a group (e.g. ``label_budget_unit``): the single distinct value is preserved,
+    or "" when the group has none / disagrees.
     """
     grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
     for row in rows:
@@ -225,6 +241,15 @@ def summarize_rows(
             finite = [x for x in present if np.isfinite(x)]
             row[f"mean_{metric}"] = float(np.mean(finite)) if finite else float("nan")
             row[f"std_{metric}"] = float(np.std(finite)) if finite else float("nan")
+        for col in count_aggregates:
+            sizes = [int(v[col]) for v in vals if col in v and v[col] is not None]
+            if sizes:
+                row[f"min_{col}"] = int(min(sizes))
+                row[f"max_{col}"] = int(max(sizes))
+                row[f"mean_{col}"] = float(np.mean(sizes))
+        for col in passthrough:
+            distinct = {v[col] for v in vals if col in v and v[col] not in ("", None)}
+            row[col] = next(iter(distinct)) if len(distinct) == 1 else ""
         row["n_rows"] = len(vals)
         if "seed" in vals[0]:
             row["n_seeds"] = len({v["seed"] for v in vals})

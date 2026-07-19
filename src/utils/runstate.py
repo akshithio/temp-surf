@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,7 @@ def build_run_manifest(
     (artifact SHA for tabular, tile-set digest for dense). Splits are consumed from the frozen
     data/splits/ CSVs (discovered + checksum-verified via data/logs/splits.json), not bound here."""
     from evals import probes as _probes
+    from evals import split_artifacts as _SA
 
     fi = cacheutils.frozen_run_identity()
     env = artifacts.capture_environment()
@@ -67,7 +69,19 @@ def build_run_manifest(
         "probe_cap": perf.PROBE_CAP or 0,          # the committed PROBE_CAP main.py pushed into perfutils
         "probe_tuning": bool(_probes.PROBE_TUNING),  # the committed PROBE_TUNING main.py pushed into probes
         "max_dense_pixels": max_dense_pixels,
-        "write_predictions": bool(write_predictions),
+        # Readable label-access contract: enabled ONLY when geographic_ood is requested; the unit is the
+        # benchmark's (patches for dense PASTIS, else samples). The canonical counts/routes/splits/unit are
+        # still recorded when disabled so the manifest stays self-describing.
+        "label_access": _SA.label_access_contract(
+            enabled=_SA.LABEL_ACCESS_REGIME in set(split_regimes), benchmark=benchmark
+        ),
+        # NEVER claim predictions were enabled when none will be written. Tabular writes per-sample
+        # predictions for every regime; dense (PASTIS) writes them ONLY for the geographic_ood label-access
+        # suite -- so a dense run without geographic_ood records write_predictions=False.
+        "write_predictions": bool(write_predictions) and (
+            _SA.LABEL_ACCESS_REGIME in set(split_regimes)
+            if benchmark in _SA.DENSE_LABEL_ACCESS_BENCHMARKS else True
+        ),
         "enc": enc,
     }
     return manifest
@@ -136,6 +150,7 @@ def budget_row_key(row):
         row.get("budget_type"),
         row.get("label_budget"),
         row.get("evaluation_split"),
+        row.get("label_access_route", ""),
     )
 
 
@@ -278,6 +293,73 @@ def _probe_cell_target(
     return rows, preds if write_predictions else []
 
 
+def _probe_cell_label_access(
+    probe_fn,
+    emb,
+    train,
+    val,
+    target_pool,
+    target_test,
+    matched_source_ranked_idx,
+    fixed_source_removal_ranked_idx,
+    target_ranked_idx,
+    y,
+    groups,
+    meta,
+    seed,
+    family="logistic",
+    write_predictions: bool = True,
+) -> tuple[list[dict], list[dict]]:
+    """One geographic_ood label-access cell: all 13 routes + the source_only complete-target diagnostic.
+    Maps the frozen label-access order (CURRENT row indices, already validated against the split at load)
+    to EXACT positions within the source-train / target-pool arrays, hard-failing if any index is not in
+    its partition. Runs the whole suite in ONE call so source_only is fit once and its scorer reused."""
+    train = np.asarray(train, dtype=np.int64)
+    target_pool = np.asarray(target_pool, dtype=np.int64)
+    target_test = np.asarray(target_test, dtype=np.int64)
+
+    def _to_positions(current_idx, partition, name):
+        pos = {int(v): p for p, v in enumerate(partition.tolist())}
+        out = np.empty(len(current_idx), dtype=np.int64)
+        for i, v in enumerate(np.asarray(current_idx, dtype=np.int64).tolist()):
+            if v not in pos:
+                raise ValueError(
+                    f"label-access {name}: current index {v} is not in its partition (size {len(partition)})"
+                )
+            out[i] = pos[v]
+        return out
+
+    matched = _to_positions(matched_source_ranked_idx, train, "matched_source")
+    fixed = _to_positions(fixed_source_removal_ranked_idx, train, "fixed_source_removal")
+    target = _to_positions(target_ranked_idx, target_pool, "target")
+
+    g = np.asarray(groups) if groups is not None else None
+    x_val = emb[val] if len(val) else None
+    y_val = y[val] if len(val) else None
+    mname = meta.get("method", "?")
+    perf.set_identity({k: meta[k] for k in ("seed", "holdout", "method") if k in meta})
+    rows: list[dict] = []
+    preds: list[dict] = []
+    with perf.measure(
+        f"probe.label_access/{meta.get('benchmark', '?')}/{mname}",
+        n_samples_source=len(train), n_samples_pool=len(target_pool), n_samples_test=len(target_test),
+    ):
+        probe_fn(
+            rows, emb[train], emb[target_pool], emb[target_test], y[train], y[target_pool], y[target_test], seed,
+            matched_source_order=matched, fixed_removal_order=fixed, target_order=target,
+            meta=meta,
+            groups_source=g[train] if g is not None else None,
+            groups_pool=g[target_pool] if g is not None else None,
+            groups_test=g[target_test] if g is not None else None,
+            predictions=preds if write_predictions else None,
+            sample_ids_test=target_test,
+            sample_ids_full=np.concatenate([target_pool, target_test]),
+            x_val=x_val, y_val=y_val, family=family,
+        )
+    perf.set_identity(None)
+    return rows, preds if write_predictions else []
+
+
 def _run_segmentation_cell(
     bench_mod,
     emb_dir,
@@ -290,6 +372,9 @@ def _run_segmentation_cell(
     meta,
     *,
     all_folds,
+    label_access=None,
+    patch_domain=None,
+    predictions_sink=None,
 ) -> list[dict]:
     """Run one dense probe cell against a schema-v2 :class:`DenseSourceTargetSplit`.
 
@@ -316,6 +401,8 @@ def _run_segmentation_cell(
     val_patches = set(cfg.source_val_patches)
     # official/geographic (has_target) evaluate zero-shot on target_test; random_id on source_test.
     test_patches = set(cfg.target_test_patches if cfg.has_target else cfg.source_test_patches)
+    # x_train is the SOURCE-SWEEP training set (globally subsampled). The label-access suite does NOT use
+    # it -- it loads its own per-patch-deterministic pixels via load_dense_patch_pixels (patch-first).
     x_train, y_train, groups_train, _, _ = cacheutils.load_dense_samples(
         emb_dir, all_folds, max_dense_pixels, seed, patch_ids=train_patches
     )
@@ -336,19 +423,55 @@ def _run_segmentation_cell(
         groups_train=groups_train, family=family,
     )
     if cfg.has_target and cfg.supports_target_labels:
-        # target-budget sweep: few-shot patches drawn ONLY from target_label_pool, scored on the SAME
-        # target_test patches (never labels from target_test).
+        # few-shot patches drawn ONLY from target_label_pool, scored on the SAME target_test patches
+        # (never labels from target_test).
         pool_patches = {int(p) for p in cfg.target_label_pool_patches}
         target_test_patches = {int(p) for p in cfg.target_test_patches}
-        EV.run_probes_segmentation_target(
-            rows, x_train, y_train, seed,
-            target_patches=pool_patches | target_test_patches,
-            pool_patches=pool_patches, target_test_patches=target_test_patches,
-            sample_target=lambda pids, sd: sample_dense(pids, sd),
-            stream_target=lambda pids: stream_dense(pids),
-            x_val=x_val, y_val=y_val, budgets=target_budgets, meta={**meta, "budget_type": "target"},
-            family=family, groups_source=groups_train,
-        )
+        if label_access is not None:
+            # geographic_ood headline: the 13-route patch-level label-access suite REPLACES the legacy
+            # target-budget sweep (no duplicate legacy target rows). Other target-label regimes
+            # (spatial_cluster_ood) keep the legacy sweep -- label_access is None for them.
+            #
+            # PATCH-FIRST loader boundary: the suite resolves its patch sets first, then assembles pixels
+            # via load_pixels, which subsamples EACH patch deterministically (run seed + patch id) to a
+            # per-patch cap sized so the largest route (all source base + whole pool) stays within
+            # MAX_DENSE_PIXELS. It does NOT reuse the globally-subsampled x_train above (that stays the
+            # source-sweep training set). cap_patches threads the effective PROBE_CAP; patch_domain
+            # balances the base pool across source domains.
+            n_units = len(cfg.source_train_patches) + len(cfg.target_label_pool_patches)
+            per_patch_cap = max(1, int(max_dense_pixels) // max(1, n_units))
+
+            def _load_pixels(patch_ids, _cap=per_patch_cap):
+                return cacheutils.load_dense_patch_pixels(
+                    emb_dir, all_folds, {int(p) for p in patch_ids}, run_seed=seed, per_patch_cap=_cap
+                )
+
+            def _stream_eval(patch_ids):
+                return cacheutils.iter_dense_tiles_with_ids(emb_dir, all_folds, patch_ids={int(p) for p in patch_ids})
+
+            EV.run_probes_segmentation_label_access(
+                rows, seed,
+                source_patches=frozenset(int(p) for p in cfg.source_train_patches),
+                pool_patches=frozenset(pool_patches),
+                target_test_patches=frozenset(target_test_patches),
+                matched_source_order=label_access.matched_source_ranked_patches,
+                fixed_removal_order=label_access.fixed_source_removal_ranked_patches,
+                target_order=label_access.target_ranked_patches,
+                load_pixels=_load_pixels, stream_eval=_stream_eval,
+                x_val=x_val, y_val=y_val, meta={**meta, "budget_type": "label_access"},
+                family=family, cap_patches=perf.PROBE_CAP, patch_domain=patch_domain,
+                predictions_sink=predictions_sink,
+            )
+        else:
+            EV.run_probes_segmentation_target(
+                rows, x_train, y_train, seed,
+                target_patches=pool_patches | target_test_patches,
+                pool_patches=pool_patches, target_test_patches=target_test_patches,
+                sample_target=lambda pids, sd: sample_dense(pids, sd),
+                stream_target=lambda pids: stream_dense(pids),
+                x_val=x_val, y_val=y_val, budgets=target_budgets, meta={**meta, "budget_type": "target"},
+                family=family, groups_source=groups_train,
+            )
     return rows
 
 
@@ -395,6 +518,8 @@ def _run_segmentation_pair(
 
     splits_by_seed: dict[int, list[Any]] = {}
     patch_fold: dict[int, int] = {}
+    patch_tile: dict[int, str | None] = {}
+    dense_la_by_cell: dict[tuple[int, str], Any] = {}
     if probing:
         # patch_fold / patch_tile are the CURRENT benchmark patch->fold and patch->tile mappings.
         # patch_fold's keys are the eligible patch universe; its values (folds) are the cache-layout
@@ -405,6 +530,14 @@ def _run_segmentation_pair(
         splits_by_seed = split_artifacts.load_dense_splits(
             splits_root, bench_mod.BENCHMARK, patch_fold, patch_tile, regimes, seeds
         )
+        # Fail-fast: load + validate the frozen dense label_access.csv for every geographic_ood headline
+        # target BEFORE any probing, so a missing/stale patch order refuses the pair up front.
+        for _s in seeds:
+            for _ld in splits_by_seed[_s]:
+                if _ld.regime == split_artifacts.LABEL_ACCESS_REGIME and _ld.split.supports_target_labels:
+                    dense_la_by_cell[(_s, _ld.split.label)] = split_artifacts.load_dense_label_access(
+                        splits_root, bench_mod.BENCHMARK, _s, _ld.split
+                    )
 
     bench_for_emb = bench.s2_only() if s2_only else bench
     if gen_embeddings:
@@ -435,13 +568,17 @@ def _run_segmentation_pair(
         write_predictions=write_predictions,
     )
     signature = run_manifest_digest(manifest)
+    preds_path = results_dir / "predictions.jsonl"
     check_run_manifest(results_dir, manifest, overwrite_mode=overwrite_mode)
     if overwrite_mode:
         for path in (
             rows_path,
+            preds_path,
             results_dir / "probe_results.csv",
             results_dir / "summary.csv",
             results_dir / "deltas.csv",
+            results_dir / "label_access_contrasts.csv",          # Stage-5, rewritten fresh each finalize
+            results_dir / "label_access_contrasts_summary.csv",
             results_dir / "data_quality.json",
             results_dir / "split_ref.json",          # legacy per-model artifact -- retired, remove on resume
             results_dir / "split_manifest.json",     # legacy per-model artifact -- retired, remove on resume
@@ -456,6 +593,19 @@ def _run_segmentation_pair(
     artifacts.write_environment(results_dir, overwrite_mode=overwrite_mode)
     publish_run_manifest(results_dir, manifest)
     artifacts.invalidate_run_complete(results_dir)
+    # Bounded-memory streaming prediction sink for the dense label-access suite: workers append per-patch
+    # batches under a lock (joblib threads share this process). Enabled ONLY when write_predictions AND a
+    # geographic_ood headline target exists -- so the manifest's write_predictions can never over-claim.
+    _preds_active = write_predictions and any(
+        ld.regime == split_artifacts.LABEL_ACCESS_REGIME and ld.split.supports_target_labels
+        for s in seeds for ld in splits_by_seed[s]
+    )
+    _preds_lock = threading.Lock()
+
+    def _predictions_sink(records):
+        with _preds_lock:
+            IOU.append_jsonl(preds_path, records)
+    predictions_sink = _predictions_sink if _preds_active else None
     # Attribute regime problems / skipped cells to THIS pair (both accumulators are shard-global).
     regime_problems_before = len(regime_base.REGIME_PROBLEMS)
     cell_failures_before = len(perf.CELL_FAILURES)
@@ -469,8 +619,10 @@ def _run_segmentation_pair(
 
     present_by_family: dict[tuple, set] = {}
     for r in rows:
+        # Include the label_access_route (empty for non-label-access) so two same-budget routes
+        # (e.g. source_plus_target(25) vs fixed_total_mixed(25)) are never confused on resume.
         present_by_family.setdefault(_fam_key(r), set()).add(
-            (r.get("budget_type"), r.get("label_budget"), r.get("evaluation_split"))
+            (r.get("budget_type"), r.get("label_budget"), r.get("evaluation_split"), r.get("label_access_route", ""))
         )
     # The 80/10/10 within-source reference (source_test) is evaluated as an extra scope whenever the
     # split HAS a target eval AND carries a source_test partition -- geographic/spatial. random_id's
@@ -486,9 +638,14 @@ def _run_segmentation_pair(
         (seed, ld.regime, ld.split.label): bool(ld.split.supports_target_labels)
         for seed in seeds for ld in splits_by_seed[seed]
     }
-    expected_target = {("target", b, "held_out") for b in target_budgets}
+    # Every scope tuple is (budget_type, label_budget, evaluation_split, label_access_route). The legacy
+    # target sweep and the source sweep carry route "" ; the label-access suite carries a real route.
+    expected_target = {("target", b, "held_out", "") for b in target_budgets}
     if any(float(b) == 0.0 for b in target_budgets):
-        expected_target.add(("target", 0, "full"))
+        expected_target.add(("target", 0, "full", ""))
+    label_access_expected = {
+        ("label_access", b, es, route) for (route, b, es) in split_artifacts.label_access_expected_rows()
+    }
 
     def _expected(key):
         # dense already scores "validation" (the source_val calibration set); the source diagnostic
@@ -496,9 +653,11 @@ def _run_segmentation_pair(
         splits = ("validation", "test")
         if has_source_diag.get((key[0], key[2], key[3]), False):
             splits = (*splits, "source_test")
-        exp = {("source", b, s) for b in source_budgets for s in splits}
+        exp = {("source", b, s, "") for b in source_budgets for s in splits}
         if supports_target.get((key[0], key[2], key[3]), False):
-            exp |= expected_target
+            # geographic_ood headline runs the label-access suite; other target-label regimes
+            # (spatial_cluster_ood) keep the legacy target-budget sweep.
+            exp |= label_access_expected if key[2] == split_artifacts.LABEL_ACCESS_REGIME else expected_target
         return exp
 
     done_families = {
@@ -514,6 +673,14 @@ def _run_segmentation_pair(
         else:
             tmp_rows.touch()
         os.replace(tmp_rows, rows_path)
+    # TRANSACTIONAL predictions: keep ONLY the predictions of families that are fully done (whose result
+    # rows are all present, so they will NOT rerun). This drops the predictions of every family scheduled
+    # to rerun -- including a family that appended predictions but CRASHED before its result rows were
+    # published (it has predictions but no rows, so it is not 'done'). Without this, that family's rerun
+    # would duplicate its predictions. Runs whenever a predictions file exists, not only on row pruning.
+    # (rewrite_jsonl_dropping repairs a torn tail and hard-fails on a corrupt interior row.)
+    if write_predictions and preds_path.exists():
+        IOU.rewrite_jsonl_dropping(preds_path, lambda p: _fam_key(p) not in done_families)
 
     # PHASE B: the per-model split_manifest.json is retired -- the frozen patch-level assignments.csv
     # leaves under data/splits/ (discovered + checksum-verified via data/logs/splits.json) are the
@@ -533,9 +700,10 @@ def _run_segmentation_pair(
             split_regime, cfg = loaded_dense.regime, loaded_dense.split
             holdout = cfg.label
             for f in active_probes:
-                for bt, lb, es in _expected((seed, method_name, split_regime, holdout, f)):
-                    # artifacts.CELL_KEY_FIELDS order
-                    expected_keys.add((seed, split_regime, holdout, method_name, f, bt, lb, es))
+                for bt, lb, es, route in _expected((seed, method_name, split_regime, holdout, f)):
+                    # artifacts.CELL_KEY_FIELDS order; the 9th field is the label-access route ("" for the
+                    # source sweep and the legacy target sweep; a real route for the label-access suite).
+                    expected_keys.add((seed, split_regime, holdout, method_name, f, bt, lb, es, route))
             families_to_run = [
                 f for f in active_probes
                 if (seed, method_name, split_regime, holdout, f) not in done_families
@@ -551,6 +719,7 @@ def _run_segmentation_pair(
                     "holdout": holdout,
                     "target_role": cfg.target_role,
                     "probe_family": family,
+                    "label_access_route": "",  # non-label-access default; the sweep overrides per route
                 }
                 jobs.append(
                     delayed(_run_segmentation_cell)(
@@ -564,6 +733,9 @@ def _run_segmentation_pair(
                         max_dense_pixels,
                         seg_meta,
                         all_folds=all_folds,
+                        label_access=dense_la_by_cell.get((seed, holdout)),
+                        patch_domain=patch_tile,     # source patch -> Sentinel tile, for balanced base selection
+                        predictions_sink=predictions_sink,
                     )
                 )
     if jobs:
@@ -585,8 +757,13 @@ def _run_segmentation_pair(
             "evaluation_split",
             "budget_type",
             "label_budget",
+            "label_access_route",
         ],
         metrics=EV.METRICS_SEGMENTATION,
+        # Dense label-access supervision counts are PATCH counts; aggregate them (never key on them) and
+        # preserve the "patches" unit -- identical treatment to the tabular summary.
+        count_aggregates=["n_source_labels", "n_target_labels", "n_total_labels"],
+        passthrough=["label_budget_unit"],
     )
     IOU.write_csv(results_dir / "summary.csv", summary)
     IOU.write_json(results_dir / "metric_roles.json", EV.METRIC_ROLES["segmentation"])
@@ -598,6 +775,10 @@ def _run_segmentation_pair(
         target_id_budget=EV.TARGET_ID_UPPER_BOUND if EV.TARGET_ID_UPPER_BOUND in target_budgets else None,
     )
     IOU.write_csv(results_dir / "deltas.csv", deltas)
+    # Stage 5: paired label-access contrasts (pure post-processing). No-op unless geographic_ood ran;
+    # hard-fails on a missing/duplicate operand or unresolvable anchor. write_run_complete re-validates.
+    from evals import contrasts
+    contrasts.compute_and_write(results_dir, rows)
     declared, available = set(compat.input_modalities(model_name)), {"s2", "s1", "time"}
     IOU.write_json(results_dir / "model_inputs.json", {
         "model": model_name, "benchmark": benchmark_name, "s2_only_mode": s2_only,

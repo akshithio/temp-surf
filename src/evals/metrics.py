@@ -416,7 +416,13 @@ def score_segmentation_streamed(
     clf: Any,
     tiles: Any,
     eval_classes: np.ndarray,
+    *,
+    predict_sink: Any = None,
 ) -> dict[str, float]:
+    """Stream tiles ONCE, accumulating segmentation metrics. When ``predict_sink`` is given, the SAME
+    per-tile inference also feeds predictions: ``tiles`` must then yield ``(tile_key, features, labels)``
+    and ``predict_sink(tile_key, labels, pred)`` is called once per tile (a single inference pass -- never
+    a second one). With no sink, ``tiles`` yields the usual ``(features, labels)`` pairs."""
     k = len(eval_classes)
     conf = np.zeros((k, k), dtype=np.int64)
     tile_mious: list[float] = []
@@ -442,7 +448,11 @@ def score_segmentation_streamed(
     cal_ok = True
     proba_classes: np.ndarray | None = None
     with perf.measure("probe.score/segmentation_streamed", n_features=-1):
-        for features, labels in tiles:
+        for item in tiles:
+            if predict_sink is not None:
+                tile_key, features, labels = item
+            else:
+                tile_key, (features, labels) = None, item
             labels = np.asarray(labels)
             if labels.size == 0:
                 continue
@@ -480,6 +490,8 @@ def score_segmentation_streamed(
                 cal_n += int(labels.size)
             else:
                 pred = np.asarray(scoring_clf.predict(features))
+            if predict_sink is not None:  # SAME inference feeds predictions -- no second pass
+                predict_sink(tile_key, labels, pred)
             lab = _as_eval_indices(labels, eval_classes, "segmentation labels")
             prd = _as_eval_indices(pred, eval_classes, "segmentation predictions")
             tile_conf = np.bincount(lab * k + prd, minlength=k * k).reshape(k, k)

@@ -656,3 +656,231 @@ def run_probes_segmentation_target(
                 **probe_meta,
                 **score_segmentation_streamed(clf, stream_target(all_patches), eval_classes),
             })
+
+
+# --------------------------------------------------------------------------- #
+# Dense geographic label-access suite (Stage 4): the tabular 13-route contract, at PATCH granularity.
+# Every selection/removal is over WHOLE patches (never a fraction of a patch); pixels are loaded only
+# AFTER the patch sets are fixed. Rows carry the same schema as the tabular suite (route, budget, the
+# three supervision counts, n_test, unit) so completeness, semantic validation, summaries, and manifest
+# identity are shared -- with the unit being "patches" and every count a PATCH count.
+# --------------------------------------------------------------------------- #
+def _validate_patch_order(order: Any, patch_population: Any, name: str) -> np.ndarray:
+    """Validate a frozen patch order BEFORE any route is built: a 1-D integer array that is an EXACT
+    permutation of ``patch_population`` (the frozen source or pool patch set). Rejects non-1-D,
+    non-integer, duplicate, and population-mismatched orders. Returns the int64 patch-id array."""
+    arr = np.asarray(order)
+    if arr.ndim != 1:
+        raise ValueError(f"{name}: must be a 1-D array (got {arr.ndim}-D)")
+    if arr.size and not np.issubdtype(arr.dtype, np.integer):
+        raise ValueError(f"{name}: must be an integer array (got dtype {arr.dtype})")
+    ids = [int(v) for v in arr.tolist()]
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"{name}: has duplicate patch ids -- not a permutation")
+    if set(ids) != {int(p) for p in patch_population}:
+        raise ValueError(f"{name}: is not an exact permutation of its {len(set(patch_population))}-patch population")
+    return np.asarray(ids, dtype=np.int64)
+
+
+def _select_base_patches(
+    source_patches: Any, cap: int | None, seed: int, patch_domain: dict[int, str] | None = None,
+) -> set[int]:
+    """The shared source BASE POOL of WHOLE patches for a label-access cell. Uncapped (``cap`` None or
+    >= |source|), it is the entire source patch set. Capped, it is a deterministic, encoder-independent
+    (``seed`` keyed on the cell, not the model) selection of ``cap`` patches -- group-balanced across
+    source domains when a ``patch_domain`` map is given, else a plain deterministic subset. Whole
+    patches only; a patch is never partially included."""
+    patches = sorted(int(p) for p in source_patches)
+    if cap is None or cap >= len(patches):
+        return set(patches)
+    rng = np.random.default_rng(seed)
+    if patch_domain is None:
+        return {int(p) for p in rng.choice(patches, size=int(cap), replace=False).tolist()}
+    by_dom: dict[str, list[int]] = {}
+    for p in patches:
+        by_dom.setdefault(str(patch_domain.get(p, "")), []).append(p)
+    doms = sorted(by_dom)
+    doms = [doms[i] for i in rng.permutation(len(doms)).tolist()]
+    pools = {d: [by_dom[d][i] for i in rng.permutation(len(by_dom[d])).tolist()] for d in doms}
+    active = [d for d in doms if pools[d]]
+    selected: list[int] = []
+    while len(selected) < cap and active:
+        for d in list(active):
+            if len(selected) >= cap:
+                break
+            selected.append(pools[d].pop())
+            if not pools[d]:
+                active.remove(d)
+    return set(selected)
+
+
+def run_probes_segmentation_label_access(
+    rows: list[dict[str, Any]],
+    seed: int,
+    *,
+    source_patches: Any,
+    pool_patches: Any,
+    target_test_patches: Any,
+    matched_source_order: Any,
+    fixed_removal_order: Any,
+    target_order: Any,
+    counts: tuple[int, ...],
+    load_pixels: Any,
+    stream_eval: Any,
+    x_val: np.ndarray,
+    y_val: np.ndarray,
+    meta: dict[str, Any] | None = None,
+    family: str = "logistic",
+    label_budget_unit: str = "patches",
+    cap_patches: int | None = None,
+    patch_domain: dict[int, str] | None = None,
+    predictions_sink: Any = None,
+) -> None:
+    """The dense geographic label-access suite: 13 distinct fits per fully-eligible cell, each scored on
+    the SAME frozen ``target_test`` patch stream, plus the source_only complete-target diagnostic reusing
+    that fit. ``target_test`` patches NEVER enter any training set.
+
+    PATCH-FIRST: allocation/removal is resolved entirely on patch IDS first; only then are pixels
+    assembled. ``load_pixels(patch_ids) -> (x, y, groups, patch_ids)`` subsamples EACH patch
+    deterministically (keyed on the run seed + patch id, NOT the route or budget), so retained patches
+    train on IDENTICAL pixels across paired routes and MAX_DENSE_PIXELS is respected. The source base and
+    the whole target pool are each loaded ONCE and sliced by patch membership -- never reloaded per route
+    and never globally re-subsampled.
+
+    Every route initializes its probe with the RUN SEED directly (no per-budget seed), so changing ``k``
+    never injects an unrelated random draw. The three frozen orders are PATCH IDS. Calibration routing
+    mirrors the tabular suite. Counts are the ONE canonical set, in PATCH units."""
+    from evals import split_artifacts as _SA
+
+    meta = dict(meta or {})
+    eval_classes = np.arange(19, dtype=np.int64)
+    counts = tuple(int(c) for c in counts)
+
+    matched_source_order = _validate_patch_order(matched_source_order, source_patches, "matched_source_order")
+    fixed_removal_order = _validate_patch_order(fixed_removal_order, source_patches, "fixed_removal_order")
+    target_order = _validate_patch_order(target_order, pool_patches, "target_order")
+
+    test_set = {int(p) for p in target_test_patches}
+    complete_set = {int(p) for p in pool_patches} | test_set  # pool ++ test (deployment estimand)
+
+    # Shared source BASE POOL of WHOLE patches; restrict BOTH source orders to it (order preserved).
+    cap_seed = perf._cap_seed(seed, "label_access", "base", meta)
+    base_set = _select_base_patches(source_patches, cap_patches, cap_seed, patch_domain)
+    matched_in_base = [p for p in matched_source_order.tolist() if p in base_set]
+    fixed_in_base = [p for p in fixed_removal_order.tolist() if p in base_set]
+    s_all, B, P = len({int(p) for p in source_patches}), len(base_set), int(target_order.size)
+    mx = max(counts) if counts else 0
+    if P < mx or B < mx:  # NEVER clamp: every configured count must be supportable at patch level
+        raise ValueError(
+            f"dense label-access infeasible: source base B={B}, target pool P={P}, max count={mx} (cap={cap_patches})"
+        )
+    m = min(B, P)
+    cap_meta = {"probe_cap": int(cap_patches) if cap_patches is not None else 0,
+                "probe_capped": int(cap_patches is not None and int(cap_patches) < s_all),
+                "n_source_precap": int(s_all), "n_source_base": int(B)}
+    tgt = target_order.tolist()
+
+    # PATCH-FIRST pixel assembly: load the source base ONCE and the whole target pool ONCE (each patch
+    # deterministically subsampled), then slice by patch membership. Because the per-patch subsample does
+    # not depend on the co-loaded set, slicing is identical to reloading -- retained patches are paired.
+    xs_base, ys_base, _gs_base, base_pid = load_pixels(set(base_set))
+    xt_pool, yt_pool, _gt_pool, pool_pid = load_pixels({int(p) for p in pool_patches})
+
+    def _assemble(src_patches: set[int], tgt_patches: set[int]):
+        parts_x, parts_y = [], []
+        if src_patches:
+            sm = np.isin(base_pid, np.fromiter((int(p) for p in src_patches), dtype=np.int64))
+            parts_x.append(xs_base[sm])
+            parts_y.append(ys_base[sm])
+        if tgt_patches:
+            tm = np.isin(pool_pid, np.fromiter((int(p) for p in tgt_patches), dtype=np.int64))
+            parts_x.append(xt_pool[tm])
+            parts_y.append(yt_pool[tm])
+        parts_x = [a for a in parts_x if len(a)]
+        parts_y = [a for a in parts_y if len(a)]
+        if not parts_x:
+            return None, None
+        return np.concatenate(parts_x), np.concatenate(parts_y)
+
+    # (route, budget, source patch set, target patch set, tune_internal). Whole-patch sets throughout.
+    route_specs: list[tuple[str, int, set[int], set[int], bool]] = [
+        (_SA.ROUTE_SOURCE_ONLY, 0, set(base_set), set(), False),
+        *[(_SA.ROUTE_SOURCE_PLUS_TARGET, k, set(base_set), set(tgt[:k]), False) for k in counts],
+        (_SA.ROUTE_TARGET_ONLY_FULL, 0, set(), set(tgt), True),
+        (_SA.ROUTE_SOURCE_PLUS_TARGET_FULL, 0, set(base_set), set(tgt), False),
+        (_SA.ROUTE_MATCHED_SOURCE, 0, set(matched_in_base[:m]), set(), True),
+        (_SA.ROUTE_MATCHED_TARGET, 0, set(), set(tgt[:m]), True),
+        *[(_SA.ROUTE_FIXED_TOTAL_MIXED, k, set(fixed_in_base[k:]), set(tgt[:k]), False) for k in counts],
+    ]
+
+    for route, budget, src_patches, tgt_patches, tune_internal in route_specs:
+        supervision = {
+            "n_source_labels": len(src_patches), "n_target_labels": len(tgt_patches),
+            "n_total_labels": len(src_patches) + len(tgt_patches), "label_budget_unit": label_budget_unit,
+        }
+        fail_meta = {**meta, "label_access_route": route, "evaluation_split": _SA.EVAL_TARGET_TEST}
+        x_tr, y_tr = _assemble(src_patches, tgt_patches)
+        if x_tr is None:
+            perf._record_cell_failure(fail_meta, budget, "label_access", ValueError("empty training set"), extra=supervision)
+            continue
+        if tune_internal:
+            cal_x, cal_y = None, None
+        else:
+            cal_x = x_val if (x_val is not None and len(x_val)) else None
+            cal_y = y_val if cal_x is not None else None
+
+        identity = {"seed": seed, "holdout": meta.get("holdout"), "method": meta.get("method"),
+                    "budget_type": "label_access", "label_access_route": route, "label_budget": budget,
+                    "evaluation_split": _SA.EVAL_TARGET_TEST}
+        perf.set_identity(identity)
+        try:
+            with perf.measure(f"probe.label_access_seg/{meta.get('benchmark', '?')}/{route}", n_train=len(y_tr)):
+                # RUN SEED for probe init on EVERY route -- no per-budget derivation.
+                clf, probe_meta = fit_probe_multiclass(
+                    x_tr, y_tr, seed, x_val=cal_x, y_val=cal_y, family=family, tune_internal=tune_internal,
+                )
+        except ValueError as exc:
+            perf.set_identity(None)
+            perf._record_cell_failure(fail_meta, budget, "label_access", exc, extra=supervision)
+            continue
+        perf.set_identity(None)
+        row_base = {**meta, "budget_type": "label_access", "label_access_route": route, "label_budget": budget,
+                    "seed": seed, "n_train_sub": int(len(y_tr)), **supervision, **cap_meta, **probe_meta}
+
+        def _scored_row(evaluation_split: str, patch_set: set[int], _rb: dict = row_base, _clf: Any = clf) -> dict[str, Any]:
+            # ONE streamed inference pass computes metrics AND (optionally) emits per-pixel predictions.
+            # n_test stays the number of EVALUATED PIXELS (like every seg row); n_eval_patches records the
+            # PATCH count the completion validator uses to derive the realized target-pool patch count.
+            predict_sink = None
+            if predictions_sink is not None:
+                base_record = {k: _rb[k] for k in (
+                    "model", "benchmark", "method", "split_regime", "holdout", "probe_family",
+                    "label_access_route", "label_budget", "n_source_labels", "n_target_labels",
+                    "n_total_labels", "label_budget_unit", "seed",
+                ) if k in _rb}
+                base_record["budget_type"] = "label_access"
+                base_record["evaluation_split"] = evaluation_split
+
+                def predict_sink(tile_key, labels, pred, _br=base_record):
+                    patch_id, row, col = int(tile_key[0]), int(tile_key[1]), int(tile_key[2])
+                    labels = np.asarray(labels, dtype=np.int64)
+                    pred = np.asarray(pred, dtype=np.int64)
+                    # sample_id = patch:row:col:within-tile valid-pixel index -> unique per route/split
+                    predictions_sink([{
+                        **_br, "patch_id": patch_id, "tile_row": row, "tile_col": col, "pixel_index": int(i),
+                        "sample_id": f"{patch_id}:{row}:{col}:{int(i)}",
+                        "y_true": int(labels[i]), "pred": int(pred[i]),
+                    } for i in range(labels.size)])
+
+            tiles = stream_eval(set(patch_set))
+            if predict_sink is None:
+                tiles = ((f, lab) for _k, f, lab in tiles)   # scoring-only: no identity needed
+            scores = score_segmentation_streamed(_clf, tiles, eval_classes, predict_sink=predict_sink)
+            return {**_rb, "evaluation_split": evaluation_split, **scores, "n_eval_patches": len(patch_set)}
+
+        rows.append(_scored_row(_SA.EVAL_TARGET_TEST, test_set))
+        # source_only complete-target diagnostic: reuse the SAME fitted clf (NO refit) to score the whole
+        # target region (pool ++ test). One extra row, flagged complete_target so paired contrasts exclude
+        # it. Not a 14th fit; carries the source_only supervision metadata unchanged.
+        if route == _SA.ROUTE_SOURCE_ONLY:
+            rows.append(_scored_row(_SA.EVAL_COMPLETE_TARGET, complete_set))

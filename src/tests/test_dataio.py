@@ -83,6 +83,80 @@ def test_summarize_rows_ignores_legacy_rows_missing_grouping_keys() -> None:
     assert summary[0]["mean_f1"] == 1.0
 
 
+def _la_row(route, holdout, n_source, n_target, f1):
+    return {
+        "model": "raw", "split_regime": "geographic_ood", "budget_type": "label_access",
+        "label_access_route": route, "label_budget": 0, "evaluation_split": "target_test",
+        "holdout": holdout, "seed": 0, "n_source_labels": n_source, "n_target_labels": n_target,
+        "n_total_labels": n_source + n_target, "label_budget_unit": "samples", "f1": f1,
+    }
+
+
+def test_summarize_rows_aggregates_label_counts_across_varying_pool_sizes() -> None:
+    """Two holdouts with DIFFERENT full-pool sizes share one (route, budget, split) group. Keying on the
+    counts would split them into two rows; instead they aggregate into ONE with min/max/mean, and the
+    unit is preserved."""
+    rows = [
+        _la_row("target_only_full", "kenya", 0, 55, 0.8),   # kenya pool = 55
+        _la_row("target_only_full", "togo", 0, 40, 0.6),    # togo  pool = 40
+    ]
+
+    summary = ioutils.summarize_rows(
+        rows,
+        keys=["model", "split_regime", "budget_type", "label_access_route", "label_budget", "evaluation_split"],
+        metrics=["f1"],
+        count_aggregates=["n_source_labels", "n_target_labels", "n_total_labels"],
+        passthrough=["label_budget_unit"],
+    )
+
+    assert len(summary) == 1                       # equal-region aggregation is NOT fragmented
+    s = summary[0]
+    assert s["n_rows"] == 2 and s["n_holdouts"] == 2
+    assert s["min_n_target_labels"] == 40 and s["max_n_target_labels"] == 55
+    assert s["mean_n_target_labels"] == 47.5
+    assert s["min_n_total_labels"] == 40 and s["max_n_total_labels"] == 55
+    assert s["label_budget_unit"] == "samples"     # constant-within-group unit preserved
+    assert s["mean_f1"] == pytest.approx(0.7)
+
+
+def test_summarize_rows_without_count_aggregates_is_unchanged() -> None:
+    """The new params default off: a plain summary emits no min_/max_/mean_ count columns."""
+    rows = [_la_row("source_only", "kenya", 60, 0, 0.9)]
+    summary = ioutils.summarize_rows(rows, keys=["model", "split_regime"], metrics=["f1"])
+
+    assert len(summary) == 1
+    assert not any(k.startswith(("min_n_", "max_n_")) for k in summary[0])
+    assert "label_budget_unit" not in summary[0]
+
+
+def test_rewrite_jsonl_dropping_repairs_torn_tail(tmp_path) -> None:
+    """A hard crash mid-append leaves a torn final line. rewrite_jsonl_dropping repairs it (like an
+    append would) rather than choking -- the two complete rows survive."""
+    p = tmp_path / "predictions.jsonl"
+    p.write_text('{"a": 1}\n{"a": 2}\n{"a": 3')   # torn final row (no newline, truncated JSON)
+    dropped = ioutils.rewrite_jsonl_dropping(p, lambda r: False)
+
+    assert dropped == 0
+    assert [r["a"] for r in ioutils.read_jsonl(p)] == [1, 2]
+
+
+def test_rewrite_jsonl_dropping_hard_fails_on_corrupt_interior_row(tmp_path) -> None:
+    """A corrupt INTERIOR row is real data loss, never silently dropped -- it hard-fails."""
+    p = tmp_path / "predictions.jsonl"
+    p.write_text('{"a": 1}\nNOT VALID JSON\n{"a": 2}\n')
+    with pytest.raises(ValueError, match="corrupt interior JSONL row 2"):
+        ioutils.rewrite_jsonl_dropping(p, lambda r: False)
+
+
+def test_rewrite_jsonl_dropping_filters_by_predicate(tmp_path) -> None:
+    p = tmp_path / "predictions.jsonl"
+    p.write_text('{"fam": "keep"}\n{"fam": "drop"}\n{"fam": "keep"}\n')
+    dropped = ioutils.rewrite_jsonl_dropping(p, lambda r: r["fam"] == "drop")
+
+    assert dropped == 1
+    assert [r["fam"] for r in ioutils.read_jsonl(p)] == ["keep", "keep"]
+
+
 def _isolate_cache(tmp_path, monkeypatch, benchmark, digest="d" * 64):
     monkeypatch.setattr(cacheutils, "EMBEDDINGS_DIR", tmp_path / "emb")
     monkeypatch.setattr(cacheutils, "CACHE_JSON_PATH", tmp_path / "logs" / "cache.json")

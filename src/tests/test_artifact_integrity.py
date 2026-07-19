@@ -968,7 +968,7 @@ def test_dense_pair_consumes_official_zero_shot_end_to_end(monkeypatch, tmp_path
     assert ok, problems
 
 
-def _run_dense_geographic(monkeypatch, tmp_path):
+def _run_dense_geographic(monkeypatch, tmp_path, *, write_predictions=False, probe_cap=None):
     from evals import split_artifacts as SA
     from evals import split_spec
     from evals.benchmarks import pastis as pastis_mod
@@ -978,18 +978,21 @@ def _run_dense_geographic(monkeypatch, tmp_path):
     tiles = list(split_spec.PASTIS.geographic_targets)  # 4 Sentinel tiles rotate as LODO targets
     centers = {t: (45.0 + 3 * i, -1.0 + 3 * i) for i, t in enumerate(tiles)}  # tiles spatially separate
     rng = np.random.default_rng(0)
+    # 64 patches per tile: when a tile is the LODO target its 80% pool (51 patches) clears the label-
+    # access feasibility floor max(LABEL_ACCESS_COUNTS)=50, and the 3-tile source (~152 train patches)
+    # clears it too, so the full 13-route PATCH suite fires for every tile.
     patches, pid = [], 100
     for tile in tiles:
         la, lo = centers[tile]
-        for k in range(6):  # 6 patches per tile
+        for k in range(64):
             fold = (pid % 5) + 1
             d = tmp_path / "emb" / f"fold_{fold}"
             d.mkdir(parents=True, exist_ok=True)
-            y = np.tile(np.arange(3), 11)[:30].astype(np.int64)
-            x = (rng.normal(size=(30, 5)) + y[:, None] * 1.5).astype(np.float32)
+            y = np.tile(np.arange(3), 5)[:15].astype(np.int64)
+            x = (rng.normal(size=(15, 5)) + y[:, None] * 1.5).astype(np.float32)
             np.save(d / f"{pid}_0_0.npy", x)
             np.save(d / f"{pid}_0_0.labels.npy", y)
-            patches.append(SimpleNamespace(patch_id=pid, fold=fold, tile=tile, latlon=(la + k * 0.01, lo + k * 0.01)))
+            patches.append(SimpleNamespace(patch_id=pid, fold=fold, tile=tile, latlon=(la + k * 0.005, lo + k * 0.005)))
             pid += 1
     emb_dir = tmp_path / "emb"
     all_pids = [p.patch_id for p in patches]
@@ -1001,8 +1004,10 @@ def _run_dense_geographic(monkeypatch, tmp_path):
         patch_latlon={p.patch_id: p.latlon for p in patches},
     )
     # publish ALL tile-LODO leaves via the real generator, so the pair consumes canonical artifacts
+    from evals.regimes import random_id as rid
+
     domain_of = {int(k): str(v) for k, v in geo.patch_domains(bench, pastis_mod).items()}
-    labels, built = [], []
+    labels, built, la_specs = [], [], []
     for dsplit in geo.iter_dense_source_target_splits(bench, pastis_mod, 0):
         rows, summary = SA.build_dense_leaf(
             "pastis", "geographic_ood", 0, dense_split=dsplit, audit_events=[],
@@ -1011,7 +1016,26 @@ def _run_dense_geographic(monkeypatch, tmp_path):
         )
         built.append((rows, summary))
         labels.append(dsplit.label)
+        if dsplit.supports_target_labels:  # geographic_ood headline target: also carries label_access.csv
+            la_specs.append((
+                str(dsplit.label),
+                [str(int(p)) for p in sorted(dsplit.source_train_patches)],
+                [str(int(p)) for p in sorted(dsplit.target_label_pool_patches)],
+                [str(int(p)) for p in sorted(dsplit.target_test_patches)],
+            ))
+    # random_id (random_patch) source-only leaf -> the Stage-5 source_ID_reference anchor.
+    rid_domain = {int(k): str(v) for k, v in rid.patch_domains(bench, pastis_mod).items()}
+    rsplit = next(iter(rid.iter_dense_source_target_splits(bench, pastis_mod, 0)))
+    rid_rows, rid_summary = SA.build_dense_leaf(
+        "pastis", "random_id", 0, dense_split=rsplit, audit_events=[], all_patch_ids=all_pids,
+        domain_of=rid_domain, class_sets={int(p): {0, 1, 2} for p in all_pids},
+        patch_latlon=dict(bench.patch_latlon), purge_km=0.0,
+    )
+    built.append((rid_rows, rid_summary))
     splitfix.freeze(tmp_path / "splits", built)
+    for label, src_ids, pool_ids, test_ids in la_specs:  # frozen patch-id orders, sibling of assignments.csv
+        la_rows = SA.build_label_access_rows(seed=0, source_ids=src_ids, target_pool_ids=pool_ids, target_test_ids=test_ids)
+        SA.write_label_access(tmp_path / "splits", "pastis", 0, label, la_rows)
 
     monkeypatch.setattr(RS.cacheutils, "SCRATCH", tmp_path)
     monkeypatch.setattr(RS.cacheutils, "OUTPUT_DIR", tmp_path / "out")
@@ -1019,28 +1043,129 @@ def _run_dense_geographic(monkeypatch, tmp_path):
     monkeypatch.setattr(RS.cacheutils, "require_dense_cache", lambda *a, **k: emb_dir)
     monkeypatch.setattr(RS, "build_run_manifest", lambda *a, **k: _STUB_MANIFEST)
     monkeypatch.setattr(artifacts, "capture_environment", lambda repo=None: _env(sklearn="1.9.0"))
+    if probe_cap is not None:
+        monkeypatch.setattr(RS.perf, "PROBE_CAP", probe_cap)   # exercised through the real dense dispatch
 
     RS._run_segmentation_pair(
-        "pastis", "raw", [0], 10_000, ["geographic_ood"], ["probing"], ["logistic"],
-        {"source": [1.0], "target": [0]}, False, False, True, False, {},
+        "pastis", "raw", [0], 10_000, ["random_id", "geographic_ood"], ["probing"], ["logistic"],
+        {"source": [1.0], "target": [0]}, False, False, True, write_predictions, {},
     )
     return tmp_path / "out" / "results" / "raw" / "pastis", tiles
 
 
 def test_dense_pair_consumes_geographic_tile_lodo_few_shot_end_to_end(monkeypatch, tmp_path) -> None:
-    """geographic_ood dense (has_target=True, supports_target_labels=True): tile-LODO, the pair
-    schedules real cells, the source budgets evaluate zero-shot on target_test AND the target budgets
-    draw few-shot ONLY from target_label_pool patches (scored on the same target_test), and completes."""
+    """geographic_ood dense (has_target=True, supports_target_labels=True): tile-LODO, the pair runs the
+    PATCH-level 13-route label-access suite (replacing the legacy target sweep) alongside the zero-shot
+    source sweep, scoring every route on the frozen target_test patches, and completes -- which means the
+    patch-level semantic validation inside write_run_complete passed."""
+    from evals import split_artifacts as SA
+
     results_dir, tiles = _run_dense_geographic(monkeypatch, tmp_path)
     rows = IOU.read_jsonl(results_dir / "probe_results.jsonl")
 
-    assert rows and {r["split_regime"] for r in rows} == {"geographic_ood"}
-    assert {r["holdout"] for r in rows} == {str(t) for t in tiles}     # one fold per Sentinel tile
-    assert {r["budget_type"] for r in rows} == {"source", "target"}    # zero-shot source + few-shot target
+    # a real label-access run also runs random_id (the source_ID_reference anchor); scope the geographic
+    # assertions to its rows.
+    assert {r["split_regime"] for r in rows} == {"geographic_ood", "random_id"}
+    geo_rows = [r for r in rows if r["split_regime"] == "geographic_ood"]
+    assert {r["holdout"] for r in geo_rows} == {str(t) for t in tiles}     # one fold per Sentinel tile
+    # the label-access suite REPLACES the legacy target sweep -- source sweep + label_access, no "target".
+    assert {r["budget_type"] for r in geo_rows} == {"source", "label_access"}
+    assert not [r for r in rows if r["budget_type"] == "target"]
+
+    la = [r for r in geo_rows if r["budget_type"] == "label_access"]
+    assert la and {r["label_budget_unit"] for r in la} == {"patches"}   # dense unit is PATCHES
+    for tile in tiles:
+        tla = [r for r in la if r["holdout"] == str(tile)]
+        assert {(r["label_access_route"], r["label_budget"], r["evaluation_split"]) for r in tla} == set(
+            SA.label_access_expected_rows()
+        )  # exactly the 13 routes on target_test + the source_only complete-target diagnostic
+        tt = [r for r in tla if r["evaluation_split"] == SA.EVAL_TARGET_TEST]
+        diag = [r for r in tla if r["evaluation_split"] == SA.EVAL_COMPLETE_TARGET]
+        assert len(tt) == 13 and len(diag) == 1
+        # patch-level accounting: every route scored on the SAME frozen target_test patch count; the
+        # diagnostic on the whole region (pool + test), so its n_test is strictly larger.
+        assert len({r["n_test"] for r in tt}) == 1
+        assert diag[0]["n_test"] > tt[0]["n_test"]
+        assert diag[0]["label_access_route"] == SA.ROUTE_SOURCE_ONLY
+
     ok, problems = artifacts.validate_run_complete(
         results_dir, expected_signature=runstate.run_manifest_digest(_STUB_MANIFEST)
     )
     assert ok, problems
+
+
+def test_dense_geographic_dispatch_honors_probe_cap(monkeypatch, tmp_path) -> None:
+    """The PRODUCTION dense dispatch threads the effective PROBE_CAP as cap_patches: with a non-None cap
+    the label-access base pool is restricted to exactly that many WHOLE source patches, and the pair
+    still completes (the patch-level semantic validation passes at the capped base)."""
+    from evals import split_artifacts as SA
+
+    results_dir, _tiles = _run_dense_geographic(monkeypatch, tmp_path, probe_cap=60)
+    rows = IOU.read_jsonl(results_dir / "probe_results.jsonl")
+    la = [r for r in rows if r["budget_type"] == "label_access"]
+    assert la
+    assert {r["n_source_base"] for r in la} == {60}      # base restricted to the cap
+    assert {r["probe_cap"] for r in la} == {60} and {r["probe_capped"] for r in la} == {1}
+    # matched routes now train on min(B=60, P) patches -- the accounting stays consistent, so the run
+    # published (write_run_complete's patch-level validation did not reject it).
+    ms = [r for r in la if r["label_access_route"] == SA.ROUTE_MATCHED_SOURCE]
+    assert ms and all(r["n_source_base"] == 60 for r in ms)
+    ok, problems = artifacts.validate_run_complete(
+        results_dir, expected_signature=runstate.run_manifest_digest(_STUB_MANIFEST)
+    )
+    assert ok, problems
+
+
+def test_dense_geographic_streams_predictions_with_identity(monkeypatch, tmp_path) -> None:
+    """With WRITE_PREDICTIONS on, the dense label-access suite streams per-pixel predictions to
+    predictions.jsonl through the real pair, each record carrying stable patch/pixel identity, route,
+    evaluation split, budget, seed, and patch-level supervision counts."""
+    from evals import split_artifacts as SA
+
+    results_dir, tiles = _run_dense_geographic(monkeypatch, tmp_path, write_predictions=True)
+    preds_path = results_dir / "predictions.jsonl"
+    assert preds_path.exists()
+    preds = IOU.read_jsonl(preds_path)
+    assert preds
+    required = {"patch_id", "tile_row", "tile_col", "pixel_index", "sample_id", "label_access_route",
+                "evaluation_split", "label_budget", "seed", "budget_type", "n_source_labels",
+                "n_target_labels", "n_total_labels", "label_budget_unit"}
+    sample = preds[0]
+    assert required <= set(sample)
+    assert sample["sample_id"] == f'{sample["patch_id"]}:{sample["tile_row"]}:{sample["tile_col"]}:{sample["pixel_index"]}'
+    assert {p["label_budget_unit"] for p in preds} == {"patches"}
+    assert {p["holdout"] for p in preds} == {str(t) for t in tiles}
+    # every canonical route appears in the streamed predictions, plus the source_only diagnostic
+    assert {p["label_access_route"] for p in preds} == set(SA.LABEL_ACCESS_ROUTES)
+    assert SA.EVAL_COMPLETE_TARGET in {p["evaluation_split"] for p in preds}
+
+
+def test_dense_prediction_resume_is_transactional(monkeypatch, tmp_path) -> None:
+    """Crash-window: a family appended predictions but its result rows never published. On resume the
+    pair keeps ONLY the predictions of fully-done families, so the orphan family's records are dropped
+    and re-running cannot duplicate them."""
+    from utils import runstate as RS
+
+    results_dir, _tiles = _run_dense_geographic(monkeypatch, tmp_path, write_predictions=True)
+    preds_path = results_dir / "predictions.jsonl"
+    original = IOU.read_jsonl(preds_path)
+    assert original
+    # Simulate the crash window: predictions for a family whose result rows never landed (holdout GHOST,
+    # so its _fam_key is not among the done families reconstructed from probe_results.jsonl).
+    orphan = {**original[0], "holdout": "GHOST", "patch_id": -1, "tile_row": 0, "tile_col": 0,
+              "pixel_index": 0, "sample_id": "-1:0:0:0"}
+    IOU.append_jsonl(preds_path, [orphan])
+    assert any(p.get("holdout") == "GHOST" for p in IOU.read_jsonl(preds_path))
+
+    # Resume the SAME pair (monkeypatches still active). All real families are done -> no jobs run, but
+    # the orphan's predictions are pruned, and the real predictions are neither dropped nor duplicated.
+    RS._run_segmentation_pair(
+        "pastis", "raw", [0], 10_000, ["random_id", "geographic_ood"], ["probing"], ["logistic"],
+        {"source": [1.0], "target": [0]}, False, False, True, True, {},
+    )
+    after = IOU.read_jsonl(preds_path)
+    assert not any(p.get("holdout") == "GHOST" for p in after)
+    assert len(after) == len(original)   # real predictions intact, no duplication
 
 
 # --- the HEALTHY tabular path: consume published splits end-to-end -----------------------
@@ -1230,12 +1355,15 @@ def test_tabular_pair_consumes_official_zero_shot_end_to_end(monkeypatch, tmp_pa
     assert SA.assignments_path(tmp_path / "splits", "cropharvest", "official", 0, labels[0]).is_file()
 
 
-# --- the HEALTHY GEOGRAPHIC path: source zero-shot + target few-shot from target_label_pool -------
+# --- the HEALTHY GEOGRAPHIC path: source zero-shot + the 13-route label-access suite --------------
 #
-# geographic_ood is has_target=True / supports_target_labels=True: the source budgets evaluate
-# zero-shot on target_test, AND the target budgets draw few-shot labels ONLY from target_label_pool
-# and are scored on the SAME target_test. This proves the runtime routes that capability end to end,
-# and that target_test is invariant across the label-budget arms.
+# geographic_ood is has_target=True / supports_target_labels=True and is the label-access HEADLINE
+# regime: the source budgets evaluate zero-shot on target_test, AND the frozen label_access.csv drives
+# the 13 label-access routes (source_only / source_plus_target(k) / target_only_full /
+# source_plus_target_full / matched_source / matched_target / fixed_total_mixed(k)), each scored on the
+# SAME frozen target_test, plus the single source_only complete-target diagnostic. This suite REPLACES
+# the old target-budget sweep. The test proves the runtime routes that capability end to end and that
+# target_test is invariant across every route.
 
 
 def _ch_geo_bench(per=40):
@@ -1260,15 +1388,33 @@ def _publish_geographic_kenya_split(splits_root, bench, *, seed=0):
     from evals import split_artifacts as SA
     from evals.benchmarks import cropharvest as ch
     from evals.regimes import geographic_ood as geo
+    from evals.regimes import random_id as rid
 
     y, _g = ch.make_targets(bench)
     domains = geo.sample_domains(bench, ch)
     split = next(s for s in geo.iter_source_target_splits(bench, ch, seed) if s.label == "kenya")
-    rows, summary = SA.build_tabular_leaf(
+    geo_rows, geo_summary = SA.build_tabular_leaf(
         "cropharvest", "geographic_ood", seed, split=split, domains=domains, labels=y,
         sample_ids=bench.sample_ids, audit_events=[], purge_km=50.0,
     )
-    splitfix.freeze(splits_root, [(rows, summary)])
+    # A real label-access run also publishes random_id -- its full-source in-distribution result is the
+    # Stage-5 source_ID_reference anchor. Publish it alongside so the contrasts resolve.
+    rsplit = next(iter(rid.iter_source_target_splits(bench, ch, seed)))
+    rid_rows, rid_summary = SA.build_tabular_leaf(
+        "cropharvest", "random_id", seed, split=rsplit, domains=rid.sample_domains(bench, ch), labels=y,
+        sample_ids=bench.sample_ids, audit_events=[], purge_km=0.0,
+    )
+    splitfix.freeze(splits_root, [(geo_rows, geo_summary), (rid_rows, rid_summary)])
+    # The geographic_ood headline target also carries a frozen label_access.csv sibling (built from the
+    # SAME source_train / target_label_pool / target_test the runtime loads), exactly as the generator does.
+    sids = [str(s) for s in np.asarray(bench.sample_ids).tolist()]
+    la_rows = SA.build_label_access_rows(
+        seed=seed,
+        source_ids=[sids[int(i)] for i in split.source_train],
+        target_pool_ids=[sids[int(i)] for i in split.target_label_pool],
+        target_test_ids=[sids[int(i)] for i in split.target_test],
+    )
+    SA.write_label_access(splits_root, "cropharvest", seed, str(split.label), la_rows)
     return split
 
 
@@ -1276,7 +1422,9 @@ def test_tabular_pair_consumes_geographic_few_shot_end_to_end(monkeypatch, tmp_p
     import main
     from evals.benchmarks import cropharvest as ch
 
-    bench = _ch_geo_bench()
+    # per=70: kenya's 80% target_label_pool (56) and the 3-region source_train (168) both clear the
+    # label-access feasibility floor (>= max(LABEL_ACCESS_COUNTS)=50), so the full 13-route suite fires.
+    bench = _ch_geo_bench(per=70)
     split = _publish_geographic_kenya_split(tmp_path / "splits", bench, seed=0)
 
     y, _g = ch.make_targets(bench)
@@ -1291,36 +1439,75 @@ def test_tabular_pair_consumes_geographic_few_shot_end_to_end(monkeypatch, tmp_p
     monkeypatch.setattr(main.compat, "input_modalities", lambda _m: {"s2"})
     monkeypatch.setattr(artifacts, "capture_environment", lambda repo=None: _env(sklearn="1.9.0"))
 
+    # A real label-access run also runs random_id (the source_ID_reference anchor for Stage-5 contrasts).
     main._run_tabular_pair(
-        "cropharvest", "raw", [0], 0, ["geographic_ood"], ["probing"], ["logistic"],
+        "cropharvest", "raw", [0], 0, ["random_id", "geographic_ood"], ["probing"], ["logistic"],
         {"source": [1.0], "target": [0, 5]}, False, False, False, {},
     )
     results_dir = tmp_path / "out" / "results" / "raw" / "cropharvest"
     rows = IOU.read_jsonl(results_dir / "probe_results.jsonl")
 
-    assert rows and {r["split_regime"] for r in rows} == {"geographic_ood"}
-    assert {r["holdout"] for r in rows} == {"kenya"}
-    # BOTH routes fire: source budgets (zero-shot on target_test) AND target budgets (few-shot).
-    assert {r["budget_type"] for r in rows} == {"source", "target"}
-    target_rows = [r for r in rows if r["budget_type"] == "target"]
-    assert {r["label_budget"] for r in target_rows} == {0, 5}   # the zero-shot + few-shot arms
+    from evals import contrasts
+    from evals import split_artifacts as SA
 
-    # target-test INVARIANCE across label arms: every held_out evaluation is scored on the SAME fixed
-    # target_test (its size never changes with the budget), and that size is exactly |target_test|.
-    held_out = [r for r in target_rows if r["evaluation_split"] == "held_out"]
-    assert held_out
-    assert {r["n_test"] for r in held_out} == {len(split.target_test)}
-    # the budget-0 "full" anchor is scored on the WHOLE target region (pool + test)
-    full = [r for r in target_rows if r["evaluation_split"] == "full"]
-    assert full and {r["n_test"] for r in full} == {len(split.target_label_pool) + len(split.target_test)}
+    assert {r["split_regime"] for r in rows} == {"geographic_ood", "random_id"}
+    geo_rows = [r for r in rows if r["split_regime"] == "geographic_ood"]
+    assert {r["holdout"] for r in geo_rows} == {"kenya"}
+    # geographic_ood headline runs the 13-route LABEL-ACCESS suite (which REPLACES the old target-budget
+    # sweep -- no legacy budget_type="target" rows) alongside the unchanged source-budget sweep.
+    assert {r["budget_type"] for r in geo_rows} == {"source", "label_access"}
+    assert not [r for r in rows if r["budget_type"] == "target"]
+
+    la = [r for r in geo_rows if r["budget_type"] == "label_access"]
+    tt = [r for r in la if r["evaluation_split"] == SA.EVAL_TARGET_TEST]
+    diag = [r for r in la if r["evaluation_split"] == SA.EVAL_COMPLETE_TARGET]
+    # 13 route fits scored on target_test + exactly ONE source_only complete-target diagnostic.
+    assert len(tt) == 13 and len(diag) == 1
+    assert {(r["label_access_route"], r["label_budget"], r["evaluation_split"]) for r in la} == set(
+        SA.label_access_expected_rows()
+    )
+    # target-test INVARIANCE: every one of the 13 routes is scored on the SAME frozen target_test.
+    assert {r["n_test"] for r in tt} == {len(split.target_test)}
+    # the diagnostic reuses the source_only fit and is scored on the WHOLE target region (pool + test).
+    assert diag[0]["label_access_route"] == SA.ROUTE_SOURCE_ONLY
+    assert diag[0]["n_test"] == len(split.target_label_pool) + len(split.target_test)
+
+    # label accounting per route: source_only uses all S source labels + 0 target; source_plus_target(k)
+    # totals S+k; fixed_total_mixed(k) holds the TOTAL fixed at S (drops k source, adds k target).
+    S = len(split.source_train)
+    by = {(r["label_access_route"], r["label_budget"]): r for r in tt}
+    assert by[(SA.ROUTE_SOURCE_ONLY, 0)]["n_source_labels"] == S
+    assert by[(SA.ROUTE_SOURCE_ONLY, 0)]["n_target_labels"] == 0
+    for k in SA.LABEL_ACCESS_COUNTS:
+        assert by[(SA.ROUTE_SOURCE_PLUS_TARGET, k)]["n_total_labels"] == S + k
+        assert by[(SA.ROUTE_FIXED_TOTAL_MIXED, k)]["n_total_labels"] == S
+        assert by[(SA.ROUTE_FIXED_TOTAL_MIXED, k)]["n_target_labels"] == k
+    # target_only_full trains on the pool alone (no source); source_plus_target_full uses S + whole pool.
+    assert by[(SA.ROUTE_TARGET_ONLY_FULL, 0)]["n_source_labels"] == 0
+    assert by[(SA.ROUTE_TARGET_ONLY_FULL, 0)]["n_target_labels"] == len(split.target_label_pool)
+    assert by[(SA.ROUTE_SOURCE_PLUS_TARGET_FULL, 0)]["n_total_labels"] == S + len(split.target_label_pool)
+
     # the source budgets evaluate zero-shot on the same fixed target_test ("test" scope), AND report
     # the untouched within-source reference on the manifest source_test partition ("source_test" scope).
-    source_test_eval = [r for r in rows if r["budget_type"] == "source" and r["evaluation_split"] == "test"]
+    source_test_eval = [r for r in geo_rows if r["budget_type"] == "source" and r["evaluation_split"] == "test"]
     assert source_test_eval and {r["n_test"] for r in source_test_eval} == {len(split.target_test)}
-    within_source = [r for r in rows if r["budget_type"] == "source" and r["evaluation_split"] == "source_test"]
+    within_source = [r for r in geo_rows if r["budget_type"] == "source" and r["evaluation_split"] == "source_test"]
     assert within_source and {r["n_test"] for r in within_source} == {len(split.source_test)}
-    # every row carries the machine-readable headline role
-    assert {r["target_role"] for r in rows} == {"headline"}
+    # non-label-access rows carry the empty route identity; every geographic row carries the headline role.
+    assert all(r["label_access_route"] == "" for r in geo_rows if r["budget_type"] == "source")
+    assert {r["target_role"] for r in geo_rows} == {"headline"}
+
+    # Stage 5: the paired-contrast artifacts were written and the run COMPLETED (run_complete.json only
+    # exists if write_run_complete's recompute-and-compare passed), with the anchor resolved from the
+    # random_id full-source result and the artifact hashes recorded in the marker.
+    assert (results_dir / contrasts.CONTRAST_FILE).exists()
+    assert (results_dir / contrasts.CONTRAST_SUMMARY_FILE).exists()
+    marker = artifacts.read_run_complete(results_dir)
+    assert marker is not None
+    assert contrasts.CONTRAST_FILE in marker["artifacts"] and contrasts.CONTRAST_SUMMARY_FILE in marker["artifacts"]
+    paired, _summary = contrasts.compute_contrasts(rows)
+    assert {r["contrast"] for r in paired} == {c[0] for c in SA.LABEL_ACCESS_CONTRASTS}
+    assert {r["target"] for r in paired} == {"kenya"}
 
 
 # --- dirty-tree identity is content-sensitive --------------------------------
@@ -1413,8 +1600,8 @@ def test_identity_is_null_but_honest_without_a_git_repo(tmp_path) -> None:
 
 
 def _key(seed=0, regime="geographic_ood", holdout="kenya", method="erm", family="logistic",
-         bt="source", lb=1.0, es="test"):
-    return (seed, regime, holdout, method, family, bt, lb, es)
+         bt="source", lb=1.0, es="test", route=""):
+    return (seed, regime, holdout, method, family, bt, lb, es, route)
 
 
 def _row(**over):

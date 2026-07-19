@@ -69,11 +69,12 @@ REQUIRED_ARTIFACTS = (
     # the seeds/regimes consumed, and the central log's checksums pin the split contents.
 )
 
-#: The identity of one evaluation cell. Identical for the tabular and dense paths -- both write
-#: these eight fields on every row -- so completeness is checkable the same way for both.
+#: The identity of one evaluation cell. Identical for the tabular and dense paths so completeness is
+#: checkable the same way for both. ``label_access_route`` (9th) distinguishes the geographic label-
+#: access routes; every non-label-access row uses the unambiguous empty default "" (see ``cell_key``).
 CELL_KEY_FIELDS = (
     "seed", "split_regime", "holdout", "method",
-    "probe_family", "budget_type", "label_budget", "evaluation_split",
+    "probe_family", "budget_type", "label_budget", "evaluation_split", "label_access_route",
 )
 
 
@@ -91,7 +92,9 @@ class EnvironmentProvenanceError(RuntimeError):
 
 
 def cell_key(row: dict[str, Any]) -> tuple:
-    return tuple(row.get(k) for k in CELL_KEY_FIELDS)
+    # label_access_route defaults to "" so a non-label-access row (which never sets it) keys the same
+    # as an explicit empty route; the other eight fields are always written, so keep them strict.
+    return tuple(row.get(k, "") if k == "label_access_route" else row.get(k) for k in CELL_KEY_FIELDS)
 
 
 def sha256_file(path: Path | str) -> str | None:
@@ -523,10 +526,181 @@ def completeness(expected_keys: set[tuple], rows: list[dict[str, Any]]) -> dict[
     }
 
 
+def _validate_label_access_semantics(rows: list[dict[str, Any]]) -> list[str]:
+    """Semantic integrity of the label-access result rows, BEYOND 9-field cell-key completeness.
+
+    The cell key certifies that every planned (route, budget, split) row is present; it says nothing
+    about whether the supervision COUNTS on those rows are internally consistent. A tampered count or
+    unit keeps the key intact, so completeness() passes and a corrupt table would publish. This
+    cross-checks the per-route accounting within each cell and returns human-readable problems (empty
+    when consistent). It only inspects rows that ARE present -- completeness() owns missing rows.
+
+    Every count and every consumed n_test is a STRICT nonnegative integer: booleans, non-integral floats
+    (e.g. 60.5), non-numeric, and negatives are rejected outright -- never silently ``int()``-coerced.
+
+    Per cell (seed, split_regime, holdout, method, probe_family): every row balances
+    (n_total == n_source + n_target) and carries the tabular unit; source_only trains on 0 target. The
+    REALIZED target-pool size ``P = complete_target.n_test - target_test.n_test`` (>= 0) anchors the
+    absolute checks: target_only_full and source_plus_target_full each train on exactly ``P`` target
+    labels; matched_source and matched_target each train on exactly ``min(B, P)`` (and on nothing from
+    the other domain). The additive route totals ``B_src + k``; the fixed-total route holds the total
+    invariant at ``B_tot``; and the source_only complete-target diagnostic agrees with the source_only
+    fit exactly.
+    """
+    from evals import split_artifacts as _SA
+
+    la = [r for r in rows if r.get("budget_type") == "label_access"]
+    if not la:
+        return []
+    count_fields = ("n_source_labels", "n_target_labels", "n_total_labels")
+    cell_fields = ("seed", "split_regime", "holdout", "method", "probe_family")
+
+    def _strict_int(row: dict[str, Any] | None, field: str) -> tuple[int | None, str | None]:
+        """The field as a STRICT nonnegative int, or ``(None, reason)``. Never silently ``int()``-
+        coerces: rejects missing, booleans (``bool`` is an ``int`` subclass), non-integral floats,
+        non-numeric values, and negatives."""
+        if row is None:
+            return None, None
+        v = row.get(field)
+        if v is None:
+            return None, f"{field} is missing"
+        if isinstance(v, bool):
+            return None, f"{field}={v!r} is a boolean, not an integer"
+        if isinstance(v, int):
+            iv = v
+        elif isinstance(v, float) and v.is_integer():
+            iv = int(v)
+        else:
+            return None, f"{field}={v!r} is not an integer"
+        if iv < 0:
+            return None, f"{field}={v!r} is negative"
+        return iv, None
+
+    def _budget_key(v: Any) -> Any:
+        if isinstance(v, bool) or not isinstance(v, float):
+            return v
+        return int(v) if v.is_integer() else v
+
+    cells: dict[tuple, dict[tuple, dict]] = {}
+    for r in la:
+        cell = tuple(r.get(f) for f in cell_fields)
+        rk = (r.get("label_access_route"), _budget_key(r.get("label_budget")), r.get("evaluation_split"))
+        cells.setdefault(cell, {})[rk] = r
+
+    problems: list[str] = []
+    for cell, by in cells.items():
+        tag = "/".join(str(x) for x in cell)
+        # The expected unit is the BENCHMARK's, resolved from the cell's own rows (every row in a cell
+        # shares one benchmark): "patches" for dense PASTIS, "samples" for tabular -- never hardcoded.
+        unit = _SA.label_access_unit(next(iter(by.values())).get("benchmark"))
+
+        def _req(cond: bool, msg: str, _tag: str = tag) -> None:
+            if not cond:
+                problems.append(f"{_tag}: {msg}")
+
+        def _req_eq(a: Any, b: Any, msg: str, _tag: str = tag) -> None:
+            # Report a genuine mismatch, but stay silent when either side is None: an absent/invalid
+            # field (or an underivable P) was already reported, so this avoids a duplicate complaint.
+            if a is not None and b is not None and a != b:
+                problems.append(f"{_tag}: {msg}")
+
+        def _field(row: dict[str, Any] | None, field: str, where: str, _tag: str = tag) -> int | None:
+            iv, err = _strict_int(row, field)
+            if err is not None:
+                problems.append(f"{_tag}: {where}: {err}")
+            return iv
+
+        # Row-local: strictly parse every supervision count, then balance + unit on EVERY row.
+        norm: dict[tuple, dict[str, int | None]] = {}
+        for (route, budget, es), r in by.items():
+            where = f"{route}@{budget}/{es}"
+            vals = {f: _field(r, f, where) for f in count_fields}
+            norm[(route, budget, es)] = vals
+            ns, nt, ntot = vals["n_source_labels"], vals["n_target_labels"], vals["n_total_labels"]
+            if None not in (ns, nt, ntot):
+                _req(ntot == ns + nt, f"{where}: n_total {ntot} != n_source {ns} + n_target {nt}")
+            _req(r.get("label_budget_unit") == unit,
+                 f"{where}: unit {r.get('label_budget_unit')!r} != {unit!r}")
+
+        so_key = (_SA.ROUTE_SOURCE_ONLY, 0, _SA.EVAL_TARGET_TEST)
+        diag_key = (_SA.ROUTE_SOURCE_ONLY, 0, _SA.EVAL_COMPLETE_TARGET)
+        so = by.get(so_key)
+        if so is None:
+            continue  # anchor absent -> completeness() blocks the run; every cross-check below needs it
+        b_src, b_tot = norm[so_key]["n_source_labels"], norm[so_key]["n_total_labels"]
+        _req_eq(norm[so_key]["n_target_labels"], 0, "source_only: n_target != 0")
+
+        # Realized target-pool size P from the source_only rows' evaluated-UNIT counts. The field is
+        # unit-appropriate: tabular counts evaluated SAMPLES via n_test (which equals the unit), dense
+        # counts evaluated PATCHES via the explicit n_eval_patches (n_test there is pixels, a different
+        # unit). So the derived P is always in the SAME unit as the supervision counts it is checked against.
+        eval_field = "n_eval_patches" if unit == _SA.LABEL_ACCESS_DENSE_UNIT else "n_test"
+        diag = by.get(diag_key)
+        so_eval = _field(so, eval_field, "source_only/target_test")
+        diag_eval = _field(diag, eval_field, "source_only/complete_target") if diag is not None else None
+        pool_p: int | None = None
+        if so_eval is not None and diag_eval is not None:
+            pool_p = diag_eval - so_eval
+            if pool_p < 0:
+                _req(False, f"realized target pool P = complete_target.{eval_field} {diag_eval} - "
+                            f"target_test.{eval_field} {so_eval} is negative")
+                pool_p = None  # a bogus P must not propagate into the absolute checks below
+
+        for k in _SA.LABEL_ACCESS_COUNTS:
+            spt = norm.get((_SA.ROUTE_SOURCE_PLUS_TARGET, k, _SA.EVAL_TARGET_TEST))
+            if spt is not None:  # additive: same source base, +k target, total B_src + k
+                _req_eq(spt["n_source_labels"], b_src, f"source_plus_target@{k}: n_source != source_only base {b_src}")
+                _req_eq(spt["n_target_labels"], k, f"source_plus_target@{k}: n_target != {k}")
+                if b_src is not None:
+                    _req_eq(spt["n_total_labels"], b_src + k, f"source_plus_target@{k}: n_total != B_src+{k}")
+            ftm = norm.get((_SA.ROUTE_FIXED_TOTAL_MIXED, k, _SA.EVAL_TARGET_TEST))
+            if ftm is not None:  # fixed-total invariance: k target replaces k source, total unchanged
+                _req_eq(ftm["n_target_labels"], k, f"fixed_total_mixed@{k}: n_target != {k}")
+                _req_eq(ftm["n_total_labels"], b_tot, f"fixed_total_mixed@{k}: n_total != source_only total {b_tot}")
+
+        ms = norm.get((_SA.ROUTE_MATCHED_SOURCE, 0, _SA.EVAL_TARGET_TEST))
+        mt = norm.get((_SA.ROUTE_MATCHED_TARGET, 0, _SA.EVAL_TARGET_TEST))
+        if ms is not None:
+            _req_eq(ms["n_target_labels"], 0, "matched_source: trains on target labels")
+        if mt is not None:
+            _req_eq(mt["n_source_labels"], 0, "matched_target: trains on source labels")
+        ms_tot = ms["n_total_labels"] if ms is not None else None
+        mt_tot = mt["n_total_labels"] if mt is not None else None
+        _req_eq(ms_tot, mt_tot, f"matched sizes differ: source {ms_tot} != target {mt_tot}")
+        if b_src is not None and pool_p is not None:  # each matched route trains on exactly min(B, P)
+            m = min(b_src, pool_p)
+            _req_eq(ms_tot, m, f"matched_source size {ms_tot} != min(B={b_src}, P={pool_p})={m}")
+            _req_eq(mt_tot, m, f"matched_target size {mt_tot} != min(B={b_src}, P={pool_p})={m}")
+
+        tof = norm.get((_SA.ROUTE_TARGET_ONLY_FULL, 0, _SA.EVAL_TARGET_TEST))
+        if tof is not None:  # the WHOLE realized pool P, no source
+            _req_eq(tof["n_source_labels"], 0, "target_only_full: trains on source labels")
+            _req_eq(tof["n_target_labels"], pool_p, f"target_only_full: n_target != realized target pool P={pool_p}")
+        sptf = norm.get((_SA.ROUTE_SOURCE_PLUS_TARGET_FULL, 0, _SA.EVAL_TARGET_TEST))
+        if sptf is not None:  # all source + the WHOLE realized pool P
+            _req_eq(sptf["n_source_labels"], b_src, f"source_plus_target_full: n_source != source_only base {b_src}")
+            _req_eq(sptf["n_target_labels"], pool_p, f"source_plus_target_full: n_target != realized target pool P={pool_p}")
+
+        if diag is not None:  # the diagnostic scores the source_only fit; its supervision must agree
+            d = norm[diag_key]
+            _req_eq(d["n_source_labels"], b_src, f"source_only diagnostic n_source != source_only fit {b_src}")
+            _req_eq(d["n_target_labels"], 0, "source_only diagnostic n_target != 0")
+            _req_eq(d["n_total_labels"], b_tot, f"source_only diagnostic n_total != source_only fit {b_tot}")
+
+    return problems
+
+
 def _summarize(label: str, items: list, limit: int = 5) -> str:
     shown = ", ".join(str(i) for i in items[:limit])
     more = f" (+{len(items) - limit} more)" if len(items) > limit else ""
     return f"{len(items)} {label}: {shown}{more}"
+
+
+def _validate_contrasts(results_dir: Path, rows: list[dict[str, Any]]) -> tuple[list[str], dict[str, Any]]:
+    """Recompute the Stage-5 label-access contrasts from the probe rows and require the on-disk artifacts
+    to match. Lazy import avoids a load-time cycle (evals.contrasts uses split_artifacts/evals)."""
+    from evals import contrasts
+    return contrasts.validate_written_contrasts(results_dir, rows)
 
 
 # --- completion marker ------------------------------------------------------
@@ -576,7 +750,10 @@ def write_run_complete(
     if cell_failures:
         problems.append(_summarize(
             "probe cell(s) skipped after a degenerate fit",
-            [f"{c.get('method')}/{c.get('holdout')}@{c.get('label_budget')}: {c.get('reason')}"
+            [f"{c.get('method')}/{c.get('holdout')}@{c.get('label_budget')}"
+             + (f"[{c.get('label_access_route')}/{c.get('evaluation_split')}]"
+                if c.get("label_access_route") else "")
+             + f": {c.get('reason')}"
              for c in cell_failures],
         ))
 
@@ -587,6 +764,19 @@ def write_run_complete(
         problems.append(_summarize("row(s) for cells that were never planned", comp["unexpected"]))
     if comp["duplicate"]:
         problems.append(_summarize("cell(s) written more than once", comp["duplicate"]))
+
+    # Semantic validation beyond the cell key: a tampered supervision count or unit keeps the key intact
+    # (so completeness passes) but must still block publication of a corrupt label-access table.
+    la_problems = _validate_label_access_semantics(rows)
+    if la_problems:
+        problems.append(_summarize("label-access row(s) with inconsistent supervision accounting", la_problems))
+
+    # Stage 5: the label-access paired-contrast artifacts must be present, non-duplicated, and byte-
+    # consistent with a fresh recomputation from probe_results.jsonl, or the run cannot complete. Their
+    # hashes are recorded in the marker. No-op for non-label-access runs.
+    contrast_problems, contrast_hashes = _validate_contrasts(results_dir, rows)
+    if contrast_problems:
+        problems.append(_summarize("label-access contrast artifact problem(s)", contrast_problems))
 
     if problems:
         raise IncompleteRunError(
@@ -605,6 +795,7 @@ def write_run_complete(
     for name in REQUIRED_ARTIFACTS:
         path = results_dir / name
         payload["artifacts"][name] = {"sha256": sha256_file(path), "bytes": path.stat().st_size}
+    payload["artifacts"].update(contrast_hashes)  # Stage-5 contrast artifacts (present only for LA runs)
     if extra:
         payload.update(extra)
     IOU.write_json(results_dir / RUN_COMPLETE_FILE, payload)
@@ -694,6 +885,23 @@ def validate_run_complete(
             problems.append(f"{name}: recorded in the marker but missing on disk")
         elif got != want:
             problems.append(f"{name}: sha256 changed since completion (stale or edited)")
+
+    # Stage 5: the label-access contrast artifacts are NOT in REQUIRED_ARTIFACTS (they exist only for
+    # label-access runs), so validate them here too -- recompute from probe_results.jsonl and verify the
+    # on-disk CSV CONTENTS, then cross-check each against the hash the marker recorded at completion.
+    if rows is not None:
+        from evals import contrasts
+        if contrasts.has_label_access(rows):
+            content_problems, on_disk = _validate_contrasts(results_dir, rows)
+            problems.extend(content_problems)
+            for name in contrasts.contrast_artifact_names():
+                marker_h = (recorded.get(name) or {}).get("sha256")
+                if marker_h is None:
+                    problems.append(f"{name}: label-access run but the contrast artifact is not recorded in the marker")
+                elif check_hashes:
+                    disk_h = on_disk.get(name, {}).get("sha256")  # None => file missing (already reported)
+                    if disk_h is not None and disk_h != marker_h:
+                        problems.append(f"{name}: sha256 changed since completion (stale or edited)")
     return (not problems), problems
 
 

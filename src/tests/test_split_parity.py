@@ -454,9 +454,25 @@ def test_generator_rejects_a_missing_holdout(tmp_path):
     """A configured LODO target absent from the data (a dropped holdout) FAILS generation -- the frozen
     split set must be exactly complete, never silently thinned."""
     gen = _load_generator()
-    bench = _ch_bench({"kenya": 20, "togo": 20, "lem-brazil": 20})  # most geographic targets absent
+    # Present targets are sized to be label-access-feasible (>= max configured count) so the ONLY
+    # failure is the missing-holdout coverage check, not the per-target feasibility gate; most of the
+    # 11 CropHarvest geographic targets are still absent.
+    bench = _ch_bench({"kenya": 130, "togo": 130, "lem-brazil": 130})
     with pytest.raises(SA.SplitArtifactError, match="missing"):
         gen.generate_tabular(tmp_path / "splits", bench, ch, "geographic_ood", 0, audit_only=True)
+
+
+def test_label_access_failure_leaves_no_partial_leaf(tmp_path):
+    """A label-access failure (here an infeasible headline target -- pool < max count) aborts the leaf
+    BEFORE writing assignments.csv, so the failed canonical leaf is never partially published."""
+    gen = _load_generator()
+    bench = _ch_bench({"kenya": 130, "togo": 130, "lem-brazil": 20})  # lem-brazil target pool 16 < 50
+    root = tmp_path / "splits"
+    with pytest.raises(SA.SplitArtifactError, match="target label pool"):
+        gen.generate_tabular(root, bench, ch, "geographic_ood", 0, audit_only=False)
+    leaf = SA.leaf_dir(root, "cropharvest", "geographic_ood", 0, "lem-brazil")
+    assert not (leaf / "assignments.csv").exists()
+    assert not (leaf / "label_access.csv").exists()
 
 
 def test_generator_rejects_a_duplicate_holdout(tmp_path, monkeypatch):

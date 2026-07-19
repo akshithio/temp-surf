@@ -1,6 +1,7 @@
 """Shared helpers for the schema-v2 split-artifact tests.
 
-The frozen format is one ``assignments.csv`` per leaf plus one central ``data/logs/splits.json``.
+The frozen format is one ``assignments.csv`` per leaf (plus, for geographic_ood headline targets, a
+sibling ``label_access.csv``) and one central ``data/logs/splits.json``.
 ``freeze`` writes every built leaf's CSV, records its SHA-256, and writes the single log -- the exact
 flow ``tools/generate_splits.py`` uses -- so a test can publish then load back through the runtime.
 

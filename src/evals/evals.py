@@ -28,6 +28,7 @@ _target_budget_count = perf._target_budget_count
 _budget_seed = perf._budget_seed
 _sweep_budgets = perf._sweep_budgets
 _sweep_target_budgets = perf._sweep_target_budgets
+_sweep_label_access_routes = perf._sweep_label_access_routes
 
 
 _value_counts = regime_base._value_counts
@@ -352,6 +353,94 @@ def run_probes_multiclass_target(
     )
 
 
+def run_probes_label_access(
+    rows: list[dict[str, Any]],
+    x_source: np.ndarray, x_pool: np.ndarray, x_test: np.ndarray,
+    y_source: np.ndarray, y_pool: np.ndarray, y_test: np.ndarray,
+    seed: int,
+    *,
+    matched_source_order: np.ndarray, fixed_removal_order: np.ndarray, target_order: np.ndarray,
+    meta: dict[str, Any] | None = None,
+    groups_source: np.ndarray | None = None,
+    groups_pool: np.ndarray | None = None,
+    groups_test: np.ndarray | None = None,
+    predictions: list[dict[str, Any]] | None = None,
+    sample_ids_test: np.ndarray | None = None,
+    sample_ids_full: np.ndarray | None = None,
+    x_val: np.ndarray | None = None,
+    y_val: np.ndarray | None = None,
+    family: str = "logistic",
+    label_budget_unit: str = "samples",
+) -> None:
+    """Run the binary geographic label-access suite (13 routes) on a frozen ``target_test``."""
+    from evals.split_artifacts import LABEL_ACCESS_COUNTS
+
+    def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False):
+        clf, threshold, n_fit, n_cal, probe_meta = fit_probe_with_calibration(
+            x_tr, y_tr, probe_seed, x_cal=x_cal, y_cal=y_cal, family=family, tune_internal=tune_internal,
+        )
+        extra = {
+            "n_probe_fit": n_fit, "n_probe_calibration": n_cal,
+            "threshold_source": probe_meta["calibration_source"], "threshold": threshold, **probe_meta,
+        }
+        def score_fitted(x_eval, y_eval):
+            return score_binary(clf, threshold, x_eval, y_eval, return_per_sample=True)
+
+        scores, per_sample = score_fitted(x_te, y_te)
+        return scores, extra, per_sample, score_fitted
+
+    _sweep_label_access_routes(
+        rows, x_source, y_source, x_pool, y_pool, x_test, y_test, seed, fit_score,
+        counts=LABEL_ACCESS_COUNTS, matched_source_order=matched_source_order,
+        fixed_removal_order=fixed_removal_order, target_order=target_order, meta=meta,
+        groups_source=groups_source, groups_pool=groups_pool, groups_test=groups_test,
+        x_val=x_val, y_val=y_val, family=family, label_budget_unit=label_budget_unit,
+        predictions=predictions, sample_ids_test=sample_ids_test, sample_ids_full=sample_ids_full,
+    )
+
+
+def run_probes_multiclass_label_access(
+    rows: list[dict[str, Any]],
+    x_source: np.ndarray, x_pool: np.ndarray, x_test: np.ndarray,
+    y_source: np.ndarray, y_pool: np.ndarray, y_test: np.ndarray,
+    seed: int,
+    *,
+    matched_source_order: np.ndarray, fixed_removal_order: np.ndarray, target_order: np.ndarray,
+    meta: dict[str, Any] | None = None,
+    groups_source: np.ndarray | None = None,
+    groups_pool: np.ndarray | None = None,
+    groups_test: np.ndarray | None = None,
+    predictions: list[dict[str, Any]] | None = None,
+    sample_ids_test: np.ndarray | None = None,
+    sample_ids_full: np.ndarray | None = None,
+    x_val: np.ndarray | None = None,
+    y_val: np.ndarray | None = None,
+    family: str = "logistic",
+    label_budget_unit: str = "samples",
+) -> None:
+    """Run the multiclass geographic label-access suite (13 routes) on a frozen ``target_test``."""
+    from evals.split_artifacts import LABEL_ACCESS_COUNTS
+
+    def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False):
+        clf, probe_meta = fit_probe_multiclass(
+            x_tr, y_tr, probe_seed, x_val=x_cal, y_val=y_cal, family=family, tune_internal=tune_internal,
+        )
+        def score_fitted(x_eval, y_eval):
+            return score_multiclass(clf, x_eval, y_eval, return_per_sample=True)
+
+        scores, per_sample = score_fitted(x_te, y_te)
+        return scores, probe_meta, per_sample, score_fitted
+
+    _sweep_label_access_routes(
+        rows, x_source, y_source, x_pool, y_pool, x_test, y_test, seed, fit_score,
+        counts=LABEL_ACCESS_COUNTS, matched_source_order=matched_source_order,
+        fixed_removal_order=fixed_removal_order, target_order=target_order, meta=meta,
+        groups_source=groups_source, groups_pool=groups_pool, groups_test=groups_test,
+        x_val=x_val, y_val=y_val, family=family, label_budget_unit=label_budget_unit,
+        predictions=predictions, sample_ids_test=sample_ids_test, sample_ids_full=sample_ids_full,
+    )
+
+
 def run_probes_segmentation(
     rows: list[dict[str, Any]],
     x_train: np.ndarray,
@@ -398,6 +487,43 @@ def run_probes_segmentation_target(
         meta=meta, family=family, groups_source=groups_source,
         target_id_budget=TARGET_ID_UPPER_BOUND,
         pool_patches=pool_patches, target_test_patches=target_test_patches,
+    )
+
+
+def run_probes_segmentation_label_access(
+    rows: list[dict[str, Any]],
+    seed: int,
+    *,
+    source_patches: Any,
+    pool_patches: Any,
+    target_test_patches: Any,
+    matched_source_order: Any,
+    fixed_removal_order: Any,
+    target_order: Any,
+    load_pixels: Any,
+    stream_eval: Any,
+    x_val: np.ndarray,
+    y_val: np.ndarray,
+    meta: dict[str, Any] | None = None,
+    family: str = "logistic",
+    cap_patches: int | None = None,
+    patch_domain: dict[int, str] | None = None,
+    predictions_sink: Any = None,
+) -> None:
+    """Run the dense geographic label-access suite (13 routes, at patch granularity) on a frozen PASTIS
+    ``target_test``. Counts come from the ONE canonical set; the unit is ``patches``. Patch allocation is
+    resolved before ``load_pixels`` assembles per-route pixels; ``predictions_sink`` (when set) receives
+    streamed per-pixel prediction records."""
+    from evals.split_artifacts import LABEL_ACCESS_COUNTS, label_access_unit
+
+    bench = load_benchmark("pastis")
+    bench.run_probes_segmentation_label_access(
+        rows, seed,
+        source_patches=source_patches, pool_patches=pool_patches, target_test_patches=target_test_patches,
+        matched_source_order=matched_source_order, fixed_removal_order=fixed_removal_order,
+        target_order=target_order, counts=LABEL_ACCESS_COUNTS, load_pixels=load_pixels, stream_eval=stream_eval,
+        x_val=x_val, y_val=y_val, meta=meta, family=family, label_budget_unit=label_access_unit("pastis"),
+        cap_patches=cap_patches, patch_domain=patch_domain, predictions_sink=predictions_sink,
     )
 
 # Pair-level execution

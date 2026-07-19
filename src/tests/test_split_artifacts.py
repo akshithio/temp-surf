@@ -1,7 +1,8 @@
 """Structural-integrity, serialization, and runtime-round-trip tests for the frozen split artifacts.
 
-The format is one ``assignments.csv`` per leaf (stable_id, partition, status, domain, reason) plus one
-central ``data/logs/splits.json`` (provenance + per-leaf summary + SHA-256). These tests exercise the
+The format is one ``assignments.csv`` per leaf (stable_id, partition, status, domain, reason) -- plus,
+for geographic_ood headline targets, a sibling ``label_access.csv`` -- and one central
+``data/logs/splits.json`` (provenance + per-leaf summary + SHA-256). These tests exercise the
 scientific invariants directly (they do not run the regimes -- that is ``test_split_parity`` and the
 per-regime files): partition disjointness, complete accounting, the route-capability contract, the
 central-log checksum gate, PASTIS patch-level dense leaves + structural fold/tile checks, and the

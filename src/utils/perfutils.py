@@ -311,9 +311,16 @@ def _cap_row_meta(cap: int | None, family: str, n_precap: int, y_post: np.ndarra
     }
 
 
-def _record_cell_failure(meta: dict, budget: Any, budget_type: str, exc: Exception) -> None:
-    """Record a skipped budget cell and say so on stdout."""
-    CELL_FAILURES.append({
+def _record_cell_failure(
+    meta: dict, budget: Any, budget_type: str, exc: Exception, *, extra: dict[str, Any] | None = None,
+) -> None:
+    """Record a skipped budget cell and say so on stdout.
+
+    ``extra`` carries route-specific fields for a label-access failure (label_access_route,
+    evaluation_split, the three label counts, label_budget_unit) so two same-budget routes that fail --
+    e.g. additive source_plus_target(25) vs fixed_total_mixed(25) -- stay fully distinguishable in the
+    failure log and the run-completion summary, instead of collapsing to one ``method/holdout@25`` line."""
+    rec = {
         "seed": meta.get("seed"),
         "split_regime": meta.get("split_regime"),
         "holdout": meta.get("holdout"),
@@ -321,10 +328,17 @@ def _record_cell_failure(meta: dict, budget: Any, budget_type: str, exc: Excepti
         "probe_family": meta.get("probe_family"),
         "budget_type": budget_type,
         "label_budget": budget,
+        "label_access_route": meta.get("label_access_route", ""),
+        "evaluation_split": meta.get("evaluation_split", ""),
         "reason": f"{type(exc).__name__}: {exc}",
-    })
+    }
+    if extra:
+        rec.update(extra)
+    CELL_FAILURES.append(rec)
+    route, es = rec.get("label_access_route", ""), rec.get("evaluation_split", "")
+    where = (f" route={route}" if route else "") + (f" split={es}" if es else "")
     print(
-        f"   [skip] cell failed ({exc}) method={meta.get('method', '?')} budget={budget}",
+        f"   [skip] cell failed ({exc}) method={meta.get('method', '?')} budget={budget}{where}",
         flush=True,
     )
 
@@ -705,6 +719,203 @@ def _sweep_target_budgets(
                 predictions, meta=meta, seed=seed, budget_type="target", label_budget=budget,
                 n_train_sub=n_tr, sample_ids=sample_ids_full[full_idx], groups_test=groups_all,
                 per_sample=per_sample_f, evaluation_split="full",
+            )
+
+
+def _validate_order(order: Any, n: int, name: str) -> np.ndarray:
+    """Validate a frozen label-access order BEFORE any route is built or fit: a 1-D integer array that
+    is an exact permutation of ``0..n-1``. Rejects non-1-D, non-integer, wrong-length (omission or
+    extra), negative, out-of-range, and duplicate positions. Returns the int64 array."""
+    arr = np.asarray(order)
+    if arr.ndim != 1:
+        raise ValueError(f"{name}: must be a 1-D array (got {arr.ndim}-D)")
+    if arr.size and not np.issubdtype(arr.dtype, np.integer):
+        raise ValueError(f"{name}: must be an integer array (got dtype {arr.dtype})")
+    if arr.size != n:
+        raise ValueError(f"{name}: has {arr.size} positions, expected exactly {n} (an omission or extra)")
+    if n and int(arr.min()) < 0:
+        raise ValueError(f"{name}: has a negative position ({int(arr.min())})")
+    if n and int(arr.max()) >= n:
+        raise ValueError(f"{name}: has an out-of-range position ({int(arr.max())} >= {n})")
+    if len(np.unique(arr)) != arr.size:
+        raise ValueError(f"{name}: has duplicate positions -- not a permutation of 0..{n - 1}")
+    return arr.astype(np.int64, copy=False)
+
+
+def _sweep_label_access_routes(
+    rows: list[dict[str, Any]],
+    x_source: np.ndarray,
+    y_source: np.ndarray,
+    x_pool: np.ndarray,
+    y_pool: np.ndarray,
+    x_test: np.ndarray,
+    y_test: np.ndarray,
+    seed: int,
+    fit_score: Any,
+    *,
+    counts: tuple[int, ...],
+    matched_source_order: np.ndarray,
+    fixed_removal_order: np.ndarray,
+    target_order: np.ndarray,
+    meta: dict[str, Any] | None = None,
+    groups_source: np.ndarray | None = None,
+    groups_pool: np.ndarray | None = None,
+    groups_test: np.ndarray | None = None,
+    x_val: np.ndarray | None = None,
+    y_val: np.ndarray | None = None,
+    family: str = "logistic",
+    label_budget_unit: str = "samples",
+    predictions: list[dict[str, Any]] | None = None,
+    sample_ids_test: np.ndarray | None = None,
+    sample_ids_full: np.ndarray | None = None,
+) -> None:
+    """The geographic label-access suite: 13 distinct fits per fully-eligible cell, each scored on the
+    SAME frozen ``target_test`` (``x_test``/``y_test``). ``target_test`` NEVER enters any training set.
+
+    The three frozen orders are POSITIONS: ``matched_source_order``/``fixed_removal_order`` permute the
+    source pool (``0..S-1``), ``target_order`` permutes the target label pool (``0..P-1``). They come
+    from the frozen ``label_access.csv`` -- this sweep regenerates no ordering. Counts come from the ONE
+    canonical set (``LABEL_ACCESS_COUNTS``, passed in); nothing is re-literaled.
+
+    ``source_only`` is fit ONCE and is the additive-``k=0`` and fixed-total baseline (Stage-5 contrasts
+    subtract it) -- no duplicate fit, no aliased row. Calibration routing: frozen ``source_val`` for
+    source_only / source_plus_target / source_plus_target_full / fixed_total_mixed; the existing
+    source-free route-internal procedure (``tune_internal``) for target_only_full / matched_source /
+    matched_target, applied INDEPENDENTLY to each route's own training set (never ``source_val``, never
+    ``target_test``). The run ``seed`` is the probe seed for every route -- no derived seeds.
+    """
+    from evals import split_artifacts as _SA  # lazy: canonical route names, no import cycle
+
+    meta = dict(meta or {})
+    counts = tuple(int(c) for c in counts)
+    S, P = len(y_source), len(y_pool)
+    mx = max(counts) if counts else 0
+
+    # Validate the three frozen orders BEFORE constructing any route or fitting anything.
+    matched_source_order = _validate_order(matched_source_order, S, "matched_source_order")
+    fixed_removal_order = _validate_order(fixed_removal_order, S, "fixed_removal_order")
+    target_order = _validate_order(target_order, P, "target_order")
+
+    # PROBE_CAP preserves the experiment: select ONE deterministic, encoder-independent, class/group-
+    # balanced source BASE POOL of size B ONCE for the cell (seed keyed on cell identity, NOT the model
+    # and NOT the route), then restrict BOTH frozen source orders to that base while preserving their
+    # order. Every source-containing route is built from this shared base -- there is NO further
+    # per-route cap. Uncapped, B == S and the base is the whole source pool.
+    cap = PROBE_CAP
+    cap_active = cap is not None and family in _CAP_FAMILIES and int(cap) < S
+    if cap_active:
+        base_all = _cap_stratified_indices(
+            y_source, groups_source, int(cap), _cap_seed(seed, "label_access", "base", meta),
+        )
+        matched_source_order = matched_source_order[np.isin(matched_source_order, base_all)]
+        fixed_removal_order = fixed_removal_order[np.isin(fixed_removal_order, base_all)]
+    else:
+        base_all = np.arange(S, dtype=np.int64)
+    B = int(len(base_all))
+    if P < mx or B < mx:  # NEVER clamp; require B >= max(counts) (a cap below it cannot support the suite)
+        raise ValueError(
+            f"label-access sweep infeasible: source base B={B}, target pool P={P}, max count={mx} (cap={cap})"
+        )
+    m = min(B, P)
+    _empty = np.empty(0, dtype=np.int64)
+    groups_test_arr = np.asarray(groups_test) if groups_test is not None else None
+    cap_meta = {"probe_cap": int(cap) if cap is not None else 0, "probe_capped": int(cap_active),
+                "n_source_precap": int(S), "n_source_base": B}
+
+    # (route, label_budget, source positions, target-pool positions, tune_internal). All source
+    # positions come from the shared base pool: source_only / source_plus_target(_full) use ALL B;
+    # matched-source takes the base-restricted prefix of matched_source_order; fixed-total removal drops
+    # the base-restricted prefix of fixed_removal_order and keeps the rest.
+    route_specs: list[tuple[str, int, np.ndarray, np.ndarray, bool]] = [
+        (_SA.ROUTE_SOURCE_ONLY, 0, base_all, _empty, False),
+        *[(_SA.ROUTE_SOURCE_PLUS_TARGET, k, base_all, target_order[:k], False) for k in counts],
+        (_SA.ROUTE_TARGET_ONLY_FULL, 0, _empty, target_order, True),
+        (_SA.ROUTE_SOURCE_PLUS_TARGET_FULL, 0, base_all, target_order, False),
+        (_SA.ROUTE_MATCHED_SOURCE, 0, matched_source_order[:m], _empty, True),
+        (_SA.ROUTE_MATCHED_TARGET, 0, _empty, target_order[:m], True),
+        *[(_SA.ROUTE_FIXED_TOTAL_MIXED, k, fixed_removal_order[k:], target_order[:k], False) for k in counts],
+    ]
+
+    for route, budget, src_pos, tgt_pos, tune_internal in route_specs:
+        sx, sy = x_source[src_pos], y_source[src_pos]  # src_pos already restricted to the shared base
+        tx, ty = x_pool[tgt_pos], y_pool[tgt_pos]
+        # No further per-route cap: the base pool selected above is the single, shared cap for the cell.
+        if len(sy) and len(ty):
+            x_fit, y_fit = np.concatenate([sx, tx]), np.concatenate([sy, ty])
+        elif len(ty):
+            x_fit, y_fit = tx, ty
+        else:
+            x_fit, y_fit = sx, sy
+        n_source_labels, n_target_labels = int(len(sy)), int(len(ty))
+
+        cal_x, cal_y = ((x_val, y_val) if (not tune_internal and x_val is not None and len(x_val)) else (None, None))
+        identity = {"seed": seed, "holdout": meta.get("holdout"), "method": meta.get("method"),
+                    "budget_type": "label_access", "label_access_route": route, "label_budget": budget,
+                    "evaluation_split": _SA.EVAL_TARGET_TEST}
+        set_identity(identity)
+        try:
+            with measure(f"probe.label_access/{meta.get('benchmark', '?')}/{route}",
+                         n_train=len(y_fit), n_test=len(y_test)):
+                result = fit_score(x_fit, y_fit, x_test, y_test, seed, cal_x, cal_y, tune_internal)
+        except ValueError as exc:
+            set_identity(None)
+            # Record the FULL route identity + supervision counts (the fit never produced a row), so an
+            # additive vs fixed-total failure at the same budget k stays distinguishable in the log.
+            _record_cell_failure(
+                {**meta, "label_access_route": route, "evaluation_split": _SA.EVAL_TARGET_TEST},
+                budget, "label_access", exc,
+                extra={"n_source_labels": n_source_labels, "n_target_labels": n_target_labels,
+                       "n_total_labels": int(len(y_fit)), "label_budget_unit": label_budget_unit},
+            )
+            continue
+        scores, extra = result[0], result[1]
+        per_sample = result[2] if len(result) >= 3 else None
+        score_fitted = result[3] if len(result) >= 4 else None
+        set_identity(None)
+        scores = {**scores, **regime_base._worst_group_scores(per_sample, groups_test_arr)}
+        # The route's supervision counts + unit. Carried IDENTICALLY on the result row AND every
+        # prediction row so a per-sample reader can attribute each prediction to its route's label access
+        # without re-joining to summary.csv.
+        supervision = {"n_source_labels": n_source_labels, "n_target_labels": n_target_labels,
+                       "n_total_labels": int(len(y_fit)), "label_budget_unit": label_budget_unit}
+        pred_meta = {**meta, "label_access_route": route, **supervision}
+        rows.append({
+            **meta, "budget_type": "label_access", "label_access_route": route, "label_budget": budget,
+            "evaluation_split": _SA.EVAL_TARGET_TEST, "seed": seed, "n_train_sub": int(len(y_fit)),
+            "n_test": int(len(y_test)), **supervision,
+            **dict(ERM_TUNING_METADATA), **cap_meta, **extra, **scores,
+        })
+        regime_base._append_prediction_rows(
+            predictions, meta=pred_meta, seed=seed, budget_type="label_access",
+            label_budget=budget, n_train_sub=len(y_fit),
+            sample_ids=np.asarray(sample_ids_test if sample_ids_test is not None else np.arange(len(y_test))),
+            groups_test=groups_test_arr, per_sample=per_sample, evaluation_split=_SA.EVAL_TARGET_TEST,
+        )
+
+        # source_only complete-target diagnostic: reuse the SAME fitted scorer (NO refit) to score the
+        # complete target region (pool ++ test) -- the deployment estimand. One extra row, flagged with
+        # evaluation_split=complete_target so Stage-5 paired contrasts exclude it. Not a 14th fit.
+        if route == _SA.ROUTE_SOURCE_ONLY and score_fitted is not None:
+            x_full = np.concatenate([x_pool, x_test])
+            y_full = np.concatenate([y_pool, y_test])
+            g_full = (np.concatenate([np.asarray(groups_pool), groups_test_arr])
+                      if (groups_pool is not None and groups_test_arr is not None) else None)
+            scores_d, per_sample_d = score_fitted(x_full, y_full)
+            scores_d = {**scores_d, **regime_base._worst_group_scores(per_sample_d, g_full)}
+            rows.append({
+                **meta, "budget_type": "label_access", "label_access_route": route, "label_budget": budget,
+                "evaluation_split": _SA.EVAL_COMPLETE_TARGET, "seed": seed, "n_train_sub": int(len(y_fit)),
+                "n_test": int(len(y_full)), **supervision,
+                **dict(ERM_TUNING_METADATA), **cap_meta, **extra, **scores_d,
+            })
+            # The diagnostic predictions carry the SAME source-only supervision metadata (pred_meta), since
+            # source_only trains on B source labels + 0 target -- so a reader sees the diagnostic scored a
+            # source-only fit, not a distinct route.
+            regime_base._append_prediction_rows(
+                predictions, meta=pred_meta, seed=seed, budget_type="label_access",
+                label_budget=budget, n_train_sub=len(y_fit),
+                sample_ids=np.asarray(sample_ids_full if sample_ids_full is not None else np.arange(len(y_full))),
+                groups_test=g_full, per_sample=per_sample_d, evaluation_split=_SA.EVAL_COMPLETE_TARGET,
             )
 
 

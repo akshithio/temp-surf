@@ -44,7 +44,9 @@ BUDGET_REGIMES = {
 MAX_DENSE_PIXELS = 50_000  # sampled pixels per PASTIS fold partition
 OVERWRITE_MODE = False
 STRICT_MODE = False
-WRITE_PREDICTIONS = True
+# Predictions are OPTIONAL and OFF by default. A full-grid PASTIS launch would otherwise stream billions
+# of per-pixel JSON records; Stage 5 paired contrasts do not need them. Opt in explicitly per run.
+WRITE_PREDICTIONS = False
 LAUNCH_GPU_SHARDS = True
 GPU_SHARDS = None
 # =============================================================================
@@ -119,6 +121,10 @@ def _run_tabular_pair(
         "binary": (EV.run_probes_target, EV.METRICS_BINARY),
         "multiclass": (EV.run_probes_multiclass_target, EV.METRICS_MULTICLASS),
     }[bench_mod.LABEL_KIND]
+    probe_fn_la = {
+        "binary": EV.run_probes_label_access,
+        "multiclass": EV.run_probes_multiclass_label_access,
+    }[bench_mod.LABEL_KIND]
     supported = getattr(bench_mod, "SPLIT_REGIMES", split_regimes)
     unsupported = [r for r in split_regimes if r not in supported]
     if unsupported:
@@ -141,11 +147,24 @@ def _run_tabular_pair(
     # Partitions AND per-sample domains come entirely from the artifacts. Embedding-only runs
     # (probing disabled) never require split artifacts.
     split_specs: list[split_artifacts.LoadedTabularSplit] = []
+    label_access_by_cell: dict[tuple[int, str], split_artifacts.LoadedLabelAccess] = {}
     if probing:
         splits_root = cacheutils.SCRATCH / "splits"
         split_specs = split_artifacts.load_tabular_splits(
             splits_root, bench_mod.BENCHMARK, bench.sample_ids, split_regimes, seeds
         )
+        # Fail-fast (same discipline as the split load, BEFORE any embedding work): load + structurally
+        # validate the frozen label-access order for every geographic_ood headline target, resolving its
+        # ranked stable ids to current row indices. The id-map is built lazily, only when such a target
+        # is actually present (so non-geographic runs never depend on it).
+        _la_id_map: dict[str, int] | None = None
+        for _ls in split_specs:
+            if _ls.regime == split_artifacts.LABEL_ACCESS_REGIME and _ls.split.supports_target_labels:
+                if _la_id_map is None:
+                    _la_id_map = {str(s): i for i, s in enumerate(np.asarray(bench.sample_ids).tolist())}
+                label_access_by_cell[(_ls.seed, _ls.split.label)] = split_artifacts.load_label_access(
+                    splits_root, bench_mod.BENCHMARK, _ls.seed, _ls.split, _la_id_map
+                )
 
     bench_for_emb = bench.s2_only() if s2_only else bench
     if gen_embeddings:
@@ -186,6 +205,8 @@ def _run_tabular_pair(
             results_dir / "probe_results.csv",
             results_dir / "summary.csv",
             results_dir / "deltas.csv",
+            results_dir / "label_access_contrasts.csv",          # Stage-5, rewritten fresh each finalize
+            results_dir / "label_access_contrasts_summary.csv",
             results_dir / "data_quality.json",
             results_dir / "split_ref.json",          # legacy per-model artifact -- retired, remove on resume
             results_dir / "split_manifest.json",     # legacy per-model artifact -- retired, remove on resume
@@ -217,6 +238,7 @@ def _run_tabular_pair(
             r.get("budget_type"),
             r.get("label_budget"),
             r.get("evaluation_split"),
+            r.get("label_access_route", ""),
         )
         for r in rows
     }
@@ -233,7 +255,7 @@ def _run_tabular_pair(
     def _missing(base, budget_type, expected, source_diag=False):
         return [
             b for b in expected
-            if not all((*base, budget_type, b, sc) in done for sc in _scopes(budget_type, b, source_diag))
+            if not all((*base, budget_type, b, sc, "") in done for sc in _scopes(budget_type, b, source_diag))
         ]
 
     rerun_keys: set = set()
@@ -286,46 +308,61 @@ def _run_tabular_pair(
                     "holdout": split_label,
                     "target_role": st.target_role,
                     "probe_family": family,
+                    "label_access_route": "",   # non-label-access default; label-access rows override
                 }
                 base = (seed, split_regime, split_label, mname, family)
                 has_source_diag = len(source_test_ref) > 0
                 # Same key shape as `done` / `rerun_keys`: every scope of every budget this
                 # cell is planned to emit. Target-budget sweeps run ONLY when the regime supports
                 # target labels; official (has_target but supports_target_labels=False) is zero-shot.
-                if supports_target_labels:
-                    expected_keys.update(
-                        (*base, "target", b, sc)
-                        for b in target_budgets for sc in _scopes("target", b)
-                    )
+                is_label_access = supports_target_labels and split_regime == split_artifacts.LABEL_ACCESS_REGIME
+                # The source-budget sweep runs for EVERY regime (unchanged experiment; empty route id).
                 expected_keys.update(
-                    (*base, "source", b, sc)
+                    (*base, "source", b, sc, "")
                     for b in source_budgets for sc in _scopes("source", b, has_source_diag)
                 )
-                if supports_target_labels:
+                if is_label_access:
+                    # geographic_ood headline: the 13-route label-access suite REPLACES the old target-
+                    # budget sweep (no duplicate legacy target rows). ONE job per cell so source_only is
+                    # fit exactly once and its fitted scorer is reused for the complete-target diagnostic;
+                    # resume is at cell granularity so different routes can never be confused.
+                    la = label_access_by_cell[(seed, split_label)]
+                    cell_keys = [
+                        (*base, "label_access", b, es, route)
+                        for (route, b, es) in split_artifacts.label_access_expected_rows()
+                    ]
+                    expected_keys.update(cell_keys)
+                    if not all(k in done for k in cell_keys):
+                        rerun_keys.update(cell_keys)
+                        jobs.append(
+                            delayed(runstate._probe_cell_label_access)(
+                                probe_fn_la, emb, train, val, st.target_label_pool, st.target_test,
+                                la.matched_source_ranked_idx, la.fixed_source_removal_ranked_idx,
+                                la.target_ranked_idx, y, groups,
+                                {**meta, "budget_type": "label_access"}, seed, family,
+                                write_predictions=write_predictions,
+                            )
+                        )
+                elif supports_target_labels:
+                    # non-geographic target-label regime (spatial_cluster_ood): the legacy target sweep.
+                    expected_keys.update(
+                        (*base, "target", b, sc, "")
+                        for b in target_budgets for sc in _scopes("target", b)
+                    )
                     todo = _missing(base, "target", target_budgets)
                     if todo:
-                        rerun_keys.update((*base, "target", b, sc) for b in todo for sc in _scopes("target", b))
+                        rerun_keys.update((*base, "target", b, sc, "") for b in todo for sc in _scopes("target", b))
                         for budget in todo:
                             jobs.append(
                                 delayed(runstate._probe_cell_target)(
-                                    probe_fn_tgt,
-                                    emb,
-                                    train,
-                                    val,
-                                    st.target_label_pool,
-                                    st.target_test,
-                                    y,
-                                    groups,
-                                    {**meta, "budget_type": "target"},
-                                    seed,
-                                    family,
-                                    [budget],
+                                    probe_fn_tgt, emb, train, val, st.target_label_pool, st.target_test,
+                                    y, groups, {**meta, "budget_type": "target"}, seed, family, [budget],
                                     write_predictions=write_predictions,
                                 )
                             )
                 todo_src = _missing(base, "source", source_budgets, has_source_diag)
                 if todo_src:
-                    rerun_keys.update((*base, "source", b, sc) for b in todo_src for sc in _scopes("source", b, has_source_diag))
+                    rerun_keys.update((*base, "source", b, sc, "") for b in todo_src for sc in _scopes("source", b, has_source_diag))
                     for budget in todo_src:
                         jobs.append(
                             delayed(runstate._probe_cell)(
@@ -369,8 +406,14 @@ def _run_tabular_pair(
             "budget_type",
             "label_budget",
             "evaluation_split",
+            "label_access_route",
         ],
         metrics=metrics,
+        # Supervision sizes vary by holdout (regional pool sizes differ), so aggregate them rather than
+        # key on them -- otherwise every region would be its own summary row. label_budget_unit is
+        # constant within a group and preserved verbatim.
+        count_aggregates=["n_source_labels", "n_target_labels", "n_total_labels"],
+        passthrough=["label_budget_unit"],
     )
     IOU.write_csv(results_dir / "summary.csv", summary)
     IOU.write_json(results_dir / "metric_roles.json", EV.METRIC_ROLES[bench_mod.LABEL_KIND])
@@ -386,6 +429,13 @@ def _run_tabular_pair(
         target_id_budget=EV.TARGET_ID_UPPER_BOUND if EV.TARGET_ID_UPPER_BOUND in target_budgets else None,
     )
     IOU.write_csv(results_dir / "deltas.csv", deltas)
+
+    # Stage 5: paired label-access contrasts (pure post-processing on the rows). No-op unless the run
+    # carries the geographic_ood label-access suite. Hard-fails here on a missing/duplicate operand or an
+    # unresolvable source_ID_reference anchor; write_run_complete re-validates + hashes the artifacts.
+    from evals import contrasts
+
+    contrasts.compute_and_write(results_dir, rows)
 
     from evals import confounds
 

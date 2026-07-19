@@ -754,3 +754,99 @@ def iter_dense_tiles(
         labels = np.asarray(np.load(label_path), dtype=np.int64)
         features = np.asarray(np.load(feature_path), dtype=np.float32)
         yield features, labels
+
+
+def _tile_identity(label_path: Path) -> tuple[int, int, int]:
+    """``(patch_id, tile_row, tile_col)`` from a ``{patch}_{row}_{col}.labels.npy`` cache filename. rsplit
+    from the right so a multi-part patch id could never be misparsed."""
+    stem = label_path.name.removesuffix(".labels.npy")
+    patch_s, row_s, col_s = stem.rsplit("_", 2)
+    return int(patch_s), int(row_s), int(col_s)
+
+
+def iter_dense_tiles_with_ids(
+    emb_dir: Path,
+    folds: set[int],
+    patch_ids: set[int] | None = None,
+):
+    """Like :func:`iter_dense_tiles` but yields ``((patch_id, tile_row, tile_col), features, labels)`` --
+    the COMPLETE tile identity -- so per-pixel predictions can carry a stable, unique tile+pixel id. A
+    PASTIS patch is cached as up to four ``{patch}_{row}_{col}`` quadrant tiles; each is streamed whole
+    (no subsampling) with only one resident at a time, so evaluation stays memory-safe."""
+    for label_path in _dense_label_paths(emb_dir, folds, patch_ids):
+        feature_path = label_path.with_name(label_path.name.replace(".labels.npy", ".npy"))
+        labels = np.asarray(np.load(label_path), dtype=np.int64)
+        features = np.asarray(np.load(feature_path), dtype=np.float32)
+        yield _tile_identity(label_path), features, labels
+
+
+def load_dense_patch_pixels(
+    emb_dir: Path,
+    folds: set[int],
+    patch_ids: set[int],
+    *,
+    run_seed: int,
+    per_patch_cap: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load pixels for ``patch_ids``, subsampling EACH PATCH (not each cache file) INDEPENDENTLY and
+    DETERMINISTICALLY.
+
+    A PASTIS patch is cached as up to four ``{patch}_{row}_{col}`` quadrant tiles. This groups every tile
+    file of a patch together and draws ``per_patch_cap`` pixels across the patch's COMBINED valid pixels
+    (the cache already stores only valid pixels), so the cap is a per-PATCH budget -- not a per-file one
+    that would let a 4-tile patch contribute 4x the cap. The draw is keyed on ``(run_seed, patch_id)``
+    ONLY -- never the co-loaded set or a budget -- so a patch yields the SAME pixels regardless of which
+    other patches load with it, which lets paired routes that RETAIN a patch train on identical pixels
+    (patch-first). A route over ``k`` patches therefore loads at most ``k * per_patch_cap`` pixels; the
+    caller sizes ``per_patch_cap`` from MAX_DENSE_PIXELS and the largest route to respect the global
+    bound. Any requested patch that contributes NO usable cached pixels is a hard error. Returns
+    ``(x, y, groups, patch_ids)``; groups are the source fold, patch_ids the per-pixel patch membership."""
+    requested = {int(p) for p in patch_ids}
+    by_patch: dict[int, list[Path]] = {}
+    for label_path in _dense_label_paths(emb_dir, folds, requested):
+        by_patch.setdefault(_tile_identity(label_path)[0], []).append(label_path)
+    cap = max(1, int(per_patch_cap))
+    feature_parts: list[np.ndarray] = []
+    label_parts: list[np.ndarray] = []
+    group_parts: list[np.ndarray] = []
+    patch_parts: list[np.ndarray] = []
+    ncols = 0
+    for pid in sorted(requested):
+        # Gather every tile of the patch, then sample across their COMBINED pixels (patch-level cap).
+        blocks: list[tuple[Path, np.ndarray, int, int]] = []  # (feature_path, labels, fold, n)
+        total = 0
+        for label_path in sorted(by_patch.get(pid, [])):
+            labels = np.load(label_path, mmap_mode="r")
+            n = int(len(labels))
+            if n == 0:
+                continue
+            feature_path = label_path.with_name(label_path.name.replace(".labels.npy", ".npy"))
+            fold = int(label_path.parent.name.removeprefix("fold_"))
+            blocks.append((feature_path, np.asarray(labels), fold, n))
+            total += n
+        if total == 0:
+            raise FileNotFoundError(
+                f"requested patch {pid} has no usable cached pixels under {emb_dir} (folds {sorted(folds)})"
+            )
+        if total > cap:
+            rng = np.random.default_rng([int(run_seed), pid])   # per-PATCH deterministic, across all tiles
+            chosen = np.sort(rng.choice(total, size=cap, replace=False))
+        else:
+            chosen = np.arange(total)
+        start = 0
+        for feature_path, labels, fold, n in blocks:
+            take = chosen[(chosen >= start) & (chosen < start + n)] - start
+            start += n
+            if len(take) == 0:
+                continue
+            feats = np.asarray(np.load(feature_path, mmap_mode="r")[take], dtype=np.float32)
+            ncols = feats.shape[1] if feats.ndim == 2 else ncols
+            feature_parts.append(feats)
+            label_parts.append(np.asarray(labels[take], dtype=np.int64))
+            group_parts.append(np.full(len(take), fold, dtype=np.int64))
+            patch_parts.append(np.full(len(take), pid, dtype=np.int64))
+    if not feature_parts:
+        return (np.zeros((0, ncols), np.float32), np.zeros(0, np.int64),
+                np.zeros(0, np.int64), np.zeros(0, np.int64))
+    return (np.concatenate(feature_parts), np.concatenate(label_parts),
+            np.concatenate(group_parts), np.concatenate(patch_parts))
