@@ -56,6 +56,11 @@ BZ_REGIONS = ["frh01", "frh02", "frh03", "frh04"]
 BZ_TIMESTEPS = 12
 
 
+def _identity_timeseries(x) -> np.ndarray:
+    """Bypass BreizhCrops' stochastic default 45-observation sampler."""
+    return np.asarray(x, dtype=np.float32)
+
+
 def _resample_fixed(arr: np.ndarray, t: int) -> np.ndarray:
     """Linspace-resample a (T, C) series to exactly ``t`` timesteps (subsample or repeat)."""
     n = arr.shape[0]
@@ -140,14 +145,21 @@ def load_benchmark(
     # as every other column, so it never affects sample membership, ordering, labels, or embeddings.
     sample_ids: list[str] = []
     for region in regions:
-        ds = bzh.BreizhCrops(region, root=str(base), level="L1C", load_timeseries=True, verbose=False)
+        ds = bzh.BreizhCrops(
+            region,
+            root=str(base),
+            level="L1C",
+            transform=_identity_timeseries,
+            load_timeseries=True,
+            verbose=False,
+        )
         latlon_map = _bz_parcel_latlon(ds)
         for i in range(len(ds)):
             x, y, fid = ds[i]
             x = np.asarray(x, dtype=np.float32)
             if x.ndim != 2 or x.shape[1] < len(BZ_X_BANDS) or x.shape[0] < 1:
                 continue
-            x = x[:, : len(BZ_X_BANDS)] * 1e4  # reflectance (0-1) -> DN, like the other benchmarks
+            x = x[:, : len(BZ_X_BANDS)]  # source HDF5 is already stored in reflectance DN
             b4, b8 = x[:, b4i], x[:, b8i]
             denom = b8 + b4
             ndvi = np.divide(b8 - b4, denom, out=np.zeros_like(b4), where=denom != 0)

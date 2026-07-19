@@ -269,8 +269,9 @@ def test_breizhcrops_fid_is_additive_and_aligned(monkeypatch):
     from evals.benchmarks import breizhcrops as bz
 
     class _FakeDS:
-        def __init__(self, region):
+        def __init__(self, region, transform):
             self.region = region
+            self.transform = transform
 
         def __len__(self):
             return 3
@@ -278,10 +279,18 @@ def test_breizhcrops_fid_is_additive_and_aligned(monkeypatch):
         def __getitem__(self, i):
             x = np.full((4, len(bz.BZ_X_BANDS)), 0.1, dtype=np.float32)
             fid = 1000 * (ord(self.region[-1]) - ord("0")) + i  # unique within+across regions
-            return x, i % 2, fid
+            return self.transform(x), i % 2, fid
+
+    transforms = []
+
+    def fake_breizhcrops(
+        region, root=None, level=None, transform=None, load_timeseries=None, verbose=None
+    ):
+        transforms.append(transform)
+        return _FakeDS(region, transform)
 
     fake_pkg = SimpleNamespace(
-        BreizhCrops=lambda region, root=None, level=None, load_timeseries=None, verbose=None: _FakeDS(region)
+        BreizhCrops=fake_breizhcrops
     )
     monkeypatch.setitem(sys.modules, "breizhcrops", fake_pkg)
     monkeypatch.setattr(bz, "BZ_REGIONS", ["frh01", "frh02"])
@@ -291,6 +300,9 @@ def test_breizhcrops_fid_is_additive_and_aligned(monkeypatch):
     bench = bz.load_benchmark(root=Path("/tmp"), shuffle=True, seed=0)
     n = len(bench.labels)
     assert bench.sample_ids is not None
+    assert all(transform is bz._identity_timeseries for transform in transforms)
+    assert all(values.shape == (4, len(bz.BZ_X_BANDS) + 1) for values in bench.native.s2.values)
+    np.testing.assert_allclose(bench.native.s2.values[0][..., :-1], 0.1)
     assert len(bench.sample_ids) == n == len(bench.groups) == len(bench.latlon)
     assert len(set(bench.sample_ids.tolist())) == n, "stable ids must be unique"
     # additivity: each sample_id is aligned to the SAME shuffled row as groups/labels (region prefix)
