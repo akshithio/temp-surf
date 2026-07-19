@@ -36,20 +36,23 @@ class _FakeTabModel:
     """Encodes the passed-through row indices back to their stored rows (+delta), so the spot check
     reproduces the legacy matrix exactly when delta == 0 and diverges otherwise."""
 
-    def __init__(self, arr: np.ndarray, dim: int, delta: float = 0.0):
-        self._arr, self.embedding_dim, self._delta = arr, dim, delta
+    def __init__(self, arr: np.ndarray, dim: int, delta: float = 0.0, enc_width=None):
+        self._arr, self.embedding_dim, self._delta, self._enc_width = arr, dim, delta, enc_width
 
     def encode(self, idx):  # `_subset_bench` is patched to pass the index list straight through
-        return self._arr[np.asarray(idx)] + self._delta
+        idx = np.asarray(idx)
+        if self._enc_width is not None:  # encoder outputs a different width than the legacy array
+            return np.zeros((len(idx), self._enc_width), dtype=np.float32)
+        return self._arr[idx] + self._delta
 
 
-def _setup_tabular(adopt, monkeypatch, tmp_path, *, arr, model_dim=None, delta=0.0):
+def _setup_tabular(adopt, monkeypatch, tmp_path, *, arr, model_dim=None, delta=0.0, enc_width=None):
     dim = arr.shape[1] if model_dim is None else model_dim
     bench = SimpleNamespace(n_samples=arr.shape[0], labels=np.zeros(arr.shape[0], dtype=np.int64),
                             sample_ids=list(range(arr.shape[0])))
     monkeypatch.setattr(adopt, "_load_bench", lambda benchmark, s2_only: (bench, benchmark))
     monkeypatch.setattr(adopt, "_subset_bench", lambda b, idx: idx)  # feed indices to the fake encode
-    monkeypatch.setattr(adopt.C, "build_model", lambda name, **kw: _FakeTabModel(arr, dim, delta))
+    monkeypatch.setattr(adopt.C, "build_model", lambda name, **kw: _FakeTabModel(arr, dim, delta, enc_width))
     monkeypatch.setattr(adopt.C, "EMBEDDINGS_DIR", tmp_path / "emb")
     monkeypatch.setattr(adopt.C, "checkpoint_sha256", lambda *a, **k: "CKPT")
     monkeypatch.setattr(adopt.C, "dataset_digest", lambda *a, **k: "DSET")
@@ -70,19 +73,19 @@ def test_tabular_adopt_report_never_writes(tmp_path, monkeypatch):
     monkeypatch.setitem(adopt.CONFIG, "mode", "report")
 
     result = adopt._adopt_tabular(_tab_cand(legacy), {})
-    assert result["status"] == "would-adopt"
+    assert result["status"] == "ready"
     assert not (tmp_path / "emb").exists()  # report mode writes nothing
 
 
-def test_tabular_adopt_publish_success_source_untouched_manifest_last(tmp_path, monkeypatch):
+def test_tabular_apply_renames_source_and_writes_manifest_last(tmp_path, monkeypatch):
     adopt = _load_tool("adopt_embeddings")
     arr = np.arange(24, dtype=np.float32).reshape(8, 3)
     legacy = tmp_path / "legacy" / "baseline.npy"
     legacy.parent.mkdir(parents=True)
     np.save(legacy, arr)
-    legacy_bytes = legacy.read_bytes()
+    legacy_inode = legacy.stat().st_ino
     _setup_tabular(adopt, monkeypatch, tmp_path, arr=arr)
-    monkeypatch.setitem(adopt.CONFIG, "mode", "publish")
+    monkeypatch.setitem(adopt.CONFIG, "mode", "apply")
 
     art_path = adopt.C.embedding_cache_path("cropharvest", "raw", "baseline")
     orig_write = adopt.C._write_manifest
@@ -95,12 +98,31 @@ def test_tabular_adopt_publish_success_source_untouched_manifest_last(tmp_path, 
 
     result = adopt._adopt_tabular(_tab_cand(legacy), {})
     assert result["status"] == "adopted"
-    assert legacy.read_bytes() == legacy_bytes  # source untouched
+    assert not legacy.exists()
+    assert not legacy.parent.exists()
+    assert art_path.stat().st_ino == legacy_inode  # same file, renamed rather than copied
     man = adopt.C._read_manifest(adopt.C.embedding_manifest_path("cropharvest", "raw", "baseline"))
     assert man["benchmark"] == "cropharvest" and man["checkpoint_sha256"] == "CKPT"
     assert man["dataset_digest"] == "DSET" and man["shape"] == [8, 3]
     assert man["artifact_sha256"] == artifacts.sha256_file(art_path)  # sidecar matches published array
     np.testing.assert_array_equal(np.load(art_path), arr)
+
+
+def test_tabular_apply_does_not_serialize_embedding_data(tmp_path, monkeypatch):
+    adopt = _load_tool("adopt_embeddings")
+    arr = np.arange(24, dtype=np.float32).reshape(8, 3)
+    legacy = tmp_path / "legacy" / "baseline.npy"
+    legacy.parent.mkdir(parents=True)
+    np.save(legacy, arr)
+    _setup_tabular(adopt, monkeypatch, tmp_path, arr=arr)
+    monkeypatch.setitem(adopt.CONFIG, "mode", "apply")
+    monkeypatch.setattr(
+        adopt.np,
+        "save",
+        lambda *_args, **_kwargs: pytest.fail("embedding data must be renamed, not serialized"),
+    )
+
+    assert adopt._adopt_tabular(_tab_cand(legacy), {})["status"] == "adopted"
 
 
 def test_tabular_refuses_missing_legacy(tmp_path, monkeypatch):
@@ -123,13 +145,138 @@ def test_tabular_refuses_wrong_dtype(tmp_path, monkeypatch):
 
 
 def test_tabular_refuses_wrong_dimension(tmp_path, monkeypatch):
+    # The encoder OUTPUT width (5) differs from the legacy array width (3) -> refused.
     adopt = _load_tool("adopt_embeddings")
-    arr = np.zeros((4, 3), dtype=np.float32)
+    arr = np.zeros((8, 3), dtype=np.float32)
     legacy = tmp_path / "legacy.npy"
     np.save(legacy, arr)
-    _setup_tabular(adopt, monkeypatch, tmp_path, arr=arr, model_dim=99)  # model expects 99, array is 3
+    _setup_tabular(adopt, monkeypatch, tmp_path, arr=arr, enc_width=5)
     result = adopt._adopt_tabular(_tab_cand(legacy), {})
     assert result["status"] == "refused" and "feature width" in result["reason"]
+
+
+def test_tabular_adopts_zero_embedding_dim_model(tmp_path, monkeypatch):
+    # RawModel reports embedding_dim=0 until its first encode; adoption must take the width from the
+    # encoder OUTPUT, not the attribute -- otherwise every RawModel cell is wrongly refused "width != 0".
+    adopt = _load_tool("adopt_embeddings")
+    arr = np.arange(24, dtype=np.float32).reshape(8, 3)
+    legacy = tmp_path / "legacy.npy"
+    np.save(legacy, arr)
+    _setup_tabular(adopt, monkeypatch, tmp_path, arr=arr, model_dim=0)  # embedding_dim=0 like RawModel
+    monkeypatch.setitem(adopt.CONFIG, "mode", "apply")
+    result = adopt._adopt_tabular(_tab_cand(legacy), {})
+    assert result["status"] == "adopted"
+
+
+def test_tabular_refuses_cross_filesystem_move(tmp_path, monkeypatch):
+    adopt = _load_tool("adopt_embeddings")
+    arr = np.arange(24, dtype=np.float32).reshape(8, 3)
+    legacy = tmp_path / "legacy" / "baseline.npy"
+    legacy.parent.mkdir(parents=True)
+    np.save(legacy, arr)
+    _setup_tabular(adopt, monkeypatch, tmp_path, arr=arr)
+    monkeypatch.setattr(adopt, "_device_id", lambda path: 1 if path == legacy else 2)
+
+    result = adopt._adopt_tabular(_tab_cand(legacy), {})
+    assert result["status"] == "refused" and "cross-filesystem" in result["reason"]
+    assert legacy.exists()
+
+
+def test_tabular_refuses_unexpected_destination(tmp_path, monkeypatch):
+    adopt = _load_tool("adopt_embeddings")
+    arr = np.arange(24, dtype=np.float32).reshape(8, 3)
+    legacy = tmp_path / "legacy" / "baseline.npy"
+    legacy.parent.mkdir(parents=True)
+    np.save(legacy, arr)
+    _setup_tabular(adopt, monkeypatch, tmp_path, arr=arr)
+    destination = adopt.C.embedding_cache_path("cropharvest", "raw", "baseline")
+    destination.parent.mkdir(parents=True)
+    np.save(destination, arr)
+
+    result = adopt._adopt_tabular(_tab_cand(legacy), {})
+    assert result["status"] == "refused" and "already exists" in result["reason"]
+    assert legacy.exists()
+
+
+def test_tabular_valid_canonical_is_checked_before_noop(tmp_path, monkeypatch):
+    adopt = _load_tool("adopt_embeddings")
+    arr = np.arange(24, dtype=np.float32).reshape(8, 3)
+    legacy = tmp_path / "legacy" / "baseline.npy"
+    legacy.parent.mkdir(parents=True)
+    np.save(legacy, arr)
+    _setup_tabular(adopt, monkeypatch, tmp_path, arr=arr)
+    monkeypatch.setitem(adopt.CONFIG, "mode", "apply")
+    assert adopt._adopt_tabular(_tab_cand(legacy), {})["status"] == "adopted"
+
+    result = adopt._adopt_tabular(_tab_cand(legacy), {})
+    assert result["status"] == "already-adopted"
+
+
+def test_tabular_invalid_canonical_is_not_accepted_as_noop(tmp_path, monkeypatch):
+    adopt = _load_tool("adopt_embeddings")
+    arr = np.arange(24, dtype=np.float32).reshape(8, 3)
+    legacy = tmp_path / "legacy" / "baseline.npy"
+    legacy.parent.mkdir(parents=True)
+    np.save(legacy, arr)
+    _setup_tabular(adopt, monkeypatch, tmp_path, arr=arr)
+    monkeypatch.setitem(adopt.CONFIG, "mode", "apply")
+    assert adopt._adopt_tabular(_tab_cand(legacy), {})["status"] == "adopted"
+    manifest_path = adopt.C.embedding_manifest_path("cropharvest", "raw", "baseline")
+    manifest = adopt.C._read_manifest(manifest_path)
+    manifest["model"] = "wrong"
+    adopt.C._write_manifest(manifest_path, manifest)
+
+    result = adopt._adopt_tabular(_tab_cand(legacy), {})
+    assert result["status"] == "refused" and "invalid canonical" in result["reason"]
+
+
+def test_tabular_changed_canonical_array_is_not_accepted_as_noop(tmp_path, monkeypatch):
+    adopt = _load_tool("adopt_embeddings")
+    arr = np.arange(24, dtype=np.float32).reshape(8, 3)
+    legacy = tmp_path / "legacy" / "baseline.npy"
+    legacy.parent.mkdir(parents=True)
+    np.save(legacy, arr)
+    _setup_tabular(adopt, monkeypatch, tmp_path, arr=arr)
+    monkeypatch.setitem(adopt.CONFIG, "mode", "apply")
+    assert adopt._adopt_tabular(_tab_cand(legacy), {})["status"] == "adopted"
+    destination = adopt.C.embedding_cache_path("cropharvest", "raw", "baseline")
+    changed = arr.copy()
+    changed[0, 0] += 1
+    np.save(destination, changed)
+
+    result = adopt._adopt_tabular(_tab_cand(legacy), {})
+    assert result["status"] == "refused"
+
+
+def test_tabular_rerun_finishes_manifest_after_rename_interruption(tmp_path, monkeypatch):
+    adopt = _load_tool("adopt_embeddings")
+    arr = np.arange(24, dtype=np.float32).reshape(8, 3)
+    legacy = tmp_path / "legacy" / "baseline.npy"
+    legacy.parent.mkdir(parents=True)
+    np.save(legacy, arr)
+    _setup_tabular(adopt, monkeypatch, tmp_path, arr=arr)
+    monkeypatch.setitem(adopt.CONFIG, "mode", "apply")
+    original_write = adopt.C._write_manifest
+    monkeypatch.setattr(
+        adopt.C,
+        "_write_manifest",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("interrupted")),
+    )
+    with pytest.raises(RuntimeError, match="interrupted"):
+        adopt._adopt_tabular(_tab_cand(legacy), {})
+    destination = adopt.C.embedding_cache_path("cropharvest", "raw", "baseline")
+    assert destination.exists() and not legacy.exists()
+
+    monkeypatch.setattr(adopt.C, "_write_manifest", original_write)
+    assert adopt._adopt_tabular(_tab_cand(legacy), {})["status"] == "adopted"
+    assert not legacy.parent.exists()
+
+
+def test_real_rawmodel_reports_zero_embedding_dim_before_encode():
+    # The exact property that broke adoption: RawModel.embedding_dim is 0 until the first encode.
+    from models.raw import RawModel
+
+    assert RawModel().embedding_dim == 0
 
 
 def test_tabular_refuses_failed_spotcheck(tmp_path, monkeypatch):
@@ -184,7 +331,7 @@ def _write_tile(root: Path, rel: str, arr: np.ndarray) -> None:
     np.save(path, arr)
 
 
-def _setup_dense(adopt, monkeypatch, tmp_path, *, dim=4, delta=0.0, drop=None,
+def _setup_dense(adopt, monkeypatch, tmp_path, *, dim=4, model_dim=None, delta=0.0, drop=None,
                  extra_label=None, extra_feature=None,
                  malformed_feat=None, bad_dtype_feat=None, bad_dim_feat=None):
     """Build a synthetic legacy dense cache. The ``*_feat`` faults target ONE specific feature rel
@@ -216,7 +363,8 @@ def _setup_dense(adopt, monkeypatch, tmp_path, *, dim=4, delta=0.0, drop=None,
     bench = _FakeDenseBench(bench_tiles)
     monkeypatch.setattr(adopt, "_load_bench", lambda benchmark, s2_only: (bench, benchmark))
     monkeypatch.setattr(adopt.C, "_dense_expected_rels", lambda b: (feat_rels, lab_rels))
-    monkeypatch.setattr(adopt.C, "build_model", lambda name, **kw: _FakeDenseModel(dim, delta))
+    monkeypatch.setattr(adopt.C, "build_model",
+                        lambda name, **kw: _FakeDenseModel(dim if model_dim is None else model_dim, delta))
     monkeypatch.setattr(adopt.C, "EMBEDDINGS_DIR", tmp_path / "emb")
     monkeypatch.setattr(adopt.C, "checkpoint_sha256", lambda *a, **k: "CKPT")
     monkeypatch.setattr(adopt.C, "dataset_digest", lambda *a, **k: "DSET")
@@ -233,16 +381,29 @@ def test_dense_adopt_report_never_writes(tmp_path, monkeypatch):
     legacy, _, _ = _setup_dense(adopt, monkeypatch, tmp_path)
     monkeypatch.setitem(adopt.CONFIG, "mode", "report")
     result = adopt._adopt_dense(_dense_cand(legacy), {})
-    assert result["status"] == "would-adopt"
+    assert result["status"] == "ready"
     assert not (tmp_path / "emb").exists()
 
 
-def test_dense_adopt_publish_success_source_untouched_manifest_last(tmp_path, monkeypatch):
+def test_dense_adopts_zero_embedding_dim_model(tmp_path, monkeypatch):
+    # Dense RawModel also reports embedding_dim=0 until its first encode; dense adoption must derive
+    # the reference width from the legacy tiles, not the attribute, and let the spot-check confirm it.
+    adopt = _load_tool("adopt_embeddings")
+    legacy, feat_rels, lab_rels = _setup_dense(adopt, monkeypatch, tmp_path, model_dim=0)
+    monkeypatch.setitem(adopt.CONFIG, "mode", "apply")
+    result = adopt._adopt_dense(_dense_cand(legacy), {})
+    assert result["status"] == "adopted"
+    root = adopt.C.dense_embedding_cache_dir("pastis", "galileo", "baseline")
+    for rel in feat_rels + lab_rels:
+        assert (root / rel).exists()
+
+
+def test_dense_apply_renames_source_and_writes_manifest_last(tmp_path, monkeypatch):
     adopt = _load_tool("adopt_embeddings")
     legacy, feat_rels, lab_rels = _setup_dense(adopt, monkeypatch, tmp_path)
-    monkeypatch.setitem(adopt.CONFIG, "mode", "publish")
+    monkeypatch.setitem(adopt.CONFIG, "mode", "apply")
 
-    before = {rel: (legacy / rel).read_bytes() for rel in feat_rels + lab_rels}
+    legacy_inode = legacy.stat().st_ino
     root = adopt.C.dense_embedding_cache_dir("pastis", "galileo", "baseline")
     orig_write = adopt.C._write_manifest
 
@@ -255,10 +416,8 @@ def test_dense_adopt_publish_success_source_untouched_manifest_last(tmp_path, mo
 
     result = adopt._adopt_dense(_dense_cand(legacy), {})
     assert result["status"] == "adopted"
-    # source untouched
-    for rel, data in before.items():
-        assert (legacy / rel).read_bytes() == data
-    # canonical tiles + slim manifest
+    assert not legacy.exists()
+    assert root.stat().st_ino == legacy_inode  # whole tree renamed without per-tile copies
     for rel in feat_rels + lab_rels:
         assert (root / rel).exists()
     man = adopt.C._read_manifest(adopt.C.dense_manifest_path("pastis", "galileo", "baseline"))
@@ -318,37 +477,79 @@ def test_dense_refuses_failed_spotcheck(tmp_path, monkeypatch):
     assert result["status"] == "refused" and "spot check" in result["reason"]
 
 
-def test_dense_publish_replaces_foreign_partial_tile(tmp_path, monkeypatch):
-    # A partial destination left by ANOTHER candidate: a valid-looking .npy at an expected rel but
-    # with foreign bytes. Publication must not trust it -- it is replaced from the selected source,
-    # so the foreign content can never be certified.
+def test_dense_refuses_unexpected_destination(tmp_path, monkeypatch):
     adopt = _load_tool("adopt_embeddings")
     legacy, feat_rels, _ = _setup_dense(adopt, monkeypatch, tmp_path)
-    monkeypatch.setitem(adopt.CONFIG, "mode", "publish")
     root = adopt.C.dense_embedding_cache_dir("pastis", "galileo", "baseline")
     foreign_rel = feat_rels[0]
-    _write_tile(root, foreign_rel, np.full((5, 4), 7.0, dtype=np.float32))  # different from legacy
-    foreign_bytes = (root / foreign_rel).read_bytes()
-    legacy_bytes = (legacy / foreign_rel).read_bytes()
-    assert foreign_bytes != legacy_bytes
+    _write_tile(root, foreign_rel, np.full((5, 4), 7.0, dtype=np.float32))
 
     result = adopt._adopt_dense(_dense_cand(legacy), {})
-    assert result["status"] == "adopted"
-    published = (root / foreign_rel).read_bytes()
-    assert published == legacy_bytes and published != foreign_bytes  # foreign tile replaced
+    assert result["status"] == "refused" and "already exists" in result["reason"]
+    assert legacy.exists()
 
 
-def test_dense_publish_keeps_byte_identical_tile(tmp_path, monkeypatch):
-    # The safe-resume happy path: a destination tile that already matches the source is a no-op.
+def test_dense_refuses_cross_filesystem_move(tmp_path, monkeypatch):
     adopt = _load_tool("adopt_embeddings")
-    legacy, feat_rels, _ = _setup_dense(adopt, monkeypatch, tmp_path)
-    monkeypatch.setitem(adopt.CONFIG, "mode", "publish")
-    root = adopt.C.dense_embedding_cache_dir("pastis", "galileo", "baseline")
-    rel = feat_rels[0]
-    _write_tile(root, rel, np.load(legacy / rel))  # identical to source
+    legacy, _, _ = _setup_dense(adopt, monkeypatch, tmp_path)
+    monkeypatch.setattr(adopt, "_device_id", lambda path: 1 if path == legacy else 2)
+
     result = adopt._adopt_dense(_dense_cand(legacy), {})
-    assert result["status"] == "adopted"
-    assert (root / rel).read_bytes() == (legacy / rel).read_bytes()
+    assert result["status"] == "refused" and "cross-filesystem" in result["reason"]
+    assert legacy.exists()
+
+
+def test_dense_canonical_noop_runs_full_validation(tmp_path, monkeypatch):
+    adopt = _load_tool("adopt_embeddings")
+    legacy, _, label_rels = _setup_dense(adopt, monkeypatch, tmp_path)
+    monkeypatch.setitem(adopt.CONFIG, "mode", "apply")
+    assert adopt._adopt_dense(_dense_cand(legacy), {})["status"] == "adopted"
+    assert adopt._adopt_dense(_dense_cand(legacy), {})["status"] == "already-adopted"
+    root = adopt.C.dense_embedding_cache_dir("pastis", "galileo", "baseline")
+    np.save(root / label_rels[-1], np.zeros(5, dtype=np.float32))
+
+    result = adopt._adopt_dense(_dense_cand(legacy), {})
+    assert result["status"] == "refused" and "dtype" in result["reason"]
+
+
+def test_main_validates_all_candidates_before_first_rename(monkeypatch):
+    adopt = _load_tool("adopt_embeddings")
+    applied = []
+    candidates = [{"benchmark": "a", "model": "m"}, {"benchmark": "b", "model": "m"}]
+    monkeypatch.setitem(adopt.CONFIG, "mode", "apply")
+    monkeypatch.setitem(adopt.CONFIG, "candidates", candidates)
+
+    def prepare(candidate, _enc_kwargs):
+        if candidate["benchmark"] == "b":
+            return adopt._Plan({"candidate": "b/m", "status": "refused", "reason": "bad"})
+        return adopt._Plan(
+            {"candidate": "a/m", "status": "ready"},
+            lambda: applied.append("a") or {"candidate": "a/m", "status": "adopted"},
+        )
+
+    monkeypatch.setattr(adopt, "_prepare_candidate", prepare)
+    assert adopt.main() == 1
+    assert applied == []
+
+
+def test_main_validates_each_candidate_once(monkeypatch):
+    adopt = _load_tool("adopt_embeddings")
+    prepared, applied = [], []
+    candidates = [{"benchmark": "a", "model": "m"}, {"benchmark": "b", "model": "m"}]
+    monkeypatch.setitem(adopt.CONFIG, "mode", "apply")
+    monkeypatch.setitem(adopt.CONFIG, "candidates", candidates)
+
+    def prepare(candidate, _enc_kwargs):
+        name = candidate["benchmark"]
+        prepared.append(name)
+        return adopt._Plan(
+            {"candidate": f"{name}/m", "status": "ready"},
+            lambda: applied.append(name) or {"candidate": f"{name}/m", "status": "adopted"},
+        )
+
+    monkeypatch.setattr(adopt, "_prepare_candidate", prepare)
+    assert adopt.main() == 0
+    assert prepared == ["a", "b"] and applied == ["a", "b"]
 
 
 # ============================ dataset preflight =============================
