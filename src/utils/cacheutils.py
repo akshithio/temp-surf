@@ -77,19 +77,6 @@ def _cache_lock(path: Path):
 _CANONICAL_LOADER = {"max_samples": None, "shuffle": True, "seed": 0}
 
 
-#: Readable integer schema for the benchmark pickle. BUMP THIS whenever a loader/metadata change
-#: alters the cached benchmark object (e.g. the CropHarvest Mali merge, PASTIS EPSG transform + tile,
-#: EuroCropsML class mask), so a stale pre-change pickle is rejected and rebuilt rather than silently
-#: reused. Identity here is a plain declared integer + name -- never a hash of the object.
-BENCHMARK_CACHE_SCHEMA = 2
-
-_BENCH_SCHEMA_KEY = "benchmark_cache_schema"
-
-
-class _StaleBenchCache(Exception):
-    """The on-disk benchmark pickle is a legacy/foreign/older-schema object -- rebuild it."""
-
-
 def benchmark_cache_path(benchmark: str) -> Path:
     """The single canonical pickle path for a supported benchmark."""
     if benchmark not in BENCHMARK_MODULES:
@@ -97,65 +84,42 @@ def benchmark_cache_path(benchmark: str) -> Path:
     return CACHE_DIR / "benchmark" / f"{benchmark}.pkl"
 
 
-def _read_cached_bench(p: Path, benchmark: str):
-    """Read a canonical benchmark pickle, validating its readable header before the object.
-
-    The file is two pickled records: a header ``{schema, benchmark}`` then the object. A legacy bare
-    pickle (object first, no header dict), a wrong schema, or a wrong benchmark name all raise
-    :class:`_StaleBenchCache` so the caller rebuilds -- an old readable pickle can never silently
-    survive a metadata change.
-    """
-    with p.open("rb") as f:  # streaming unpickle -- header validated before the (large) object
-        header = pickle.load(f)
-        if not isinstance(header, dict) or _BENCH_SCHEMA_KEY not in header:
-            raise _StaleBenchCache("legacy bare pickle without a schema header")
-        schema = header.get(_BENCH_SCHEMA_KEY)
-        if schema != BENCHMARK_CACHE_SCHEMA:
-            raise _StaleBenchCache(f"schema {schema!r} != current {BENCHMARK_CACHE_SCHEMA}")
-        if str(header.get("benchmark")) != str(benchmark):
-            raise _StaleBenchCache(f"benchmark {header.get('benchmark')!r} != requested {benchmark!r}")
-        return pickle.load(f)
-
-
 def cached_bench(benchmark: str):
     """Load-or-build the ONE canonical benchmark pickle at data/cache/benchmark/<benchmark>.pkl.
 
     The pickle is always built with the fixed production contract (max_samples=None, shuffle=True,
     seed=0), which is loader behavior -- not cache identity -- so it is not encoded in the filename.
-    It carries a readable ``{schema, benchmark}`` header; a legacy, wrong-schema, wrong-name, or
-    unreadable pickle is reported and rebuilt in place under the writer lock. No loader kwargs are
-    accepted and no per-parameter fallback file is ever created.
+    No loader kwargs are accepted and no per-parameter fallback file is ever created; utilities that
+    need a subset must call ``dataio.get_input`` directly and must not write this cache. An
+    unreadable pickle is reported and rebuilt in place under the writer lock.
     """
     path = benchmark_cache_path(benchmark)
 
     def _try_read(p: Path):
         try:
-            return _read_cached_bench(p, benchmark), None
-        except Exception as exc:  # _StaleBenchCache (stale header) OR unreadable/truncated pickle
+            with p.open("rb") as f:  # streaming unpickle -- no full-file bytes allocation
+                return pickle.load(f), None
+        except Exception as exc:  # unreadable / truncated / partial pickle
             return None, exc
-
-    def _reason(exc) -> str:
-        return "stale" if isinstance(exc, _StaleBenchCache) else "unreadable"
 
     if path.exists():
         bench, exc = _try_read(path)
         if bench is not None:
             return bench
-        print(f"  !! benchmark cache {_reason(exc)} at {path}: {type(exc).__name__}: {exc} -- rebuilding", flush=True)
+        print(f"  !! benchmark cache unreadable at {path}: {type(exc).__name__}: {exc} -- rebuilding", flush=True)
 
     with _cache_lock(path):
         if path.exists():  # a concurrent writer may have just (re)built it
             bench, exc = _try_read(path)
             if bench is not None:
                 return bench
-            print(f"  !! benchmark cache still {_reason(exc)} at {path}: {type(exc).__name__}: {exc} -- rebuilding", flush=True)
+            print(f"  !! benchmark cache still unreadable at {path}: {type(exc).__name__}: {exc} -- rebuilding", flush=True)
         with perf.measure(f"bench.load/{benchmark}"):
             bench = GI.get_input(benchmark, root=INPUT_ROOT, **_CANONICAL_LOADER)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = _atomic_tmp(path)
         try:
-            with open(tmp, "wb") as f:  # header first, then the object, atomically via os.replace
-                pickle.dump({_BENCH_SCHEMA_KEY: BENCHMARK_CACHE_SCHEMA, "benchmark": benchmark}, f)
+            with open(tmp, "wb") as f:
                 pickle.dump(bench, f)
             os.replace(tmp, path)
         finally:
