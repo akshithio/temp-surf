@@ -49,7 +49,7 @@ LOGS_PATH = SA.default_log_path(SPLITS_ROOT)          # data/logs/splits.json
 BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis"]
 REGIMES = ["random_id", "official", "geographic_ood", "spatial_cluster_ood"]
 SEEDS = [0, 1, 2]
-AUDIT_ONLY = True     # True = validate + report; writes NO assignments.csv / splits.json (may
+AUDIT_ONLY = False    # True = validate + report; writes NO assignments.csv / splits.json (may
 #                       populate/read the benchmark pickle cache via cached_bench). False = write.
 # =============================================================================
 
