@@ -54,6 +54,7 @@ def _setup_tabular(adopt, monkeypatch, tmp_path, *, arr, model_dim=None, delta=0
     monkeypatch.setattr(adopt, "_subset_bench", lambda b, idx: idx)  # feed indices to the fake encode
     monkeypatch.setattr(adopt.C, "build_model", lambda name, **kw: _FakeTabModel(arr, dim, delta, enc_width))
     monkeypatch.setattr(adopt.C, "EMBEDDINGS_DIR", tmp_path / "emb")
+    monkeypatch.setattr(adopt.C, "CACHE_JSON_PATH", tmp_path / "logs" / "cache.json")
     monkeypatch.setattr(adopt.C, "checkpoint_sha256", lambda *a, **k: "CKPT")
     monkeypatch.setattr(adopt.C, "dataset_digest", lambda *a, **k: "DSET")
 
@@ -77,7 +78,7 @@ def test_tabular_adopt_report_never_writes(tmp_path, monkeypatch):
     assert not (tmp_path / "emb").exists()  # report mode writes nothing
 
 
-def test_tabular_apply_renames_source_and_writes_manifest_last(tmp_path, monkeypatch):
+def test_tabular_apply_renames_source_and_writes_record_last(tmp_path, monkeypatch):
     adopt = _load_tool("adopt_embeddings")
     arr = np.arange(24, dtype=np.float32).reshape(8, 3)
     legacy = tmp_path / "legacy" / "baseline.npy"
@@ -88,23 +89,23 @@ def test_tabular_apply_renames_source_and_writes_manifest_last(tmp_path, monkeyp
     monkeypatch.setitem(adopt.CONFIG, "mode", "apply")
 
     art_path = adopt.C.embedding_cache_path("cropharvest", "raw", "baseline")
-    orig_write = adopt.C._write_manifest
+    orig_update = adopt.C.update_cache
 
-    def _manifest_last(path, manifest):  # the array must already exist when the manifest is written
-        assert art_path.exists(), "manifest written before the array -- not manifest-last"
-        return orig_write(path, manifest)
+    def _record_last(**kwargs):  # the array must already exist when the record is written
+        assert art_path.exists(), "record written before the array -- not record-last"
+        return orig_update(**kwargs)
 
-    monkeypatch.setattr(adopt.C, "_write_manifest", _manifest_last)
+    monkeypatch.setattr(adopt.C, "update_cache", _record_last)
 
     result = adopt._adopt_tabular(_tab_cand(legacy), {})
     assert result["status"] == "adopted"
     assert not legacy.exists()
     assert not legacy.parent.exists()
     assert art_path.stat().st_ino == legacy_inode  # same file, renamed rather than copied
-    man = adopt.C._read_manifest(adopt.C.embedding_manifest_path("cropharvest", "raw", "baseline"))
-    assert man["benchmark"] == "cropharvest" and man["checkpoint_sha256"] == "CKPT"
-    assert man["dataset_digest"] == "DSET" and man["shape"] == [8, 3]
-    assert man["artifact_sha256"] == artifacts.sha256_file(art_path)  # sidecar matches published array
+    record = adopt.C._cache_record("cropharvest", "raw", "baseline")
+    assert record["checkpoint_sha256"] == "CKPT" and record["dataset_digest"] == "DSET"
+    assert record["shape"] == [8, 3]
+    assert record["artifact_sha256"] == artifacts.sha256_file(art_path)  # record matches published array
     np.testing.assert_array_equal(np.load(art_path), arr)
 
 
@@ -221,10 +222,10 @@ def test_tabular_invalid_canonical_is_not_accepted_as_noop(tmp_path, monkeypatch
     _setup_tabular(adopt, monkeypatch, tmp_path, arr=arr)
     monkeypatch.setitem(adopt.CONFIG, "mode", "apply")
     assert adopt._adopt_tabular(_tab_cand(legacy), {})["status"] == "adopted"
-    manifest_path = adopt.C.embedding_manifest_path("cropharvest", "raw", "baseline")
-    manifest = adopt.C._read_manifest(manifest_path)
-    manifest["model"] = "wrong"
-    adopt.C._write_manifest(manifest_path, manifest)
+    key = adopt.C._embedding_key("cropharvest", "raw", "baseline")
+    record = adopt.C._cache_record("cropharvest", "raw", "baseline")
+    record["checkpoint_sha256"] = "wrong"  # a validated identity field now disagrees
+    adopt.C.update_cache(embeddings={key: record})
 
     result = adopt._adopt_tabular(_tab_cand(legacy), {})
     assert result["status"] == "refused" and "invalid canonical" in result["reason"]
@@ -248,7 +249,7 @@ def test_tabular_changed_canonical_array_is_not_accepted_as_noop(tmp_path, monke
     assert result["status"] == "refused"
 
 
-def test_tabular_rerun_finishes_manifest_after_rename_interruption(tmp_path, monkeypatch):
+def test_tabular_rerun_finishes_record_after_rename_interruption(tmp_path, monkeypatch):
     adopt = _load_tool("adopt_embeddings")
     arr = np.arange(24, dtype=np.float32).reshape(8, 3)
     legacy = tmp_path / "legacy" / "baseline.npy"
@@ -256,18 +257,18 @@ def test_tabular_rerun_finishes_manifest_after_rename_interruption(tmp_path, mon
     np.save(legacy, arr)
     _setup_tabular(adopt, monkeypatch, tmp_path, arr=arr)
     monkeypatch.setitem(adopt.CONFIG, "mode", "apply")
-    original_write = adopt.C._write_manifest
+    original_update = adopt.C.update_cache
     monkeypatch.setattr(
         adopt.C,
-        "_write_manifest",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("interrupted")),
+        "update_cache",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("interrupted")),
     )
     with pytest.raises(RuntimeError, match="interrupted"):
         adopt._adopt_tabular(_tab_cand(legacy), {})
     destination = adopt.C.embedding_cache_path("cropharvest", "raw", "baseline")
     assert destination.exists() and not legacy.exists()
 
-    monkeypatch.setattr(adopt.C, "_write_manifest", original_write)
+    monkeypatch.setattr(adopt.C, "update_cache", original_update)
     assert adopt._adopt_tabular(_tab_cand(legacy), {})["status"] == "adopted"
     assert not legacy.parent.exists()
 
@@ -366,6 +367,7 @@ def _setup_dense(adopt, monkeypatch, tmp_path, *, dim=4, model_dim=None, delta=0
     monkeypatch.setattr(adopt.C, "build_model",
                         lambda name, **kw: _FakeDenseModel(dim if model_dim is None else model_dim, delta))
     monkeypatch.setattr(adopt.C, "EMBEDDINGS_DIR", tmp_path / "emb")
+    monkeypatch.setattr(adopt.C, "CACHE_JSON_PATH", tmp_path / "logs" / "cache.json")
     monkeypatch.setattr(adopt.C, "checkpoint_sha256", lambda *a, **k: "CKPT")
     monkeypatch.setattr(adopt.C, "dataset_digest", lambda *a, **k: "DSET")
     return legacy, feat_rels, lab_rels
@@ -398,21 +400,21 @@ def test_dense_adopts_zero_embedding_dim_model(tmp_path, monkeypatch):
         assert (root / rel).exists()
 
 
-def test_dense_apply_renames_source_and_writes_manifest_last(tmp_path, monkeypatch):
+def test_dense_apply_renames_source_and_writes_record_last(tmp_path, monkeypatch):
     adopt = _load_tool("adopt_embeddings")
     legacy, feat_rels, lab_rels = _setup_dense(adopt, monkeypatch, tmp_path)
     monkeypatch.setitem(adopt.CONFIG, "mode", "apply")
 
     legacy_inode = legacy.stat().st_ino
     root = adopt.C.dense_embedding_cache_dir("pastis", "galileo", "baseline")
-    orig_write = adopt.C._write_manifest
+    orig_update = adopt.C.update_cache
 
-    def _manifest_last(path, manifest):
-        for rel in feat_rels + lab_rels:  # every expected tile present before the manifest lands
-            assert (root / rel).exists(), f"manifest written before tile {rel}"
-        return orig_write(path, manifest)
+    def _record_last(**kwargs):
+        for rel in feat_rels + lab_rels:  # every expected tile present before the record lands
+            assert (root / rel).exists(), f"record written before tile {rel}"
+        return orig_update(**kwargs)
 
-    monkeypatch.setattr(adopt.C, "_write_manifest", _manifest_last)
+    monkeypatch.setattr(adopt.C, "update_cache", _record_last)
 
     result = adopt._adopt_dense(_dense_cand(legacy), {})
     assert result["status"] == "adopted"
@@ -420,11 +422,11 @@ def test_dense_apply_renames_source_and_writes_manifest_last(tmp_path, monkeypat
     assert root.stat().st_ino == legacy_inode  # whole tree renamed without per-tile copies
     for rel in feat_rels + lab_rels:
         assert (root / rel).exists()
-    man = adopt.C._read_manifest(adopt.C.dense_manifest_path("pastis", "galileo", "baseline"))
-    assert man["feature_tile_count"] == 3 and man["label_tile_count"] == 3
-    assert man["feature_dim"] == 4 and man["dtype"] == "float32"
-    assert man["checkpoint_sha256"] == "CKPT" and man["dataset_digest"] == "DSET"
-    assert man["tile_set_digest"] == adopt.C.tile_set_digest(feat_rels, lab_rels)
+    record = adopt.C._cache_record("pastis", "galileo", "baseline")
+    assert record["feature_tile_count"] == 3 and record["label_tile_count"] == 3
+    assert record["feature_dim"] == 4 and record["dtype"] == "float32"
+    assert record["checkpoint_sha256"] == "CKPT" and record["dataset_digest"] == "DSET"
+    assert record["tile_set_digest"] == adopt.C.tile_set_digest(feat_rels, lab_rels)
 
 
 def test_dense_refuses_missing_tile(tmp_path, monkeypatch):
@@ -583,50 +585,51 @@ def test_preflight_refuses_missing_input(tmp_path):
 
 
 def _prep_preflight(pre, monkeypatch, tmp_path, benches):
-    """benches: {benchmark: {relpath: bytes}}. Returns (digest_dir, {benchmark: good_digest})."""
-    input_root, digest_dir = tmp_path / "benchmarks", tmp_path / "digests"
+    """benches: {benchmark: {relpath: bytes}}. Returns (cache_json_path, {benchmark: good_digest})."""
+    input_root = tmp_path / "benchmarks"
+    cache_json = tmp_path / "logs" / "cache.json"
     consumed = {b: sorted(files) for b, files in benches.items()}
     for bench, files in benches.items():
         _mk_files(input_root / bench, files)
     monkeypatch.setattr(pre.C, "INPUT_ROOT", input_root)
-    monkeypatch.setattr(pre.C, "DATASET_DIGEST_DIR", digest_dir)
+    monkeypatch.setattr(pre.C, "CACHE_JSON_PATH", cache_json)
     monkeypatch.setattr(pre, "_consumed_files", lambda benchmark, r: consumed[benchmark])
     monkeypatch.setitem(pre.CONFIG, "benchmarks", list(benches))
     good = {b: pre._aggregate_sha256(input_root / b, consumed[b]) for b in benches}
-    return digest_dir, good
+    return cache_json, good
 
 
 def test_preflight_reference_match_writes_digest(tmp_path, monkeypatch):
     pre = _load_tool("preflight_dataset_digests")
-    digest_dir, good = _prep_preflight(pre, monkeypatch, tmp_path, {"fake": {"a.npy": b"AAA", "b.npy": b"BBB"}})
+    _cache_json, good = _prep_preflight(pre, monkeypatch, tmp_path, {"fake": {"a.npy": b"AAA", "b.npy": b"BBB"}})
     monkeypatch.setitem(pre.CONFIG, "reference", {"fake": good["fake"]})
     monkeypatch.setitem(pre.CONFIG, "write", True)
     assert pre.main() == 0
-    assert (digest_dir / "fake.txt").read_text().strip() == good["fake"]
+    assert pre.C._read_cache_doc()["datasets"]["fake"] == good["fake"]
 
 
-def test_preflight_write_enabled_mismatch_leaves_files_unchanged(tmp_path, monkeypatch):
-    # write=True, but one benchmark's reference mismatches -> transactional abort: the matching
-    # benchmark's file is NOT written and a pre-existing digest file is left untouched.
+def test_preflight_write_enabled_mismatch_leaves_records_unchanged(tmp_path, monkeypatch):
+    # write=True, but one benchmark's reference mismatches -> transactional abort: nothing is merged
+    # into cache.json and a pre-existing dataset record is left untouched.
     pre = _load_tool("preflight_dataset_digests")
-    digest_dir, good = _prep_preflight(
+    _cache_json, good = _prep_preflight(
         pre, monkeypatch, tmp_path, {"good": {"a.npy": b"AAA"}, "bad": {"b.npy": b"BBB"}})
-    digest_dir.mkdir()
-    (digest_dir / "good.txt").write_text("PRIOR\n")  # a prior good run's file
+    pre.C.update_cache(datasets={"good": "PRIOR"})  # a prior good run's record
     monkeypatch.setitem(pre.CONFIG, "reference", {"good": good["good"], "bad": "0" * 64})
     monkeypatch.setitem(pre.CONFIG, "write", True)
     assert pre.main() == 1
-    assert (digest_dir / "good.txt").read_text() == "PRIOR\n"  # untouched despite matching + write=True
-    assert not (digest_dir / "bad.txt").exists()               # mismatch never written
+    datasets = pre.C._read_cache_doc()["datasets"]
+    assert datasets["good"] == "PRIOR"  # untouched despite matching + write=True
+    assert "bad" not in datasets        # mismatch never written
 
 
 def test_preflight_dry_run_is_write_free(tmp_path, monkeypatch):
     pre = _load_tool("preflight_dataset_digests")
-    digest_dir, _good = _prep_preflight(pre, monkeypatch, tmp_path, {"fake": {"a.npy": b"AAA"}})
+    cache_json, _good = _prep_preflight(pre, monkeypatch, tmp_path, {"fake": {"a.npy": b"AAA"}})
     monkeypatch.setitem(pre.CONFIG, "reference", {})  # no reference -> no failure
     monkeypatch.setitem(pre.CONFIG, "write", False)
     assert pre.main() == 0
-    assert not digest_dir.exists()  # zero filesystem writes, including no directory creation
+    assert not cache_json.exists()  # zero filesystem writes
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Frozen-run tabular embedding cache: fixed paths, sidecar identity, refuse-on-mismatch."""
+"""Frozen-run tabular embedding cache: fixed paths, cache.json identity, refuse-on-mismatch."""
 
 from __future__ import annotations
 
@@ -33,9 +33,8 @@ class FakeBench:
 @pytest.fixture
 def cache_env(tmp_path, monkeypatch):
     monkeypatch.setattr(C, "EMBEDDINGS_DIR", tmp_path / "emb")
-    monkeypatch.setattr(C, "DATASET_DIGEST_DIR", tmp_path / "dd")
-    (tmp_path / "dd").mkdir()
-    (tmp_path / "dd" / "cropharvest.txt").write_text("d" * 64)
+    monkeypatch.setattr(C, "CACHE_JSON_PATH", tmp_path / "logs" / "cache.json")
+    C.update_cache(datasets={"cropharvest": "d" * 64})
     return tmp_path
 
 
@@ -52,14 +51,12 @@ def test_extract_then_load_roundtrip_fixed_path(cache_env, monkeypatch):
     assert np.array_equal(out, arr)
 
     art = C.embedding_cache_path("cropharvest", "fakemodel", "baseline")
-    man = C.embedding_manifest_path("cropharvest", "fakemodel", "baseline")
-    assert art.name == "baseline.npy" and man.name == "baseline.manifest.json"
-    assert art.exists() and man.exists()
+    assert art.name == "baseline.npy" and art.exists()
 
-    manifest = C._read_manifest(man)
-    assert manifest["shape"] == [3, 4] and manifest["dtype"] == "float32"
-    assert len(manifest["artifact_sha256"]) == 64 and len(manifest["checkpoint_sha256"]) == 64
-    assert "sample_ids_digest" in manifest and "byte_size" not in manifest  # slim sidecar
+    record = C._cache_record("cropharvest", "fakemodel", "baseline")
+    assert record["shape"] == [3, 4] and record["dtype"] == "float32"
+    assert len(record["artifact_sha256"]) == 64 and len(record["checkpoint_sha256"]) == 64
+    assert "sample_ids_digest" in record and "byte_size" not in record  # slim record
 
     assert np.array_equal(C.load_cached_embeddings(bench, "cropharvest", "fakemodel", "baseline"), arr)
 
@@ -83,7 +80,7 @@ def test_load_rejects_dataset_digest_change(cache_env, monkeypatch):
     bench = FakeBench(2)
     _patch_model(monkeypatch, np.zeros((2, 4), np.float32))
     C.extract_and_cache(bench, "cropharvest", "fakemodel", "baseline")
-    (cache_env / "dd" / "cropharvest.txt").write_text("e" * 64)
+    C.update_cache(datasets={"cropharvest": "e" * 64})  # inputs changed underneath
     with pytest.raises(C.MissingEmbeddingCache, match="dataset_digest"):
         C.load_cached_embeddings(bench, "cropharvest", "fakemodel", "baseline")
 
@@ -113,21 +110,21 @@ def test_extract_refuses_to_replace_a_mismatched_cache(cache_env, monkeypatch):
     bench = FakeBench(2)
     _patch_model(monkeypatch, np.zeros((2, 4), np.float32))
     C.extract_and_cache(bench, "cropharvest", "fakemodel", "baseline")
-    (cache_env / "dd" / "cropharvest.txt").write_text("e" * 64)  # inputs changed underneath
+    C.update_cache(datasets={"cropharvest": "e" * 64})  # inputs changed underneath
     with pytest.raises(C.MissingEmbeddingCache, match="REFUSING|Delete the leaf"):
         C.extract_and_cache(bench, "cropharvest", "fakemodel", "baseline")
 
 
-def test_manifest_is_written_only_after_the_array(cache_env, monkeypatch):
-    """If publication fails at the manifest step, there is an array but NO manifest, so the cache
-    reads as incomplete (not built) rather than certified."""
+def test_record_is_written_only_after_the_array(cache_env, monkeypatch):
+    """If publication fails at the record step, there is an array but NO cache.json record, so the
+    cache reads as incomplete (not built) rather than certified."""
     bench = FakeBench(2)
     _patch_model(monkeypatch, np.zeros((2, 4), np.float32))
-    monkeypatch.setattr(C, "_write_manifest", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(C, "update_cache", lambda **k: (_ for _ in ()).throw(RuntimeError("boom")))
     with pytest.raises(RuntimeError, match="boom"):
         C.extract_and_cache(bench, "cropharvest", "fakemodel", "baseline")
     assert C.embedding_cache_path("cropharvest", "fakemodel", "baseline").exists()
-    assert not C.embedding_manifest_path("cropharvest", "fakemodel", "baseline").exists()
+    assert C._cache_record("cropharvest", "fakemodel", "baseline") is None
     with pytest.raises(C.MissingEmbeddingCache, match="not built"):
         C.load_cached_embeddings(bench, "cropharvest", "fakemodel", "baseline")
 
