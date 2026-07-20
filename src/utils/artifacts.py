@@ -703,6 +703,54 @@ def _validate_contrasts(results_dir: Path, rows: list[dict[str, Any]]) -> tuple[
     return contrasts.validate_written_contrasts(results_dir, rows)
 
 
+def expects_geographic_deltas(rows: list[dict[str, Any]]) -> bool:
+    """True when these rows carry BOTH legs of a geographic ID-to-OOD delta.
+
+    A run that produced a random_id in-distribution row AND a geographic_ood target-side row (either
+    schema) must yield at least one delta. Without this, an empty ``deltas.csv`` is indistinguishable
+    from a run that legitimately had nothing to compare.
+    """
+    has_id = any(
+        r.get("split_regime") == "random_id" and r.get("budget_type") == "source" for r in rows
+    )
+    has_ood = any(
+        r.get("split_regime") == "geographic_ood"
+        and r.get("budget_type") in ("target", "label_access")
+        for r in rows
+    )
+    return has_id and has_ood
+
+
+def _validate_deltas(results_dir: Path, rows: list[dict[str, Any]]) -> list[str]:
+    """A run expected to contain geographic deltas must not certify with an empty/headerless deltas.csv.
+
+    ``write_csv`` renders an empty row list as a ZERO-BYTE file, which passes an existence check and
+    hashes cleanly -- so the marker would otherwise certify a run whose headline geographic result
+    silently failed to compute.
+    """
+    if not expects_geographic_deltas(rows):
+        return []
+    path = Path(results_dir) / "deltas.csv"
+    if not path.is_file():
+        return ["deltas.csv: expected geographic deltas but the artifact is absent"]
+    text = path.read_text().strip()
+    if not text:
+        return [
+            "deltas.csv: run carries a random_id reference and a geographic_ood target-side row, "
+            "but the delta table is empty -- the ID-to-OOD comparison resolved no rows"
+        ]
+    lines = text.splitlines()
+    if len(lines) < 2:
+        return ["deltas.csv: header present but no delta rows"]
+    header = lines[0].split(",")
+    missing = [c for c in ("metric", "id", "ood", "delta", "ood_regime") if c not in header]
+    if missing:
+        return [f"deltas.csv: missing required column(s) {missing}"]
+    if not any(c.strip() == "geographic_ood" for line in lines[1:] for c in line.split(",")):
+        return ["deltas.csv: no geographic_ood row despite a geographic_ood target-side result"]
+    return []
+
+
 # --- completion marker ------------------------------------------------------
 
 
@@ -777,6 +825,8 @@ def write_run_complete(
     contrast_problems, contrast_hashes = _validate_contrasts(results_dir, rows)
     if contrast_problems:
         problems.append(_summarize("label-access contrast artifact problem(s)", contrast_problems))
+
+    problems.extend(_validate_deltas(results_dir, rows))
 
     if problems:
         raise IncompleteRunError(
@@ -902,6 +952,7 @@ def validate_run_complete(
                     disk_h = on_disk.get(name, {}).get("sha256")  # None => file missing (already reported)
                     if disk_h is not None and disk_h != marker_h:
                         problems.append(f"{name}: sha256 changed since completion (stale or edited)")
+        problems.extend(_validate_deltas(results_dir, rows))
     return (not problems), problems
 
 

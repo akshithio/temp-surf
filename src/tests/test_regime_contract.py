@@ -123,10 +123,11 @@ def test_geographic_ood_speaks_the_v2_regime_contract() -> None:
 
 def test_spatial_cluster_ood_speaks_the_v2_regime_contract() -> None:
     """spatial_cluster_ood is migrated to schema v2: coordinate-only cell emitter + fail-closed route
-    capabilities (target geography WITH target labels), NOT the retired v1 iter_splits/assign_domains."""
+    capabilities. It carries target geography but NO target labels -- it is a split-sensitivity
+    analysis scored zero-shot, not a second deployment setting."""
     from evals.regimes import spatial_cluster_ood as sc
 
-    assert RB.route_capabilities(sc) == (True, True)  # has_target AND supports target labels
+    assert RB.route_capabilities(sc) == (True, False)  # has_target, but NO target-label routes
     # five far-apart coordinate blobs (each two-class) -> five clean spherical-K-means cells
     centers = [(0.0, 0.0), (0.0, 40.0), (40.0, 0.0), (-40.0, 0.0), (0.0, -40.0)]
     groups, y, latlon = [], [], []
@@ -145,9 +146,9 @@ def test_spatial_cluster_ood_speaks_the_v2_regime_contract() -> None:
     assert [s.label for s in splits] == list(sc._CELL_NAMES)  # exactly the five fixed cells, in order
     assert len(splits) == sc.N_CLUSTERS == 5
     sp = splits[0]
-    assert sp.has_target is True and sp.supports_target_labels is True
-    assert sp.target_label_pool.size > 0 and sp.target_test.size > 0
-    assert sp.target_role == RB.TARGET_ROLE_HEADLINE  # every spatial cell is a headline target
+    assert sp.has_target is True and sp.supports_target_labels is False
+    assert sp.target_label_pool.size == 0 and sp.target_test.size > 0  # whole cell is zero-shot eval
+    assert sp.target_role == RB.TARGET_ROLE_HEADLINE
     assert not RB.REGIME_PROBLEMS  # the v2 emitter raises on infeasibility; it never records a problem
     assert len(sc.sample_domains(bench, bench_mod)) == len(y)
     # the retired v1 contract is genuinely gone (no silent alias/fallback left behind)

@@ -21,6 +21,7 @@ Per-benchmark frozen geography (from :mod:`evals.split_spec`):
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterator
 
 import numpy as np
@@ -111,6 +112,121 @@ def _purge(source: np.ndarray, target: np.ndarray, latlon: np.ndarray | None, ra
     return np.sort(source[keep])
 
 
+class FootprintError(ValueError):
+    """The declared target footprint could not be constructed -- refuse to build the split.
+
+    Footprint exclusion is load-bearing for what ``geographic_ood`` MEANS on a provenance-labelled
+    benchmark. Silently skipping it would emit a split that looks identical to a clean one while
+    retaining in-territory source points, so every failure path here raises instead of degrading.
+    """
+
+
+#: Local azimuthal-equidistant projection centred on the target. Distances through the centre are
+#: true and local distortion is negligible at the scale of one region, so a metre buffer applied in
+#: this plane is a real geographic buffer -- unlike expanding lat/lon degrees, where a degree of
+#: longitude shrinks as cos(latitude) and radial vertex scaling never yields constant width.
+FOOTPRINT_PROJ = "+proj=aeqd +lat_0={lat:.10f} +lon_0={lon:.10f} +datum=WGS84 +units=m +no_defs"
+#: Arc segments per quarter circle when buffering. High enough that the recorded polygon and the
+#: containment test agree to well under a metre on a 50 km buffer.
+FOOTPRINT_QUAD_SEGS = 64
+
+
+def target_footprint(target_latlon: np.ndarray, buffer_m: float, *, where: str):
+    """Build the buffered target footprint in a local metric CRS.
+
+    Returns ``(buffered_polygon, hull, transformer, crs)`` where the geometries live in the metric
+    plane defined by ``crs``. ``hull`` is the convex hull of the target's own coordinates; the
+    footprint is that hull dilated by ``buffer_m`` -- a true constant-width buffer that rounds corners
+    and offsets edges correctly, which radial vertex scaling does not.
+
+    The bare hull UNDERSTATES the territory (it reaches only as far as the target happened to be
+    sampled), so the buffer is what makes the exclusion conservative rather than optimistic.
+
+    Raises :class:`FootprintError` on anything that would leave the footprint undefined. A single
+    target point is not degenerate here: its hull is a Point and the buffer is a 50 km disc.
+    """
+    from pyproj import Transformer
+    from shapely import buffer as shp_buffer
+    from shapely.geometry import MultiPoint
+
+    if buffer_m <= 0:
+        raise FootprintError(f"{where}: footprint exclusion is declared but the buffer is {buffer_m} m")
+    pts = np.asarray(target_latlon, dtype=float)
+    pts = pts[np.isfinite(pts).all(axis=1)] if pts.ndim == 2 and len(pts) else np.empty((0, 2))
+    if len(pts) == 0:
+        raise FootprintError(f"{where}: no target coordinate is finite -- the footprint is undefined")
+
+    crs = FOOTPRINT_PROJ.format(lat=float(pts[:, 0].mean()), lon=float(pts[:, 1].mean()))
+    transformer = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    # .tolist() keeps pyproj on its sequence path: a size-1 ndarray triggers a scalar-conversion
+    # DeprecationWarning and a single target point is a legitimate case here.
+    xs, ys = transformer.transform(pts[:, 1].tolist(), pts[:, 0].tolist())   # always_xy => (lon, lat)
+    xy = np.column_stack([np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)])
+    if not np.isfinite(xy).all():
+        raise FootprintError(f"{where}: projecting the target into {crs!r} produced a non-finite coordinate")
+
+    hull = MultiPoint([tuple(p) for p in xy.tolist()]).convex_hull
+    footprint = shp_buffer(hull, float(buffer_m), quad_segs=FOOTPRINT_QUAD_SEGS)
+    if footprint.is_empty or not footprint.is_valid:
+        raise FootprintError(f"{where}: the buffered target footprint is empty or invalid")
+    return footprint, hull, transformer, crs
+
+
+def _footprint_exclude(source: np.ndarray, target: np.ndarray, latlon: np.ndarray | None,
+                       buffer_km: float, *, where: str):
+    """Remove every source item lying INSIDE the target's buffered footprint.
+
+    The distance purge bounds separation from the nearest LABELLED target sample; it says nothing
+    about territory. Where a benchmark's domains are provenance labels rather than regions, a source
+    point can clear the purge and still sit inside the held-out country -- which is contamination, not
+    a near miss.
+
+    Containment is tested in the same metric plane the footprint was built in, so the decision
+    boundary IS the recorded polygon. Everything dropped is recorded with the geometry that proves it.
+    """
+    import shapely
+
+    source = np.asarray(source, dtype=np.int64)
+    if latlon is None:
+        raise FootprintError(f"{where}: footprint exclusion requires coordinates, but none are provided")
+    if len(target) == 0:
+        raise FootprintError(f"{where}: footprint exclusion requires a non-empty target")
+    if len(source) == 0:
+        return np.sort(source), np.empty(0, dtype=np.int64)
+
+    buffer_m = float(buffer_km) * 1000.0
+    footprint, hull, transformer, crs = target_footprint(latlon[np.asarray(target)], buffer_m, where=where)
+
+    src = np.asarray(latlon[source], dtype=float)
+    if not np.isfinite(src).all():
+        raise FootprintError(
+            f"{where}: {int((~np.isfinite(src).all(axis=1)).sum())} source item(s) lack a finite "
+            f"coordinate, so their containment in the target footprint cannot be decided"
+        )
+    sx, sy = transformer.transform(src[:, 1].tolist(), src[:, 0].tolist())
+    # intersects == covers for points: interior OR boundary, so a point exactly at buffer distance is
+    # excluded. Conservative in the direction that protects the holdout.
+    inside = np.asarray(shapely.intersects_xy(footprint, np.asarray(sx), np.asarray(sy)), dtype=bool)
+
+    dropped = source[inside]
+    # ALWAYS emitted, including when nothing is excluded. The declared footprint is part of what the
+    # split MEANS, so "this target was masked and nothing fell inside" and "this target was never
+    # masked" must be distinguishable in the artifact -- a zero-exclusion target is evidence, not
+    # absence of evidence.
+    emit_split_audit_event(
+        "footprint_exclusion", where=where, reference="target",
+        buffer_m=buffer_m, crs=crs, quad_segs=FOOTPRINT_QUAD_SEGS, hull_policy="convex_hull",
+        # The hull is small (a handful of vertices) and, with crs + buffer_m + quad_segs, reproduces
+        # the footprint exactly; the checksum pins the realized polygon without storing it.
+        hull_wkt=shapely.to_wkt(hull, rounding_precision=3),
+        footprint_sha256=hashlib.sha256(
+            shapely.to_wkt(footprint, rounding_precision=3).encode()
+        ).hexdigest(),
+        n_excluded=int(len(dropped)), excluded_indices=[int(i) for i in dropped.tolist()],
+    )
+    return np.sort(source[~inside]), np.sort(dropped)
+
+
 def _require_finite_coords(rows, latlon: np.ndarray | None, *, benchmark: str, target: str, kind: str) -> None:
     """Fail closed: every ASSIGNED source/target item MUST have finite coordinates. The purge is
     load-bearing for the holdout's meaning, so a missing coordinate is a hard generation error (with
@@ -161,6 +277,13 @@ def iter_source_target_splits(bench, bench_mod, seed: int) -> Iterator[SourceTar
         _require_finite_coords(source_rows, latlon, benchmark=benchmark, target=target, kind="source")
         # purge the whole source against the ENTIRE target FIRST, then partition
         source_rows = _purge(source_rows, target_rows, latlon, spec.purge_km, where=NAME)
+        # ...and, where domains are provenance labels rather than territories, additionally drop
+        # everything inside the target's own footprint. Both filters run BEFORE partitioning, so no
+        # excluded item can reach source_train/val/test.
+        if spec.footprint_exclusion:
+            source_rows, _excluded = _footprint_exclude(
+                source_rows, target_rows, latlon, spec.purge_km, where=NAME
+            )
         if len(source_rows) == 0:
             emit_split_audit_event("dropped_holdout", regime=NAME, holdout=target, reason="empty_source_after_purge")
             continue

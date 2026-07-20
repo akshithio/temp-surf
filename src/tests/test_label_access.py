@@ -206,8 +206,8 @@ def test_write_load_resolves_three_orders_to_current_indices(tmp_path):
     sample_ids = SOURCE + ["108", "109", "110", "111"] + POOL + TEST
     split, id_map = _headline_split(sample_ids)
     rows = _rows(2)
-    SA.write_label_access(tmp_path, "cropharvest", 2, "R1", rows)
-    loaded = SA.load_label_access(tmp_path, "cropharvest", 2, split, id_map)
+    _path, sha = SA.write_label_access(tmp_path, "cropharvest", 2, "R1", rows)
+    loaded = SA.load_label_access(tmp_path, "cropharvest", 2, split, id_map, sha)
 
     # each array is a permutation of the right partition, mapped to CURRENT indices ...
     assert sorted(loaded.matched_source_ranked_idx.tolist()) == sorted(id_map[s] for s in SOURCE)
@@ -225,13 +225,66 @@ def test_load_missing_file_hard_errors(tmp_path):
     sample_ids = SOURCE + ["108", "109", "110", "111"] + POOL + TEST
     split, id_map = _headline_split(sample_ids)
     with pytest.raises(SA.SplitArtifactError, match="missing label_access"):
-        SA.load_label_access(tmp_path, "cropharvest", 2, split, id_map)
+        SA.load_label_access(tmp_path, "cropharvest", 2, split, id_map, "0" * 64)
 
 
 def test_load_rejects_stale_order(tmp_path):
     sample_ids = SOURCE + ["108", "109", "110", "111"] + POOL + TEST
     split, id_map = _headline_split(sample_ids)
     stale = SA.build_label_access_rows(seed=2, source_ids=SOURCE[:-1] + ["777"], target_pool_ids=POOL, target_test_ids=TEST)
-    SA.write_label_access(tmp_path, "cropharvest", 2, "R1", stale)
+    _p, stale_sha = SA.write_label_access(tmp_path, "cropharvest", 2, "R1", stale)
     with pytest.raises(SA.SplitArtifactError, match="does not match"):
-        SA.load_label_access(tmp_path, "cropharvest", 2, split, id_map)
+        SA.load_label_access(tmp_path, "cropharvest", 2, split, id_map, stale_sha)
+
+
+# --------------------------------------------------------------------------- #
+# Checksum binding: a DIFFERENT valid permutation must be refused
+# --------------------------------------------------------------------------- #
+def test_write_returns_a_checksum_bound_to_the_bytes():
+    import tempfile
+    from pathlib import Path as _P
+
+    with tempfile.TemporaryDirectory() as td:
+        a_path, a_sha = SA.write_label_access(_P(td), "cropharvest", 0, "R1", _rows(0))
+        assert len(a_sha) == 64
+        assert a_sha == SA.sha256_bytes(a_path.read_bytes())
+
+
+def test_a_different_valid_permutation_is_refused_by_the_checksum(tmp_path):
+    """The whole point of the checksum: seed-1's draw is structurally VALID over the same id sets --
+    same populations, same contiguous ranks -- so only the hash distinguishes it from the frozen draw.
+    Accepting it would silently change every matched-label and fixed-total experiment."""
+    split, id_map = _headline_split(SOURCE + ["108", "109", "110", "111"] + POOL + TEST)
+    _p, frozen_sha = SA.write_label_access(tmp_path, "cropharvest", 2, "R1", _rows(0))
+    SA.load_label_access(tmp_path, "cropharvest", 2, split, id_map, frozen_sha)   # frozen draw: fine
+
+    # overwrite with a different seed's draw -- still structurally valid
+    SA.write_label_access(tmp_path, "cropharvest", 2, "R1", _rows(1))
+    SA.validate_label_access_rows(
+        _rows(1), source_ids=list(SOURCE), target_pool_ids=list(POOL), target_test_ids=list(TEST),
+        where="structural-check",
+    )   # proves structure alone cannot catch it
+    with pytest.raises(SA.SplitArtifactError, match="checksum mismatch"):
+        SA.load_label_access(tmp_path, "cropharvest", 2, split, id_map, frozen_sha)
+
+
+def test_a_missing_recorded_checksum_is_refused(tmp_path):
+    """An unverifiable draw fails closed rather than loading on structure alone."""
+    split, id_map = _headline_split(SOURCE + ["108", "109", "110", "111"] + POOL + TEST)
+    SA.write_label_access(tmp_path, "cropharvest", 2, "R1", _rows(0))
+    with pytest.raises(SA.SplitArtifactError, match="no label_access sha256"):
+        SA.load_label_access(tmp_path, "cropharvest", 2, split, id_map, None)
+
+
+def test_a_single_swapped_rank_is_refused(tmp_path):
+    """Byte-level tamper: swap two ranks. Structurally contiguous, cryptographically different."""
+    split, id_map = _headline_split(SOURCE + ["108", "109", "110", "111"] + POOL + TEST)
+    rows = _rows(0)
+    _p, frozen_sha = SA.write_label_access(tmp_path, "cropharvest", 2, "R1", rows)
+    src = [r for r in rows if r["population"] == SA.POP_SOURCE]
+    src[0]["target_rank"], src[1]["target_rank"] = src[1]["target_rank"], src[0]["target_rank"]
+    src[0]["matched_source_rank"], src[1]["matched_source_rank"] = (
+        src[1]["matched_source_rank"], src[0]["matched_source_rank"])
+    SA.write_label_access(tmp_path, "cropharvest", 2, "R1", rows)
+    with pytest.raises(SA.SplitArtifactError, match="checksum mismatch"):
+        SA.load_label_access(tmp_path, "cropharvest", 2, split, id_map, frozen_sha)

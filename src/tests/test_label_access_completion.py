@@ -81,8 +81,10 @@ def _publish(tmp_path, rows, keys, **kw):
     rows = [*rows, _ANCHOR]
     keys = set(keys) | {artifacts.cell_key(_ANCHOR)}
     IOU.append_jsonl(tmp_path / "probe_results.jsonl", rows)
-    for name in ("probe_results.csv", "summary.csv", "deltas.csv", artifacts.ENVIRONMENT_FILE):
+    for name in ("probe_results.csv", "summary.csv", artifacts.ENVIRONMENT_FILE):
         (tmp_path / name).write_text("{}\n")
+    # Real delta table: the anchor + geographic label-access rows above make one mandatory.
+    IOU.write_csv(tmp_path / "deltas.csv", IOU.compute_deltas(rows, ["f1"]))
     contrasts.compute_and_write(tmp_path, rows)
     return artifacts.write_run_complete(tmp_path, run_manifest_sha256="sig", expected_keys=keys, rows=rows, **kw)
 

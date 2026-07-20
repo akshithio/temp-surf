@@ -1035,7 +1035,7 @@ def _run_dense_geographic(monkeypatch, tmp_path, *, write_predictions=False, pro
     splitfix.freeze(tmp_path / "splits", built)
     for label, src_ids, pool_ids, test_ids in la_specs:  # frozen patch-id orders, sibling of assignments.csv
         la_rows = SA.build_label_access_rows(seed=0, source_ids=src_ids, target_pool_ids=pool_ids, target_test_ids=test_ids)
-        SA.write_label_access(tmp_path / "splits", "pastis", 0, label, la_rows)
+        splitfix.attach_label_access(tmp_path / "splits", "pastis", 0, label, la_rows)
 
     monkeypatch.setattr(RS.cacheutils, "SCRATCH", tmp_path)
     monkeypatch.setattr(RS.cacheutils, "OUTPUT_DIR", tmp_path / "out")
@@ -1414,7 +1414,7 @@ def _publish_geographic_kenya_split(splits_root, bench, *, seed=0):
         target_pool_ids=[sids[int(i)] for i in split.target_label_pool],
         target_test_ids=[sids[int(i)] for i in split.target_test],
     )
-    SA.write_label_access(splits_root, "cropharvest", seed, str(split.label), la_rows)
+    splitfix.attach_label_access(splits_root, "cropharvest", seed, str(split.label), la_rows)
     return split
 
 

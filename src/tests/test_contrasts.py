@@ -286,8 +286,11 @@ _ENV = {"schema": 1, "captured_at": "2026-07-11T00:00:00+00:00", "python": "3.11
 
 def _publish_required(results_dir, rows):
     IOU.append_jsonl(results_dir / "probe_results.jsonl", rows)
-    for name in ("probe_results.csv", "summary.csv", "deltas.csv"):
+    for name in ("probe_results.csv", "summary.csv"):
         (results_dir / name).write_text("{}\n")
+    # deltas.csv is computed for real: these rows carry a random_id reference AND a geographic_ood
+    # label-access result, so completion validation requires a genuine non-empty delta table.
+    IOU.write_csv(results_dir / "deltas.csv", IOU.compute_deltas(rows, ["f1"]))
     IOU.write_json(results_dir / artifacts.ENVIRONMENT_FILE, _ENV)   # schema-valid for validate_run_complete
 
 

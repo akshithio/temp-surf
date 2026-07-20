@@ -13,8 +13,11 @@ frozen, label-blind label-access order (see ``LABEL_ACCESS_HEADER``). ``assignme
 EVERY eligible stable id exactly once:
 
   * assigned -- ``partition`` is one of the five v2 partitions, ``status`` ``assigned``, blank reason;
-  * purged   -- removed by the source<->target distance purge; blank ``partition``, ``status``
-                ``purged``, ``reason`` ``purged_near_ood``;
+  * purged   -- deliberately removed geography with a proven cause; blank ``partition``, ``status``
+                ``purged``, ``reason`` either ``purged_near_ood`` (within the source<->target distance
+                purge) or ``inside_buffered_target_footprint`` (inside the target's buffered
+                convex-hull footprint). The two are counted separately in the log: one bounds distance
+                to the nearest labelled target sample, the other establishes territorial exclusion;
   * excluded -- any other non-assigned eligible id; blank ``partition``, ``status`` ``excluded``,
                 ``reason`` the specific cause (``unknown_domain`` / ``no_coords`` / ``unassigned``).
 
@@ -60,6 +63,14 @@ STATUS_PURGED = "purged"
 STATUS_EXCLUDED = "excluded"
 STATUSES = (STATUS_ASSIGNED, STATUS_PURGED, STATUS_EXCLUDED)
 
+#: Stable removal reasons. Both are ``STATUS_PURGED`` -- they are deliberate geographic removals with
+#: a proven cause, NOT leftovers -- but they answer different scientific questions and must stay
+#: distinguishable in the artifact: one bounds distance to the nearest labelled target sample, the
+#: other establishes territorial exclusion from the target's buffered footprint.
+REASON_PURGED_NEAR_OOD = "purged_near_ood"
+REASON_INSIDE_FOOTPRINT = "inside_buffered_target_footprint"
+PURGE_REASONS = (REASON_PURGED_NEAR_OOD, REASON_INSIDE_FOOTPRINT)
+
 LOG_FILENAME = "splits.json"
 _PART_RANK = {p: i for i, p in enumerate(PARTITIONS)}
 
@@ -69,8 +80,11 @@ _PART_RANK = {p: i for i, p in enumerate(PARTITIONS)}
 #: carries TWO independent orders -- ``matched_source_rank`` (matched-source selection) and
 #: ``fixed_source_removal_rank`` (fixed-total source removal) -- so those two interventions never
 #: share a draw; ``target_rank`` orders the target pool (additive + matched-target selection);
-#: target_test units carry no rank. No checksum, digest, version, or derived seed -- integrity is
-#: structural (population-correct / complete / contiguous), validated at load against the frozen split.
+#: target_test units carry no rank. Integrity is BOTH structural (population-correct / complete /
+#: contiguous, validated at load against the frozen split) AND cryptographic: the file's SHA-256 is
+#: recorded in the central log beside the assignments checksum and re-verified at load, because a
+#: DIFFERENT valid permutation over the same id sets passes every structural check while silently
+#: changing every matched-label and fixed-total experiment.
 LABEL_ACCESS_FILENAME = "label_access.csv"
 LABEL_ACCESS_HEADER: list[str] = [
     "stable_id", "population", "matched_source_rank", "fixed_source_removal_rank", "target_rank",
@@ -262,6 +276,7 @@ def _leaf_summary(
     benchmark: str, regime: str, seed: int, holdout: str, rows: list[dict[str, str]], *,
     target_unit: str, group_kind: str, has_target: bool, supports_target_labels: bool,
     target_role: str, purge_km: float, class_by_id: dict[str, list[str]],
+    footprint: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the central-log entry for one leaf (everything but the CSV's SHA-256, which the generator
     fills in after writing the file). Carries per-partition stratification stats, not stable ids.
@@ -271,6 +286,7 @@ def _leaf_summary(
     patch-level presence within each partition, never pixel totals)."""
     status_counts = {s: 0 for s in STATUSES}
     exclusion_counts: dict[str, int] = {}
+    purge_counts: dict[str, int] = {}
     partition_stats: dict[str, dict[str, Any]] = {
         p: {"n": 0, "class_counts": {}, "domain_counts": {}} for p in PARTITIONS
     }
@@ -284,6 +300,8 @@ def _leaf_summary(
                 ps["class_counts"][c] = ps["class_counts"].get(c, 0) + 1
         elif r["status"] == STATUS_EXCLUDED:
             exclusion_counts[r["reason"]] = exclusion_counts.get(r["reason"], 0) + 1
+        elif r["status"] == STATUS_PURGED:
+            purge_counts[r["reason"]] = purge_counts.get(r["reason"], 0) + 1
     for ps in partition_stats.values():  # stable, diff-friendly ordering
         ps["class_counts"] = dict(sorted(ps["class_counts"].items()))
         ps["domain_counts"] = dict(sorted(ps["domain_counts"].items()))
@@ -294,6 +312,12 @@ def _leaf_summary(
         "assignments_csv": leaf_rel_path(benchmark, regime, seed, holdout),
         "partition_stats": partition_stats, "status_counts": status_counts,
         "purge_km": float(purge_km), "purge_count": status_counts[STATUS_PURGED],
+        # Broken out by cause: a distance purge and a territorial footprint exclusion are different
+        # scientific claims and must stay countable apart in the central log.
+        "purge_counts": dict(sorted(purge_counts.items())),
+        # The realized footprint SPECIFICATION for this target -- recorded whenever the mask ran, even
+        # if it excluded nothing, so a zero-exclusion target is provably masked rather than unmasked.
+        "footprint": dict(footprint) if footprint else None,
         "exclusion_counts": dict(sorted(exclusion_counts.items())),
         "n_eligible": len(rows),
         "validation": validate_rows(rows, has_target=has_target, supports_target_labels=supports_target_labels),
@@ -327,12 +351,8 @@ def build_tabular_leaf(
     for part, arr in split.as_partitions().items():
         for i in np.asarray(arr, dtype=np.int64).tolist():
             partition_of[str(sample_ids[i])] = part
-    purged: set[str] = set()
-    for ev in audit_events:
-        if ev.get("kind") == "purge":
-            for i in ev.get("purged_indices", ev.get("purged_train_indices", [])):
-                if 0 <= int(i) < len(sample_ids):
-                    purged.add(str(sample_ids[int(i)]))
+    purged, footprint = _removed_by_reason(audit_events, sample_ids)
+    footprint_spec = _footprint_spec(audit_events)
 
     rows: list[dict[str, str]] = []
     for sid in (str(s) for s in sample_ids.tolist()):
@@ -340,7 +360,9 @@ def build_tabular_leaf(
         if sid in partition_of:
             rows.append(_row(sid, partition_of[sid], STATUS_ASSIGNED, dom, ""))
         elif sid in purged:
-            rows.append(_row(sid, "", STATUS_PURGED, dom, "purged_near_ood"))
+            rows.append(_row(sid, "", STATUS_PURGED, dom, REASON_PURGED_NEAR_OOD))
+        elif sid in footprint:
+            rows.append(_row(sid, "", STATUS_PURGED, dom, REASON_INSIDE_FOOTPRINT))
         elif dom in ("unknown", "nan"):
             rows.append(_row(sid, "", STATUS_EXCLUDED, dom, "unknown_domain"))
         else:
@@ -351,9 +373,51 @@ def build_tabular_leaf(
         benchmark, regime, seed, str(split.label), rows, target_unit="sample",
         group_kind=str(split.group_kind), has_target=split.has_target,
         supports_target_labels=split.supports_target_labels, target_role=str(split.target_role),
-        purge_km=purge_km, class_by_id=class_by_id,
+        purge_km=purge_km, class_by_id=class_by_id, footprint=footprint_spec,
     )
     return rows, summary
+
+
+#: Footprint-specification fields lifted verbatim from the regime's audit event into the log entry.
+#: Everything needed to RECONSTRUCT the decision boundary and re-verify it independently.
+FOOTPRINT_SPEC_FIELDS = (
+    "crs", "buffer_m", "quad_segs", "hull_policy", "hull_wkt", "footprint_sha256", "n_excluded",
+)
+
+
+def _footprint_spec(audit_events) -> dict[str, Any] | None:
+    """The realized footprint specification for this leaf, or None if the mask never ran.
+
+    Present even when nothing was excluded: "masked, zero hits" and "never masked" are different
+    claims about the split and must be distinguishable in the artifact.
+    """
+    for ev in audit_events:
+        if ev.get("kind") == "footprint_exclusion":
+            return {k: ev[k] for k in FOOTPRINT_SPEC_FIELDS if k in ev}
+    return None
+
+
+def _removed_by_reason(audit_events, unit_ids) -> tuple[set[str], set[str]]:
+    """``(purged_near_target, inside_target_footprint)`` id sets proven by the regime's audit events.
+
+    Kept separate so a footprint exclusion can never collapse into ``excluded/unassigned``, which
+    would erase the scientific reason the item was removed.
+    """
+    unit_ids = np.asarray(unit_ids, dtype=object)
+    purged: set[str] = set()
+    footprint: set[str] = set()
+    for ev in audit_events:
+        kind = ev.get("kind")
+        if kind == "purge":
+            sink, idx = purged, ev.get("purged_indices", ev.get("purged_train_indices", []))
+        elif kind == "footprint_exclusion":
+            sink, idx = footprint, ev.get("excluded_indices", [])
+        else:
+            continue
+        for i in idx:
+            if 0 <= int(i) < len(unit_ids):
+                sink.add(str(unit_ids[int(i)]))
+    return purged, footprint
 
 
 def build_dense_leaf(
@@ -371,12 +435,8 @@ def build_dense_leaf(
     for part, pset in dense_split.as_partitions().items():
         for p in pset:
             partition_of[str(int(p))] = part
-    purged: set[str] = set()
-    for ev in audit_events:
-        if ev.get("kind") == "purge":
-            for i in ev.get("purged_indices", []):
-                if 0 <= int(i) < len(all_patch_ids):
-                    purged.add(str(all_patch_ids[int(i)]))
+    purged, footprint = _removed_by_reason(audit_events, [str(int(p)) for p in all_patch_ids])
+    footprint_spec = _footprint_spec(audit_events)
 
     rows: list[dict[str, str]] = []
     for pid in all_patch_ids:
@@ -385,7 +445,9 @@ def build_dense_leaf(
         if sid in partition_of:
             rows.append(_row(sid, partition_of[sid], STATUS_ASSIGNED, dom, ""))
         elif sid in purged:
-            rows.append(_row(sid, "", STATUS_PURGED, dom, "purged_near_ood"))
+            rows.append(_row(sid, "", STATUS_PURGED, dom, REASON_PURGED_NEAR_OOD))
+        elif sid in footprint:
+            rows.append(_row(sid, "", STATUS_PURGED, dom, REASON_INSIDE_FOOTPRINT))
         else:
             ll = patch_latlon.get(int(pid))
             no_coords = ll is None or not np.all(np.isfinite(np.asarray(ll, dtype=float)))
@@ -397,7 +459,7 @@ def build_dense_leaf(
         benchmark, regime, seed, str(dense_split.label), rows, target_unit="patch",
         group_kind=str(dense_split.group_kind), has_target=dense_split.has_target,
         supports_target_labels=dense_split.supports_target_labels, target_role=str(dense_split.target_role),
-        purge_km=purge_km, class_by_id=class_by_id,
+        purge_km=purge_km, class_by_id=class_by_id, footprint=footprint_spec,
     )
     return rows, summary
 
@@ -549,16 +611,22 @@ def _label_access_bytes(rows: list[dict[str, str]]) -> bytes:
 
 def write_label_access(
     root: str | os.PathLike, benchmark: str, seed: int, holdout: str, rows: list[dict[str, str]],
-) -> Path:
-    """Write one geographic_ood target's ``label_access.csv`` (deterministic order). No checksum is
-    recorded -- integrity is enforced structurally at load."""
+) -> tuple[Path, str]:
+    """Write one geographic_ood target's ``label_access.csv`` (deterministic order) and return
+    ``(path, sha256)``.
+
+    The checksum is recorded beside the assignments checksum in the central log and re-verified at
+    load. Structural validation alone cannot detect a DIFFERENT valid permutation over the same id
+    sets -- and such a permutation silently changes every matched-label and fixed-total experiment.
+    """
     label = str(holdout)
     if "/" in label or label in ("", ".", ".."):
         raise SplitArtifactError(f"unsafe holdout label for a leaf directory: {holdout!r}")
+    data = _label_access_bytes(rows)
     path = label_access_path(root, benchmark, seed, holdout)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(_label_access_bytes(rows))
-    return path
+    path.write_bytes(data)
+    return path, sha256_bytes(data)
 
 
 def read_label_access_csv(path: str | os.PathLike) -> list[dict[str, str]]:
@@ -648,8 +716,29 @@ class LoadedLabelAccess(NamedTuple):
     target_ranked_idx: np.ndarray
 
 
+def _verify_label_access_checksum(data: bytes, expected_sha256: str | None, where: str) -> None:
+    """Integrity gate, run BEFORE structural validation.
+
+    Structural validation accepts ANY contiguous permutation over the correct id sets, so it cannot
+    distinguish a regenerated or hand-edited draw from the frozen one -- and a different valid draw
+    silently changes every matched-label and fixed-total experiment. Only the checksum catches that.
+    """
+    if expected_sha256 is None:
+        raise SplitArtifactError(
+            f"{where}: the split log records no label_access sha256 -- the frozen label draw is "
+            f"unverifiable; regenerate the splits with the current generator"
+        )
+    got = sha256_bytes(data)
+    if got != str(expected_sha256):
+        raise SplitArtifactError(
+            f"checksum mismatch for {where}: log records {str(expected_sha256)[:12]}..., file hashes "
+            f"to {got[:12]}... -- the frozen label draw changed; refuse to consume"
+        )
+
+
 def load_label_access(
     root: str | os.PathLike, benchmark: str, seed: int, split: SourceTargetSplit, id_map: dict[str, Any],
+    expected_sha256: str | None = None,
 ) -> LoadedLabelAccess:
     """Load + structurally validate one geographic_ood target's frozen ``label_access.csv`` and
     resolve its ranked stable ids to CURRENT row indices. Missing or malformed => hard error. The
@@ -660,6 +749,7 @@ def load_label_access(
     path = label_access_path(root, benchmark, seed, holdout)
     if not path.is_file():
         raise SplitArtifactError(f"missing label_access.csv at {path} -- run tools/generate_splits.py first")
+    _verify_label_access_checksum(path.read_bytes(), expected_sha256, where)
     rows = read_label_access_csv(path)
     inv = {int(v): k for k, v in id_map.items()}
     src_ids = [inv[int(i)] for i in np.asarray(split.source_train, dtype=np.int64).tolist()]
@@ -702,6 +792,7 @@ class LoadedDenseLabelAccess(NamedTuple):
 
 def load_dense_label_access(
     root: str | os.PathLike, benchmark: str, seed: int, dense_split: DenseSourceTargetSplit,
+    expected_sha256: str | None = None,
 ) -> LoadedDenseLabelAccess:
     """Load + structurally validate one geographic_ood PASTIS target's frozen ``label_access.csv`` and
     resolve its ranked stable patch ids to PATCH IDs in rank order. Missing/malformed => hard error. The
@@ -712,6 +803,7 @@ def load_dense_label_access(
     path = label_access_path(root, benchmark, seed, holdout)
     if not path.is_file():
         raise SplitArtifactError(f"missing label_access.csv at {path} -- run tools/generate_splits.py first")
+    _verify_label_access_checksum(path.read_bytes(), expected_sha256, where)
     rows = read_label_access_csv(path)
     src_ids = [str(int(p)) for p in sorted(dense_split.source_train_patches)]
     pool_ids = [str(int(p)) for p in sorted(dense_split.target_label_pool_patches)]
@@ -749,6 +841,9 @@ class LoadedTabularSplit(NamedTuple):
     regime: str
     domains: np.ndarray
     split: SourceTargetSplit
+    #: sha256 of this leaf's label_access.csv as recorded in the central log (None where the leaf
+    #: carries no label-access order). Threaded to load_label_access so the frozen draw is verified.
+    label_access_sha256: str | None = None
 
 
 class LoadedDenseSplit(NamedTuple):
@@ -757,6 +852,8 @@ class LoadedDenseSplit(NamedTuple):
     seed: int
     regime: str
     split: DenseSourceTargetSplit
+    #: sha256 of this leaf's label_access.csv as recorded in the central log (None where absent).
+    label_access_sha256: str | None = None
 
 
 def read_splits_log(logs_path: str | os.PathLike) -> dict[str, Any]:
@@ -907,7 +1004,10 @@ def load_tabular_splits(
                     )
                 except ValueError as exc:
                     raise SplitArtifactError(f"{where}: {exc}") from exc
-                loaded.append(LoadedTabularSplit(seed=int(seed), regime=str(regime), domains=domains, split=split))
+                loaded.append(LoadedTabularSplit(
+                    seed=int(seed), regime=str(regime), domains=domains, split=split,
+                    label_access_sha256=entry.get("label_access_sha256"),
+                ))
     return loaded
 
 
@@ -962,6 +1062,9 @@ def load_dense_splits(
                     )
                 except ValueError as exc:
                     raise SplitArtifactError(f"{where}: {exc}") from exc
-                leaves.append(LoadedDenseSplit(seed=int(seed), regime=str(regime), split=dsplit))
+                leaves.append(LoadedDenseSplit(
+                    seed=int(seed), regime=str(regime), split=dsplit,
+                    label_access_sha256=entry.get("label_access_sha256"),
+                ))
         by_seed[int(seed)] = leaves
     return by_seed

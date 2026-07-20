@@ -38,7 +38,7 @@ def test_route_capabilities_per_regime():
     assert RB.route_capabilities(random_id) == (False, False)          # source-only, no target
     assert RB.route_capabilities(official) == (True, False)            # target geography, NO target labels
     assert RB.route_capabilities(geographic_ood) == (True, True)
-    assert RB.route_capabilities(spatial_cluster_ood) == (True, True)
+    assert RB.route_capabilities(spatial_cluster_ood) == (True, False)  # sensitivity split, zero-shot
 
 
 def test_route_capabilities_is_fail_closed():

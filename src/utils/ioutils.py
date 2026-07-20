@@ -478,10 +478,15 @@ def compute_deltas(
     from evals import confounds
 
     if ood_regimes is None:
+        # A regime is OOD-eligible if it carries a target-side row in EITHER schema: the schema-v2
+        # label-access suite (geographic_ood) or the pre-label-access target sweep (historical trees).
+        # Gating on budget_type=="target" alone silently discovered nothing once geographic_ood moved
+        # to label_access rows, which produced an empty deltas.csv that still certified as complete.
         found = sorted({
             str(r.get("split_regime"))
             for r in rows
-            if r.get("budget_type") == "target" and r.get("split_regime") not in (None, "random_id")
+            if r.get("budget_type") in ("target", "label_access")
+            and r.get("split_regime") not in (None, "random_id")
         })
         ood_regimes = tuple(found or ["geographic_ood"])
 

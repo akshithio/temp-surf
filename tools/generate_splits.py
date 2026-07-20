@@ -42,6 +42,7 @@ from evals import evals as EV  # noqa: E402
 from evals import split_artifacts as SA  # noqa: E402
 from evals import split_spec  # noqa: E402
 from evals.regimes import base as regime_base  # noqa: E402
+from evals.regimes import geographic_ood as _GEO  # noqa: E402  (footprint policy constants only)
 from utils import cacheutils  # noqa: E402  (benchmark loader only -- not the embedding cache/manifests)
 
 # === Configuration ===========================================================
@@ -156,7 +157,11 @@ def generate_tabular(root, bench, bench_mod, regime, seed, *, audit_only):
             _path, sha = SA.write_assignments(root, bench_mod.BENCHMARK, regime, seed, str(split.label), rows)
             summary["sha256"] = sha
             if la_rows is not None:
-                SA.write_label_access(root, bench_mod.BENCHMARK, seed, str(split.label), la_rows)
+                la_path, la_sha = SA.write_label_access(root, bench_mod.BENCHMARK, seed, str(split.label), la_rows)
+                # The frozen label DRAW is bound as tightly as the frozen partitions: a different valid
+                # permutation passes every structural check but changes every matched/fixed-total route.
+                summary["label_access_csv"] = str(la_path.relative_to(root))
+                summary["label_access_sha256"] = la_sha
         entries.append(summary)
     _check_expected_coverage(
         regime, bench_mod.BENCHMARK, seed, _expected_tabular_labels(regime, bench_mod), [e["holdout"] for e in entries]
@@ -210,7 +215,11 @@ def generate_dense(root, bench, bench_mod, regime, seed, *, audit_only, dense_ca
             _path, sha = SA.write_assignments(root, bench_mod.BENCHMARK, regime, seed, str(dense_split.label), rows)
             summary["sha256"] = sha
             if la_rows is not None:
-                SA.write_label_access(root, bench_mod.BENCHMARK, seed, str(dense_split.label), la_rows)
+                la_path, la_sha = SA.write_label_access(
+                    root, bench_mod.BENCHMARK, seed, str(dense_split.label), la_rows
+                )
+                summary["label_access_csv"] = str(la_path.relative_to(root))
+                summary["label_access_sha256"] = la_sha
         entries.append(summary)
     _check_expected_coverage(
         regime, bench_mod.BENCHMARK, seed, _expected_dense_labels(regime, bench_mod), [e["holdout"] for e in entries]
@@ -246,6 +255,40 @@ def _code_revision() -> str:
         return "unknown"
 
 
+def _tree_is_dirty() -> str:
+    """Uncommitted tracked-source changes, as a short summary ("" when the tree is clean)."""
+    try:
+        out = subprocess.check_output(["git", "status", "--porcelain"], cwd=_REPO, text=True)
+    except Exception:  # noqa: BLE001 -- cannot prove clean; treat as dirty below
+        return "git status unavailable"
+    dirty = [ln for ln in out.splitlines() if ln[3:].startswith(("src/", "tools/"))]
+    return "; ".join(sorted(ln.strip() for ln in dirty)[:8])
+
+
+def _require_frozen_provenance() -> None:
+    """Refuse canonical generation whose recorded provenance would be FALSE.
+
+    ``code_revision`` records ``git rev-parse HEAD``. If the protocol implementation is uncommitted,
+    that hash does not contain the code that produced these splits, and the log would attribute the
+    artifacts to a revision that generates something else. Likewise a null ``data_fingerprint`` records
+    "the inputs are unknown" -- neither is acceptable for a frozen scientific artifact.
+    """
+    dirty = _tree_is_dirty()
+    if dirty:
+        raise SystemExit(
+            "[generate_splits] REFUSING to generate: src/ or tools/ has uncommitted changes, so the "
+            f"recorded code_revision ({_code_revision()[:12]}) would not contain the protocol being "
+            f"frozen.\n  dirty: {dirty}\n"
+            "  Commit the protocol implementation first, or set AUDIT_ONLY = True to validate without writing."
+        )
+    if not os.environ.get("DATA_FINGERPRINT"):
+        raise SystemExit(
+            "[generate_splits] REFUSING to generate: DATA_FINGERPRINT is unset, so the log would record "
+            "a null input fingerprint and the frozen splits could not be tied to the data that produced "
+            "them. Export DATA_FINGERPRINT (see tools/preflight_dataset_digests.py)."
+        )
+
+
 def _split_config() -> dict:
     """The complete frozen policy needed to understand generation, as ONE plain explicit dict:
     eligible populations + exclusions + removed classes, CropHarvest canonical-region merges, the
@@ -257,6 +300,28 @@ def _split_config() -> dict:
             "source": "source_val = source_test = ceil(0.1*N); source_train = remainder",
             "target": "target_test = ceil(0.2*N); target_label_pool = remainder",
             "official": "val = floor(0.1*N); train = remainder",
+        },
+        # Territorial exclusion policy. Recorded in full because it is a SCIENTIFIC claim about what
+        # "held out" means, not an implementation detail: without it a reader cannot tell whether a
+        # geographic leaf excluded the target's territory or only a distance ring around its samples.
+        "footprint_exclusion": {
+            "enabled_benchmarks": sorted(
+                name for name, spec in S.ALL_SPECS.items() if spec.footprint_exclusion
+            ),
+            "rationale": (
+                "applied where a benchmark's domains are PROVENANCE labels rather than territories, so "
+                "a source point can satisfy the distance purge while lying inside the held-out region"
+            ),
+            "hull_policy": "convex_hull_of_target_coordinates",
+            "projection": _GEO.FOOTPRINT_PROJ,
+            "projection_kind": "local azimuthal equidistant, centred on the target's mean coordinate",
+            "buffer_m_rule": "purge_km * 1000 (the same radius as the distance purge)",
+            "buffer_quad_segs": _GEO.FOOTPRINT_QUAD_SEGS,
+            "containment_predicate": "point intersects the buffered footprint (interior or boundary)",
+            "applied_before": "source partitioning, immediately after the distance purge",
+            "recorded_per_leaf": list(SA.FOOTPRINT_SPEC_FIELDS),
+            "assignment_reason": SA.REASON_INSIDE_FOOTPRINT,
+            "fail_closed": "an unconstructible footprint raises FootprintError; exclusion is never skipped",
         },
         "run_seeds": list(S.RUN_SEEDS),
         "cluster_seed": S.CLUSTER_SEED,
@@ -312,6 +377,7 @@ def build_provenance() -> dict:
         "inputs": {
             "data_root": str(cacheutils.SCRATCH),
             "benchmarks": list(BENCHMARKS),
+            # Never null in a written log: _require_frozen_provenance refuses generation without it.
             "data_fingerprint": os.environ.get("DATA_FINGERPRINT"),
         },
         "run_seeds": list(SEEDS),
@@ -321,6 +387,8 @@ def build_provenance() -> dict:
 
 def main() -> int:
     root = Path(SPLITS_ROOT)
+    if not AUDIT_ONLY:
+        _require_frozen_provenance()
     mode = "AUDIT-ONLY (no assignments.csv / label_access.csv / splits.json written)" if AUDIT_ONLY else f"WRITE -> {root} + {LOGS_PATH}"
     print(f"[generate_splits] mode={mode}; benchmarks={BENCHMARKS}; regimes={REGIMES}; seeds={SEEDS}", flush=True)
     failed, entries = [], []

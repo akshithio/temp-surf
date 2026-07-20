@@ -1,11 +1,15 @@
 """Schema-v2 spatial_cluster_ood: coordinate-only spherical-K-means cells, five fixed cells each
-rotated once as the target, purge-before-partition, has_target=True / supports_target_labels=True.
+rotated once as the target, purge-before-partition, has_target=True / supports_target_labels=False.
+
+This regime is a SPLIT-SENSITIVITY analysis, not a second deployment setting: the held-out cell is
+scored zero-shot in full, so target_test is the complete cell and target_label_pool is always empty.
 
 Semantic coverage (no real data, no model): exactly five fixed cells and five rotations, boundaries
-identical across run seeds, seed-varying subdivisions at fixed counts, deterministic label-independent
-assignment, exactly-once accounting, purge-before-partition, fail-closed coordinates, target
-pool/test disjoint+complete, source_test as an untouched within-source reference, PASTIS patch
-atomicity, and artifact round-trips that preserve the frozen cluster IDs without re-clustering.
+identical across run seeds, seed-varying source subdivisions at fixed counts, deterministic
+label-independent assignment, exactly-once accounting, purge-before-partition, fail-closed
+coordinates, whole-cell zero-shot target_test, source_test as an untouched within-source reference,
+PASTIS patch atomicity, and artifact round-trips that preserve the frozen cluster IDs without
+re-clustering.
 """
 
 from __future__ import annotations
@@ -91,8 +95,10 @@ def _pastis_bench(per_group=8):
 # --------------------------------------------------------------------------- #
 # Route capabilities + five fixed cells / five rotations
 # --------------------------------------------------------------------------- #
-def test_spatial_declares_target_geography_and_target_labels():
-    assert RB.route_capabilities(sc) == (True, True)
+def test_spatial_declares_target_geography_but_no_target_labels():
+    """Split-sensitivity only: spatial cells are scored zero-shot. geographic_ood is the sole regime
+    carrying the target-label-access suite."""
+    assert RB.route_capabilities(sc) == (True, False)
 
 
 def test_exactly_five_fixed_cells_and_five_target_rotations():
@@ -174,17 +180,16 @@ def test_every_eligible_item_appears_exactly_once_per_split():
         assert (len(s.source_train), len(s.source_val), len(s.source_test)) == (tr, va, te)
 
 
-def test_target_pool_and_test_are_disjoint_and_complete():
+def test_whole_cell_is_zero_shot_target_test_with_no_label_pool():
+    """No part of a spatial cell is ever trainable: the label pool is empty and target_test is the
+    COMPLETE cell, so a target-label route cannot be constructed here even by accident."""
     bench, bench_mod = _tab_bench()
     cells = sc.sample_domains(bench, bench_mod)
     for s in sc.iter_source_target_splits(bench, bench_mod, 0):
         cell_rows = set(np.flatnonzero(cells == s.label).tolist())
-        pool, test = set(s.target_label_pool.tolist()), set(s.target_test.tolist())
-        assert pool.isdisjoint(test)
-        assert pool | test == cell_rows  # the two target partitions are exactly the held-out cell
-        pool_n, test_n = split_spec.target_partition_sizes(len(cell_rows))
-        assert (len(pool), len(test)) == (pool_n, test_n)
-        assert s.has_target is True and s.supports_target_labels is True
+        assert s.target_label_pool.size == 0
+        assert set(s.target_test.tolist()) == cell_rows
+        assert s.has_target is True and s.supports_target_labels is False
         assert s.target_role == RB.TARGET_ROLE_HEADLINE
 
 
@@ -276,7 +281,8 @@ def test_pastis_dense_five_cells_and_patch_atomicity():
         flat = [p for part in parts for p in part]
         # every patch appears in EXACTLY one partition, none split (whole-patch atomicity)
         assert len(flat) == len(set(flat)) == len(all_patches)
-        assert d.has_target is True and d.supports_target_labels is True
+        assert d.has_target is True and d.supports_target_labels is False
+        assert not d.target_label_pool_patches          # zero-shot: no trainable target patches
         assert d.target_role == RB.TARGET_ROLE_HEADLINE
 
 
@@ -312,11 +318,11 @@ def test_spatial_tabular_round_trip_preserves_cluster_ids_and_partitions(tmp_pat
     id_to_cell = {str(sid): str(domains[i]) for i, sid in enumerate(bench.sample_ids.tolist())}
     assert all(doms[sid] == id_to_cell[sid] for sid in doms)
     assert set(doms.values()) <= set(sc._CELL_NAMES)
-    target_ids = {str(bench.sample_ids[i]) for i in np.concatenate([split.target_label_pool, split.target_test]).tolist()}
-    assert {doms[t] for t in target_ids} == {split.label}  # the target partitions ARE the held-out cell
+    target_ids = {str(bench.sample_ids[i]) for i in split.target_test.tolist()}
+    assert {doms[t] for t in target_ids} == {split.label}  # target_test IS the held-out cell
     loaded = SA.load_tabular_splits(root, "cropharvest", bench.sample_ids, ["spatial_cluster_ood"], [0])
     ls = loaded[0]
-    assert ls.split.has_target is True and ls.split.supports_target_labels is True
+    assert ls.split.has_target is True and ls.split.supports_target_labels is False
     for part, arr in split.as_partitions().items():
         assert set(getattr(ls.split, part).tolist()) == {int(i) for i in arr.tolist()}
 

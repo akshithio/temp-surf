@@ -26,9 +26,16 @@ from dataclasses import dataclass
 # --------------------------------------------------------------------------- #
 # Global determinism knobs
 # --------------------------------------------------------------------------- #
-#: The three deterministic evaluation replicates. Each run seed determines split membership,
-#: label-budget draws, and probe randomness (via operation-specific derived sub-seeds). There are
-#: three complete pipeline repetitions, NOT nine combinations of independent seeds.
+#: The three deterministic evaluation replicates. Each run seed JOINTLY determines split membership,
+#: label-access draws, and probe randomness: three complete pipeline repetitions, NOT nine
+#: combinations of independent seeds -- and therefore NOT a design that can separately identify
+#: label-draw variance from probe-initialization variance.
+#:
+#: The label-access path consumes the run seed DIRECTLY -- ``split_artifacts.build_label_access_rows``
+#: seeds one Generator with it and draws the three orders in sequence, and every route fits its probe
+#: with the same raw run seed (no per-route or per-budget derivation). The only derived sub-seed left
+#: anywhere in that path is ``perfutils._cap_seed`` for PROBE_CAP base-pool selection, which is
+#: inactive under the committed uncapped default.
 RUN_SEEDS: tuple[int, ...] = (0, 1, 2)
 
 #: Spatial-cluster cell boundaries are frozen at this seed and never vary with the run seed.
@@ -102,6 +109,18 @@ class BenchmarkSpec:
     source_only_units: tuple[str, ...] = ()
     #: supplementary one-class targets (source-only stress; excluded from headline mean/worst)
     supplementary_targets: tuple[str, ...] = ()
+    #: Territorial exclusion. When True, geographic_ood additionally drops every source item lying
+    #: INSIDE the target's realized footprint (convex hull of the target's own coordinates, expanded
+    #: by ``purge_km``), not merely within ``purge_km`` of a labelled target sample.
+    #:
+    #: Required when a benchmark's domains are PROVENANCE labels rather than territories: CropHarvest
+    #: aggregates globally distributed collections (``croplands``, ``geowiki-landcover-2017``) whose
+    #: points interleave with every region, so a source point can satisfy the distance purge while
+    #: sitting inside the held-out country. The realized audit measured 1851 such points across the
+    #: 15 leaves (1533 of them from those two collections; Ethiopia 236, Kenya 178, Sudan 148).
+    #: Benchmarks whose domains ARE territories (EuroCropsML countries, BreizhCrops/PASTIS folds) do
+    #: not need it and leave it False so their frozen splits are unaffected.
+    footprint_exclusion: bool = False
     #: stable-id provenance (what an artifact stores per unit); documented, not consumed here
     id_kind: str = "sample"  # "sample" | "patch"
     notes: str = ""
@@ -157,6 +176,7 @@ CROPHARVEST = BenchmarkSpec(
     ),
     supplementary_targets=("central-asia", "tanzania", "uganda", "zimbabwe"),
     source_only_units=CROPHARVEST_GLOBAL_COLLECTIONS,
+    footprint_exclusion=True,   # domains are provenance labels, not territories -- see the field docs
     id_kind="sample",
     notes="official regime = Togo only (is_crop labels do not reproduce Kenya maize / Brazil coffee).",
 )

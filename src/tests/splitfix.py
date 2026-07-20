@@ -11,6 +11,8 @@ sibling ``.../logs/splits.json`` stays inside the per-test tmp dir.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 from evals import split_artifacts as SA
@@ -21,14 +23,41 @@ _PROV: dict[str, Any] = {
 
 
 def freeze(root, built) -> list[dict[str, Any]]:
-    """Freeze built leaves. ``built`` is an iterable of ``(rows, summary)`` from ``SA.build_*_leaf``.
-    Writes each leaf's assignments.csv, sets its ``sha256``, and writes the one central log. Returns the
-    log entries."""
+    """Freeze built leaves. ``built`` is an iterable of ``(rows, summary)`` from ``SA.build_*_leaf``,
+    optionally ``(rows, summary, label_access_rows)`` for a geographic_ood headline leaf.
+
+    Writes each leaf's assignments.csv and (when given) its label_access.csv, records BOTH checksums on
+    the entry -- the loaders verify each -- and writes the one central log. Returns the log entries."""
     entries = []
-    for rows, summary in built:
+    for item in built:
+        rows, summary = item[0], item[1]
+        la_rows = item[2] if len(item) > 2 else None
         _path, summary["sha256"] = SA.write_assignments(
             root, summary["benchmark"], summary["regime"], summary["seed"], summary["holdout"], rows
         )
+        if la_rows is not None:
+            la_path, summary["label_access_sha256"] = SA.write_label_access(
+                root, summary["benchmark"], summary["seed"], summary["holdout"], la_rows
+            )
+            summary["label_access_csv"] = str(la_path.relative_to(root))
         entries.append(summary)
     SA.write_splits_log(SA.default_log_path(root), provenance=_PROV, entries=entries)
     return entries
+
+
+def attach_label_access(root, benchmark, seed, holdout, la_rows) -> str:
+    """Write a leaf's label_access.csv AFTER the log was frozen, recording its sha256 on the entry.
+
+    The loaders verify that checksum, so a fixture that writes the file without updating the central
+    log would be refused -- exactly as a real tampered or regenerated draw would be.
+    """
+    la_path, sha = SA.write_label_access(root, benchmark, seed, holdout, la_rows)
+    log_path = SA.default_log_path(root)
+    log = json.loads(Path(log_path).read_text())
+    for entry in log["leaves"]:
+        if (entry["benchmark"] == benchmark and entry["regime"] == SA.LABEL_ACCESS_REGIME
+                and int(entry["seed"]) == int(seed) and str(entry["holdout"]) == str(holdout)):
+            entry["label_access_csv"] = str(la_path.relative_to(root))
+            entry["label_access_sha256"] = sha
+    Path(log_path).write_text(json.dumps(log, indent=2) + "\n")
+    return sha

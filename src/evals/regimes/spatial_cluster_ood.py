@@ -10,17 +10,22 @@ Determinism contract (mirrors :mod:`evals.split_spec`):
     seed -- the same five cells for run seeds 0, 1, 2;
   * labels, native regions, published folds, class support, and the run seed are NEVER consulted to
     construct or modify a cell;
-  * the run seed varies ONLY the source subdivision, the target pool/test membership, and later
-    label draws.
+  * the run seed varies ONLY the source subdivision -- the held-out cell is evaluated whole and
+    zero-shot, so there is no target pool/test subdivision and no label draw here.
 
 Per rotation the source is purged of everything within the benchmark's ``purge_km`` of the ENTIRE
 target cell FIRST, then the purged source is partitioned exactly 80/10/10
-(source_train/source_val/source_test) and the target 80/20 (target_label_pool/target_test) by the
-shared deterministic partitioners. ``has_target=True`` and ``supports_target_labels=True``: every
-cell is a headline target whose own labels drive the target-label-budget routes (few-shot draws come
-ONLY from target_label_pool, every budget scored on the fixed target_test). A cell is never merged,
-expanded, dropped, or altered to improve class support -- if a real-data cell cannot support the
-declared 80/10/10 + 80/20 route, generation fails explicitly (the shared partitioners raise).
+(source_train/source_val/source_test) by the shared deterministic partitioners. A cell is never
+merged, expanded, dropped, or altered to improve class support -- if a real-data cell cannot support
+the declared 80/10/10 route, generation fails explicitly (the shared partitioners raise).
+
+SCOPE. This regime is a coordinate-only SPLIT-SENSITIVITY analysis: it asks whether the geographic
+conclusions persist when regions are defined algorithmically rather than by benchmark-provided
+administrative or collection boundaries. It is deliberately NOT a second deployment setting and NOT a
+second definition of ``geographic_ood``. Accordingly ``has_target=True`` but
+``supports_target_labels=False``: the cell is evaluated ZERO-SHOT, the whole cell is ``target_test``,
+``target_label_pool`` is empty, and no target-label route of any kind runs here. ``geographic_ood`` is
+the single regime carrying the target-label-access suite.
 
 Per-benchmark purge radii (from :mod:`evals.split_spec`): CropHarvest 50 km, EuroCropsML 25 km,
 BreizhCrops 5 km, PASTIS-R 2 km. PASTIS clusters at the ORIGINAL patch level over EPSG:4326 patch
@@ -49,7 +54,7 @@ from evals.regimes.geographic_ood import _latlon, _purge, _source_sizes
 NAME = "spatial_cluster_ood"
 GROUP_KIND = "spatial_cluster"
 HAS_TARGET = True
-SUPPORTS_TARGET_LABELS = True  # every cell's labels drive the target-label-budget routes
+SUPPORTS_TARGET_LABELS = False  # split-sensitivity only: the cell is scored zero-shot, never label-accessed
 EARTH_RADIUS_KM = 6371.0088
 
 #: Five spherical K-means Voronoi cells, frozen at CLUSTER_SEED (never the run seed), n_init fixed.
@@ -180,14 +185,15 @@ def iter_source_target_splits(bench, bench_mod, seed: int) -> Iterator[SourceTar
         source_val = np.sort(source_rows[src["source_val"]])
         source_test = np.sort(source_rows[src["source_test"]])
 
-        pool_n, test_n = split_spec.target_partition_sizes(len(target_rows))
-        tgt = partition.partition_target([str(c) for c in y[target_rows].tolist()], pool_n, test_n, int(seed))
+        # Zero-shot sensitivity target: the WHOLE cell is the evaluation set and no label pool is
+        # carved out of it, so nothing here can ever be trained on. (Route invariants in regimes.base
+        # require an empty pool whenever supports_target_labels is False.)
         yield SourceTargetSplit(
             label=target, source_train=source_train, source_val=source_val, source_test=source_test,
-            target_label_pool=np.sort(target_rows[tgt["target_label_pool"]]),
-            target_test=np.sort(target_rows[tgt["target_test"]]),
-            domain=target, has_target=True, supports_target_labels=True, group_kind=GROUP_KIND,
-            target_role=TARGET_ROLE_HEADLINE,  # every spatial cell is a headline target
+            target_label_pool=np.empty(0, dtype=np.int64),
+            target_test=np.sort(target_rows),
+            domain=target, has_target=True, supports_target_labels=False, group_kind=GROUP_KIND,
+            target_role=TARGET_ROLE_HEADLINE,
         )
 
 
@@ -223,22 +229,17 @@ def iter_dense_source_target_splits(bench, bench_mod, seed: int) -> Iterator[Den
         src = partition.multilabel_assign(
             [sorted(class_sets.get(p, set())) for p in source_patches], _source_sizes(len(source_patches)), int(seed),
         )
-        pool_n, test_n = split_spec.target_partition_sizes(len(target_patches))
-        tgt = partition.multilabel_assign(
-            [sorted(class_sets.get(p, set())) for p in target_patches],
-            [("target_label_pool", pool_n), ("target_test", test_n)], int(seed),
-        )
-
         def pset(idx, base):  # noqa: ANN001 -- map partitioner indices back to patch ids
             return frozenset(base[i] for i in idx.tolist())
 
+        # Zero-shot sensitivity target: every patch in the cell is evaluation, none is a label pool.
         yield DenseSourceTargetSplit(
             label=target,
             source_train_patches=pset(src["source_train"], source_patches),
             source_val_patches=pset(src["source_val"], source_patches),
             source_test_patches=pset(src["source_test"], source_patches),
-            target_label_pool_patches=pset(tgt["target_label_pool"], target_patches),
-            target_test_patches=pset(tgt["target_test"], target_patches),
-            has_target=True, supports_target_labels=True, group_kind=GROUP_KIND,
-            target_role=TARGET_ROLE_HEADLINE,  # every spatial cell is a headline multiclass target
+            target_label_pool_patches=frozenset(),
+            target_test_patches=frozenset(int(p) for p in target_patches),
+            has_target=True, supports_target_labels=False, group_kind=GROUP_KIND,
+            target_role=TARGET_ROLE_HEADLINE,
         )

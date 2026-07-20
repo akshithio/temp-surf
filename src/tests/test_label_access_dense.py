@@ -437,8 +437,8 @@ def test_load_dense_label_access_resolves_patch_orders(tmp_path):
         seed=0, source_ids=[str(p) for p in source], target_pool_ids=[str(p) for p in pool],
         target_test_ids=[str(p) for p in test],
     )
-    SA.write_label_access(tmp_path / "splits", "pastis", 0, "T1", la_rows)
-    loaded = SA.load_dense_label_access(tmp_path / "splits", "pastis", 0, _dense_split(source, pool, test))
+    _path, sha = SA.write_label_access(tmp_path / "splits", "pastis", 0, "T1", la_rows)
+    loaded = SA.load_dense_label_access(tmp_path / "splits", "pastis", 0, _dense_split(source, pool, test), sha)
     assert set(loaded.matched_source_ranked_patches.tolist()) == set(source)
     assert set(loaded.fixed_source_removal_ranked_patches.tolist()) == set(source)
     assert set(loaded.target_ranked_patches.tolist()) == set(pool)
@@ -447,7 +447,10 @@ def test_load_dense_label_access_resolves_patch_orders(tmp_path):
 
 def test_load_dense_label_access_missing_file_hard_errors(tmp_path):
     with pytest.raises(SA.SplitArtifactError, match="missing label_access.csv"):
-        SA.load_dense_label_access(tmp_path / "splits", "pastis", 0, _dense_split(range(60), range(1000, 1055), range(2000, 2008)))
+        SA.load_dense_label_access(
+            tmp_path / "splits", "pastis", 0,
+            _dense_split(range(60), range(1000, 1055), range(2000, 2008)), "0" * 64,
+        )
 
 
 def test_load_dense_label_access_rejects_stale_population(tmp_path):
@@ -456,9 +459,11 @@ def test_load_dense_label_access_rejects_stale_population(tmp_path):
         seed=0, source_ids=[str(p) for p in source], target_pool_ids=[str(p) for p in pool],
         target_test_ids=[str(p) for p in test],
     )
-    SA.write_label_access(tmp_path / "splits", "pastis", 0, "T1", la_rows)
+    _p, stale_sha = SA.write_label_access(tmp_path / "splits", "pastis", 0, "T1", la_rows)
     with pytest.raises(SA.SplitArtifactError):
-        SA.load_dense_label_access(tmp_path / "splits", "pastis", 0, _dense_split(list(range(1, 61)), pool, test))
+        SA.load_dense_label_access(
+            tmp_path / "splits", "pastis", 0, _dense_split(list(range(1, 61)), pool, test), stale_sha,
+        )
 
 
 # --------------------------------------------------------------------------- #

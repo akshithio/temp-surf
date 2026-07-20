@@ -536,7 +536,7 @@ def _run_segmentation_pair(
             for _ld in splits_by_seed[_s]:
                 if _ld.regime == split_artifacts.LABEL_ACCESS_REGIME and _ld.split.supports_target_labels:
                     dense_la_by_cell[(_s, _ld.split.label)] = split_artifacts.load_dense_label_access(
-                        splits_root, bench_mod.BENCHMARK, _s, _ld.split
+                        splits_root, bench_mod.BENCHMARK, _s, _ld.split, _ld.label_access_sha256
                     )
 
     bench_for_emb = bench.s2_only() if s2_only else bench

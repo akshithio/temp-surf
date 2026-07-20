@@ -25,9 +25,6 @@ from utils import ioutils as IOU  # noqa: E402
 from utils import perfutils as perf  # noqa: E402
 
 # === Configuration ===========================================================
-# The final protocol lives here: committed, reviewable, and unchangeable by a stale shell or a
-# Slurm export. The ONLY thing that differs across machines is which benchmarks/models this box
-# runs -- edit BENCHMARKS / ACTIVE_MODELS per machine; everything else is synced identically.
 BENCHMARKS = ["cropharvest", "eurocropsml", "breizhcrops", "pastis"]
 ACTIVE_MODELS = None  # None = all eligible models for BENCHMARKS; or a list to restrict this box
 SEEDS = [0, 1, 2]
@@ -163,7 +160,8 @@ def _run_tabular_pair(
                 if _la_id_map is None:
                     _la_id_map = {str(s): i for i, s in enumerate(np.asarray(bench.sample_ids).tolist())}
                 label_access_by_cell[(_ls.seed, _ls.split.label)] = split_artifacts.load_label_access(
-                    splits_root, bench_mod.BENCHMARK, _ls.seed, _ls.split, _la_id_map
+                    splits_root, bench_mod.BENCHMARK, _ls.seed, _ls.split, _la_id_map,
+                    _ls.label_access_sha256,
                 )
 
     bench_for_emb = bench.s2_only() if s2_only else bench
@@ -286,11 +284,12 @@ def _run_tabular_pair(
             supports_target_labels = st.supports_target_labels
             # Schema-v2 partition routing, by route capability:
             #  * random_id (has_target=False): evaluate IN DISTRIBUTION on source_test.
-            #  * official (has_target=True, supports_target_labels=False): fit source_train, calibrate
-            #    source_val, evaluate ZERO-SHOT on target_test -- NO target-label access, NO target sweep.
-            #  * geographic/spatial (supports_target_labels=True): the source budgets ALSO evaluate
-            #    zero-shot on target_test, AND the target budgets draw few-shot labels ONLY from
-            #    target_label_pool and are scored on the SAME target_test.
+            #  * official / spatial_cluster (has_target=True, supports_target_labels=False): fit
+            #    source_train, calibrate source_val, evaluate ZERO-SHOT on target_test -- NO
+            #    target-label access, NO target sweep. spatial_cluster's whole cell IS target_test.
+            #  * geographic_ood (supports_target_labels=True): the source budgets ALSO evaluate
+            #    zero-shot on target_test, AND the 13-route label-access suite draws few-shot labels
+            #    ONLY from target_label_pool, scored on the SAME target_test.
             train, val = st.source_train, st.source_val
             test = st.target_test if has_target else st.source_test
             # The 80/10/10 within-source reference: source_test is evaluated as an UNTOUCHED diagnostic
