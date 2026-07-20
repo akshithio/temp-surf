@@ -127,6 +127,23 @@ def test_tabular_apply_does_not_serialize_embedding_data(tmp_path, monkeypatch):
     assert adopt._adopt_tabular(_tab_cand(legacy), {})["status"] == "adopted"
 
 
+def test_tabular_apply_records_existing_canonical_file_in_place(tmp_path, monkeypatch):
+    adopt = _load_tool("adopt_embeddings")
+    arr = np.arange(24, dtype=np.float32).reshape(8, 3)
+    _setup_tabular(adopt, monkeypatch, tmp_path, arr=arr)
+    destination = adopt.C.embedding_cache_path("cropharvest", "raw", "baseline")
+    destination.parent.mkdir(parents=True)
+    np.save(destination, arr)
+    inode = destination.stat().st_ino
+    monkeypatch.setitem(adopt.CONFIG, "mode", "apply")
+
+    result = adopt._adopt_tabular(_tab_cand(destination), {})
+
+    assert result["status"] == "adopted"
+    assert destination.stat().st_ino == inode
+    assert adopt.C._cache_record("cropharvest", "raw", "baseline") is not None
+
+
 def test_tabular_refuses_missing_legacy(tmp_path, monkeypatch):
     adopt = _load_tool("adopt_embeddings")
     arr = np.zeros((4, 2), dtype=np.float32)
@@ -547,6 +564,22 @@ def test_dense_canonical_noop_runs_full_validation(tmp_path, monkeypatch):
 
     result = adopt._adopt_dense(_dense_cand(legacy), {})
     assert result["status"] == "refused" and "dtype" in result["reason"]
+
+
+def test_dense_apply_records_existing_canonical_directory_in_place(tmp_path, monkeypatch):
+    adopt = _load_tool("adopt_embeddings")
+    legacy, _, _ = _setup_dense(adopt, monkeypatch, tmp_path)
+    destination = adopt.C.dense_embedding_cache_dir("pastis", "galileo", "baseline")
+    destination.parent.mkdir(parents=True)
+    legacy.rename(destination)
+    inode = destination.stat().st_ino
+    monkeypatch.setitem(adopt.CONFIG, "mode", "apply")
+
+    result = adopt._adopt_dense(_dense_cand(destination), {})
+
+    assert result["status"] == "adopted"
+    assert destination.stat().st_ino == inode
+    assert adopt.C._cache_record("pastis", "galileo", "baseline") is not None
 
 
 def test_main_applies_valid_candidate_before_later_refusal(monkeypatch):

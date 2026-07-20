@@ -187,6 +187,7 @@ def _prepare_tabular(cand, enc_kwargs) -> _Plan:
     if not already_adopted and destination.exists() and legacy.exists() and destination != legacy:
         return _refused(report, f"canonical destination already exists without a cache.json record: {destination}")
     source = destination if already_adopted or recovering or destination == legacy else legacy
+    in_place = source == destination
     if not source.is_file():
         return _refused(report, "legacy artifact missing")
 
@@ -263,7 +264,7 @@ def _prepare_tabular(cand, enc_kwargs) -> _Plan:
             if recovering:
                 if not destination.is_file():
                     raise RuntimeError(f"canonical recovery artifact disappeared: {destination}")
-            else:
+            elif not in_place:
                 if destination.exists():
                     raise RuntimeError(f"canonical destination appeared after validation: {destination}")
                 if not source.is_file():
@@ -272,6 +273,8 @@ def _prepare_tabular(cand, enc_kwargs) -> _Plan:
                 if cross_device:
                     raise RuntimeError(cross_device)
                 os.replace(source, destination)
+            elif not destination.is_file():
+                raise RuntimeError(f"canonical in-place artifact disappeared: {destination}")
             C.update_cache(embeddings={C._embedding_key(bench_key, model, artifact): record})
         if legacy != destination:
             _remove_empty_fingerprint_parent(legacy)
@@ -301,6 +304,7 @@ def _prepare_dense(cand, enc_kwargs) -> _Plan:
     if not already_adopted and destination.exists() and legacy.exists() and destination != legacy:
         return _refused(report, f"canonical destination already exists without a cache.json record: {destination}")
     source = destination if already_adopted or recovering or destination == legacy else legacy
+    in_place = source == destination
     if not source.is_dir():
         return _refused(report, "legacy dense cache directory missing")
 
@@ -417,7 +421,7 @@ def _prepare_dense(cand, enc_kwargs) -> _Plan:
             if recovering:
                 if not destination.is_dir():
                     raise RuntimeError(f"canonical recovery directory disappeared: {destination}")
-            else:
+            elif not in_place:
                 if destination.exists():
                     raise RuntimeError(f"canonical destination appeared after validation: {destination}")
                 if not source.is_dir():
@@ -426,6 +430,8 @@ def _prepare_dense(cand, enc_kwargs) -> _Plan:
                 if cross_device:
                     raise RuntimeError(cross_device)
                 os.replace(source, destination)
+            elif not destination.is_dir():
+                raise RuntimeError(f"canonical in-place directory disappeared: {destination}")
             final_problems = C._dense_tile_set_problems(
                 destination, feature_rels, label_rels
             )
@@ -506,7 +512,8 @@ def main() -> int:
             except Exception as exc:  # noqa: BLE001
                 report = {**plan.report, "status": "error", "reason": repr(exc)}
             print(
-                f"[apply {index}/{len(candidates)}] {candidate_name}: {report['status']}",
+                f"[apply {index}/{len(candidates)}] {candidate_name}: {report['status']}"
+                + (f" ({report['reason']})" if report.get("reason") else ""),
                 flush=True,
             )
         reports.append(report)

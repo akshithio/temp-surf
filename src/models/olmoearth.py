@@ -49,6 +49,7 @@ OLMOEARTH_S2_BANDS = [
 ]
 OLMOEARTH_NUM_S2_BANDS = len(OLMOEARTH_S2_BANDS)  # 12
 OLMOEARTH_EMBEDDING_DIM = 768
+OLMOEARTH_BATCH_SIZE = 2048
 
 # --------------------------------------------------------------------------- #
 # Mapping from common Benchmark S2 band names to OlmoEarth's index.
@@ -115,7 +116,7 @@ class OlmoEarthModel:
     name: str = "olmoearth"
     embedding_dim: int = OLMOEARTH_EMBEDDING_DIM
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    batch_size: int = 8
+    batch_size: int = OLMOEARTH_BATCH_SIZE
     patch_size: int = 1
     tile_size: int = 1
     weights_path: str | Path | None = None
@@ -266,11 +267,12 @@ class OlmoEarthModel:
                 sentinel2_l2a_mask=torch.from_numpy(masks[sl]).to(self.device),
                 timestamps=torch.from_numpy(ts[sl]).to(self.device),
             )
-            from olmoearth_pretrain.datatypes import MaskValue
             from olmoearth_pretrain.nn.pooling import PoolingType, pool_unmasked_tokens
 
-            fast_pass = not (sample.sentinel2_l2a_mask == MaskValue.MISSING.value).any().item()
-            tokens = self._model(sample, fast_pass=fast_pass, patch_size=eff_patch)["tokens_and_masks"]
+            # ``fast_pass`` is a whole-batch switch: choosing it from whether any row is missing
+            # makes one sample's embedding depend on its batch companions. The general path handles
+            # both observed and missing months and is invariant to batch composition.
+            tokens = self._model(sample, fast_pass=False, patch_size=eff_patch)["tokens_and_masks"]
             pooled = pool_unmasked_tokens(tokens, PoolingType.MEAN)
             out.append(pooled.detach().cpu().numpy().astype(np.float32))
 

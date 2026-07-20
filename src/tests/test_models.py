@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -8,7 +10,7 @@ import torch
 
 from dataio.get_input import Benchmark, ModalitySeries, NativeSeries, _synthetic_month_doy
 from models.agrifm import AgriFMModel, _split_s2_checkpoint
-from models.olmoearth import OlmoEarthModel
+from models.olmoearth import OLMOEARTH_BATCH_SIZE, OlmoEarthModel
 from models.presto import PrestoModel
 from models.tessera import TESSERA_S2_BANDS, TesseraModel
 from utils import cacheutils
@@ -245,6 +247,54 @@ def test_olmoearth_default_loader_returns_pinned_encoder_api(tmp_path, monkeypat
     )
 
     assert olmoearth._default_load_model(model_dir) is encoder
+
+
+def test_olmoearth_uses_fixed_high_throughput_batch_contract() -> None:
+    assert OLMOEARTH_BATCH_SIZE == 2048
+    assert OlmoEarthModel().batch_size == OLMOEARTH_BATCH_SIZE
+
+
+def test_olmoearth_encode_uses_batch_invariant_general_path(monkeypatch) -> None:
+    calls = []
+
+    class Sample:
+        def __init__(self, sentinel2_l2a, sentinel2_l2a_mask, timestamps):
+            self.sentinel2_l2a = sentinel2_l2a
+            self.sentinel2_l2a_mask = sentinel2_l2a_mask
+            self.timestamps = timestamps
+
+    class Encoder:
+        def __call__(self, sample, *, fast_pass, patch_size):
+            calls.append((fast_pass, patch_size))
+            pooled = torch.zeros((sample.sentinel2_l2a.shape[0], 768))
+            return {"tokens_and_masks": SimpleNamespace(sentinel2_l2a=pooled)}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "olmoearth_pretrain.datatypes",
+        SimpleNamespace(MaskedOlmoEarthSample=Sample),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "olmoearth_pretrain.nn.pooling",
+        SimpleNamespace(
+            PoolingType=SimpleNamespace(MEAN="mean"),
+            pool_unmasked_tokens=lambda tokens, _pooling: tokens.sentinel2_l2a,
+        ),
+    )
+    model = OlmoEarthModel(batch_size=2, _model=Encoder())
+    monkeypatch.setattr(
+        model,
+        "_bench_to_olmoearth",
+        lambda _bench: (
+            np.zeros((5, 1, 1, 12, 12), dtype=np.float32),
+            np.zeros((5, 1, 1, 12, 1), dtype=np.float32),
+            np.zeros((5, 12, 3), dtype=np.int64),
+        ),
+    )
+
+    assert model.encode(object()).shape == (5, 768)
+    assert calls == [(False, 1), (False, 1), (False, 1)]
 
 
 def test_pretrained_classification_smoke_runs_under_pytest() -> None:
