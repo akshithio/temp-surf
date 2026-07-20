@@ -2,8 +2,8 @@
 
 This temporary migration utility never regenerates embeddings and never copies their data. Edit the
 CONFIG block and run it without command-line arguments. Report mode performs every validation but
-does not write. Apply mode validates every candidate before moving any candidate, then atomically
-renames each accepted cell on its filesystem and records it in cache.json last.
+does not write. Apply mode validates each candidate, then atomically renames that accepted cell on
+its filesystem and records it in cache.json last before continuing to the next candidate.
 
 Each cell is independently resumable. If execution stops after a rename but before its cache.json
 record is written, rerunning validates the canonical artifact and finishes the record. A later cell
@@ -486,7 +486,7 @@ def main() -> int:
     candidates = CONFIG["candidates"]
     print(f"[adopt] mode={CONFIG['mode']}  candidates={len(candidates)}")
 
-    plans = []
+    reports = []
     for index, candidate in enumerate(candidates, start=1):
         candidate_name = f"{candidate['benchmark']}/{candidate['model']}"
         started = time.perf_counter()
@@ -498,23 +498,19 @@ def main() -> int:
             f"{plan.report['status']} ({elapsed:.1f}s)",
             flush=True,
         )
-        plans.append(plan)
-    failures = _summarize([plan.report for plan in plans])
-    if failures or CONFIG["mode"] == "report":
-        return 1 if failures else 0
-
-    results = []
-    for index, plan in enumerate(plans, start=1):
-        candidate_name = plan.report.get("candidate", "unknown")
-        print(f"[apply {index}/{len(plans)}] {candidate_name}", flush=True)
-        if plan.apply is None:
-            results.append(plan.report)
-            continue
-        try:
-            results.append(plan.apply())
-        except Exception as exc:  # noqa: BLE001
-            results.append({**plan.report, "status": "error", "reason": repr(exc)})
-    return 1 if _summarize(results) else 0
+        report = plan.report
+        if CONFIG["mode"] == "apply" and plan.apply is not None:
+            print(f"[apply {index}/{len(candidates)}] {candidate_name}", flush=True)
+            try:
+                report = plan.apply()
+            except Exception as exc:  # noqa: BLE001
+                report = {**plan.report, "status": "error", "reason": repr(exc)}
+            print(
+                f"[apply {index}/{len(candidates)}] {candidate_name}: {report['status']}",
+                flush=True,
+            )
+        reports.append(report)
+    return 1 if _summarize(reports) else 0
 
 
 if __name__ == "__main__":

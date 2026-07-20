@@ -549,7 +549,7 @@ def test_dense_canonical_noop_runs_full_validation(tmp_path, monkeypatch):
     assert result["status"] == "refused" and "dtype" in result["reason"]
 
 
-def test_main_validates_all_candidates_before_first_rename(monkeypatch):
+def test_main_applies_valid_candidate_before_later_refusal(monkeypatch):
     adopt = _load_tool("adopt_embeddings")
     applied = []
     candidates = [{"benchmark": "a", "model": "m"}, {"benchmark": "b", "model": "m"}]
@@ -566,7 +566,7 @@ def test_main_validates_all_candidates_before_first_rename(monkeypatch):
 
     monkeypatch.setattr(adopt, "_prepare_candidate", prepare)
     assert adopt.main() == 1
-    assert applied == []
+    assert applied == ["a"]
 
 
 def test_main_validates_each_candidate_once(monkeypatch):
