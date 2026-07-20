@@ -359,7 +359,13 @@ def run_probes_label_access(
     y_source: np.ndarray, y_pool: np.ndarray, y_test: np.ndarray,
     seed: int,
     *,
-    matched_source_order: np.ndarray, fixed_removal_order: np.ndarray, target_order: np.ndarray,
+    budget: int,
+    source_order: np.ndarray, target_order: np.ndarray,
+    percents: tuple[int, ...] | None = None,
+    counts: tuple[int, ...] | None = None,
+    controlled_cap: int | None = None,
+    full_target_reference: bool = True,
+    full_combined_reference: bool = True,
     meta: dict[str, Any] | None = None,
     groups_source: np.ndarray | None = None,
     groups_pool: np.ndarray | None = None,
@@ -372,8 +378,10 @@ def run_probes_label_access(
     family: str = "logistic",
     label_budget_unit: str = "samples",
 ) -> None:
-    """Run the binary geographic label-access suite (13 routes) on a frozen ``target_test``."""
-    from evals.split_artifacts import LABEL_ACCESS_COUNTS
+    """Run the binary geographic label-access suite on a frozen ``target_test``: the fixed-budget
+    allocation curve over ``percents`` at the frozen benchmark budget ``budget``, plus the additive
+    appendix routes and the optional full references."""
+    from evals.split_artifacts import ALLOCATION_PERCENTS, LABEL_ACCESS_COUNTS
 
     def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False):
         clf, threshold, n_fit, n_cal, probe_meta = fit_probe_with_calibration(
@@ -391,8 +399,12 @@ def run_probes_label_access(
 
     _sweep_label_access_routes(
         rows, x_source, y_source, x_pool, y_pool, x_test, y_test, seed, fit_score,
-        counts=LABEL_ACCESS_COUNTS, matched_source_order=matched_source_order,
-        fixed_removal_order=fixed_removal_order, target_order=target_order, meta=meta,
+        budget=budget,
+        percents=(ALLOCATION_PERCENTS if percents is None else tuple(percents)),
+        counts=(LABEL_ACCESS_COUNTS if counts is None else tuple(counts)),
+        source_order=source_order, target_order=target_order,
+        controlled_cap=controlled_cap, full_target_reference=full_target_reference,
+        full_combined_reference=full_combined_reference, meta=meta,
         groups_source=groups_source, groups_pool=groups_pool, groups_test=groups_test,
         x_val=x_val, y_val=y_val, family=family, label_budget_unit=label_budget_unit,
         predictions=predictions, sample_ids_test=sample_ids_test, sample_ids_full=sample_ids_full,
@@ -405,7 +417,13 @@ def run_probes_multiclass_label_access(
     y_source: np.ndarray, y_pool: np.ndarray, y_test: np.ndarray,
     seed: int,
     *,
-    matched_source_order: np.ndarray, fixed_removal_order: np.ndarray, target_order: np.ndarray,
+    budget: int,
+    source_order: np.ndarray, target_order: np.ndarray,
+    percents: tuple[int, ...] | None = None,
+    counts: tuple[int, ...] | None = None,
+    controlled_cap: int | None = None,
+    full_target_reference: bool = True,
+    full_combined_reference: bool = True,
     meta: dict[str, Any] | None = None,
     groups_source: np.ndarray | None = None,
     groups_pool: np.ndarray | None = None,
@@ -418,8 +436,10 @@ def run_probes_multiclass_label_access(
     family: str = "logistic",
     label_budget_unit: str = "samples",
 ) -> None:
-    """Run the multiclass geographic label-access suite (13 routes) on a frozen ``target_test``."""
-    from evals.split_artifacts import LABEL_ACCESS_COUNTS
+    """Run the multiclass geographic label-access suite on a frozen ``target_test``: the fixed-budget
+    allocation curve over ``percents`` at the frozen benchmark budget ``budget``, plus the additive
+    appendix routes and the optional full references."""
+    from evals.split_artifacts import ALLOCATION_PERCENTS, LABEL_ACCESS_COUNTS
 
     def fit_score(x_tr, y_tr, x_te, y_te, probe_seed, x_cal=None, y_cal=None, tune_internal=False):
         clf, probe_meta = fit_probe_multiclass(
@@ -433,8 +453,12 @@ def run_probes_multiclass_label_access(
 
     _sweep_label_access_routes(
         rows, x_source, y_source, x_pool, y_pool, x_test, y_test, seed, fit_score,
-        counts=LABEL_ACCESS_COUNTS, matched_source_order=matched_source_order,
-        fixed_removal_order=fixed_removal_order, target_order=target_order, meta=meta,
+        budget=budget,
+        percents=(ALLOCATION_PERCENTS if percents is None else tuple(percents)),
+        counts=(LABEL_ACCESS_COUNTS if counts is None else tuple(counts)),
+        source_order=source_order, target_order=target_order,
+        controlled_cap=controlled_cap, full_target_reference=full_target_reference,
+        full_combined_reference=full_combined_reference, meta=meta,
         groups_source=groups_source, groups_pool=groups_pool, groups_test=groups_test,
         x_val=x_val, y_val=y_val, family=family, label_budget_unit=label_budget_unit,
         predictions=predictions, sample_ids_test=sample_ids_test, sample_ids_full=sample_ids_full,
@@ -497,33 +521,42 @@ def run_probes_segmentation_label_access(
     source_patches: Any,
     pool_patches: Any,
     target_test_patches: Any,
-    matched_source_order: Any,
-    fixed_removal_order: Any,
+    source_order: Any,
     target_order: Any,
+    budget: int,
+    percents: tuple[int, ...] | None = None,
+    counts: tuple[int, ...] | None = None,
+    controlled_cap: int | None = None,
+    full_target_reference: bool = True,
+    full_combined_reference: bool = True,
     load_pixels: Any,
     stream_eval: Any,
     x_val: np.ndarray,
     y_val: np.ndarray,
     meta: dict[str, Any] | None = None,
     family: str = "logistic",
-    cap_patches: int | None = None,
     patch_domain: dict[int, str] | None = None,
     predictions_sink: Any = None,
 ) -> None:
-    """Run the dense geographic label-access suite (13 routes, at patch granularity) on a frozen PASTIS
-    ``target_test``. Counts come from the ONE canonical set; the unit is ``patches``. Patch allocation is
-    resolved before ``load_pixels`` assembles per-route pixels; ``predictions_sink`` (when set) receives
-    streamed per-pixel prediction records."""
-    from evals.split_artifacts import LABEL_ACCESS_COUNTS, label_access_unit
+    """Run the dense geographic label-access suite at PATCH granularity on a frozen PASTIS
+    ``target_test``: the fixed-budget allocation curve at the frozen benchmark budget, the additive
+    appendix routes, and the optional full references. The unit is ``patches`` and patches are never
+    split. Patch allocation is resolved before ``load_pixels`` assembles per-route pixels;
+    ``predictions_sink`` (when set) receives streamed per-pixel prediction records."""
+    from evals.split_artifacts import ALLOCATION_PERCENTS, LABEL_ACCESS_COUNTS, label_access_unit
 
     bench = load_benchmark("pastis")
     bench.run_probes_segmentation_label_access(
         rows, seed,
         source_patches=source_patches, pool_patches=pool_patches, target_test_patches=target_test_patches,
-        matched_source_order=matched_source_order, fixed_removal_order=fixed_removal_order,
-        target_order=target_order, counts=LABEL_ACCESS_COUNTS, load_pixels=load_pixels, stream_eval=stream_eval,
+        source_order=source_order, target_order=target_order, budget=int(budget),
+        percents=tuple(ALLOCATION_PERCENTS if percents is None else percents),
+        counts=tuple(LABEL_ACCESS_COUNTS if counts is None else counts),
+        controlled_cap=controlled_cap, full_target_reference=full_target_reference,
+        full_combined_reference=full_combined_reference,
+        load_pixels=load_pixels, stream_eval=stream_eval,
         x_val=x_val, y_val=y_val, meta=meta, family=family, label_budget_unit=label_access_unit("pastis"),
-        cap_patches=cap_patches, patch_domain=patch_domain, predictions_sink=predictions_sink,
+        patch_domain=patch_domain, predictions_sink=predictions_sink,
     )
 
 # Pair-level execution

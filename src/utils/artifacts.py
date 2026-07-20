@@ -529,30 +529,35 @@ def completeness(expected_keys: set[tuple], rows: list[dict[str, Any]]) -> dict[
 def _validate_label_access_semantics(rows: list[dict[str, Any]]) -> list[str]:
     """Semantic integrity of the label-access result rows, BEYOND 9-field cell-key completeness.
 
-    The cell key certifies that every planned (route, budget, split) row is present; it says nothing
+    The cell key certifies that every planned (route, budget, split) row is PRESENT; it says nothing
     about whether the supervision COUNTS on those rows are internally consistent. A tampered count or
-    unit keeps the key intact, so completeness() passes and a corrupt table would publish. This
-    cross-checks the per-route accounting within each cell and returns human-readable problems (empty
-    when consistent). It only inspects rows that ARE present -- completeness() owns missing rows.
+    unit keeps the key intact, so completeness() would pass and a corrupt table would publish. This
+    cross-checks the per-route accounting within each cell and returns readable problems (empty when
+    consistent). It only inspects rows that ARE present -- completeness() owns missing rows.
 
-    Every count and every consumed n_test is a STRICT nonnegative integer: booleans, non-integral floats
-    (e.g. 60.5), non-numeric, and negatives are rejected outright -- never silently ``int()``-coerced.
+    Every count is a STRICT nonnegative integer: booleans, non-integral floats and negatives are
+    rejected outright, never silently ``int()``-coerced.
 
-    Per cell (seed, split_regime, holdout, method, probe_family): every row balances
-    (n_total == n_source + n_target) and carries the tabular unit; source_only trains on 0 target. The
-    REALIZED target-pool size ``P = complete_target.n_test - target_test.n_test`` (>= 0) anchors the
-    absolute checks: target_only_full and source_plus_target_full each train on exactly ``P`` target
-    labels; matched_source and matched_target each train on exactly ``min(B, P)`` (and on nothing from
-    the other domain). The additive route totals ``B_src + k``; the fixed-total route holds the total
-    invariant at ``B_tot``; and the source_only complete-target diagnostic agrees with the source_only
-    fit exactly.
+    Per cell (seed, split_regime, holdout, method, probe_family):
+
+    * every row balances ``n_total == n_source + n_target`` and carries the benchmark's unit
+      (``patches`` for dense PASTIS, ``samples`` otherwise -- resolved, never hardcoded);
+    * every allocation row agrees on ONE realized budget ``B`` (``allocation_total_budget``), and at
+      fraction ``f``: ``n_target == round_half_up(f*B)``, ``n_source == B - n_target``, ``n_total == B``
+      -- this is the whole fixed-budget claim, so it is checked arithmetically rather than trusted;
+    * additive@k trains on the COMPLETE source pool plus exactly ``k`` target units;
+    * ``target_only_full`` has no source; ``source_plus_target_full`` uses the complete source pool;
+    * the RETIRED routes (``source_only`` / ``matched_source`` / ``matched_target`` /
+      ``fixed_total_mixed``) must not appear, and label access must emit no ``complete_target`` row --
+      the deployment estimand is now the ordinary full-source E1 row;
+    * exactly ONE corresponding full-source geographic (E1) row exists, since the label-access
+      contrasts subtract it instead of refitting a source-only probe.
     """
-    from evals import split_artifacts as _SA
+    from evals import split_artifacts as _SA  # lazy: canonical route names, no import cycle
 
     la = [r for r in rows if r.get("budget_type") == "label_access"]
     if not la:
         return []
-    count_fields = ("n_source_labels", "n_target_labels", "n_total_labels")
     cell_fields = ("seed", "split_regime", "holdout", "method", "probe_family")
 
     def _strict_int(row: dict[str, Any] | None, field: str) -> tuple[int | None, str | None]:
@@ -581,27 +586,35 @@ def _validate_label_access_semantics(rows: list[dict[str, Any]]) -> list[str]:
             return v
         return int(v) if v.is_integer() else v
 
+    _RETIRED = ("source_only", "matched_source", "matched_target", "fixed_total_mixed")
+
     cells: dict[tuple, dict[tuple, dict]] = {}
     for r in la:
         cell = tuple(r.get(f) for f in cell_fields)
         rk = (r.get("label_access_route"), _budget_key(r.get("label_budget")), r.get("evaluation_split"))
         cells.setdefault(cell, {})[rk] = r
+    # E1: the ordinary full-source geographic row the contrasts subtract (and whose complete_target
+    # scope carries the deployment estimand). Counted per cell -- exactly one must exist.
+    e1_counts: dict[tuple, int] = {}
+    for r in rows:
+        if r.get("budget_type") != "source" or r.get("evaluation_split") != "test":
+            continue
+        try:
+            if float(r.get("label_budget")) != 1.0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        e1_counts[tuple(r.get(f) for f in cell_fields)] = e1_counts.get(
+            tuple(r.get(f) for f in cell_fields), 0
+        ) + 1
 
     problems: list[str] = []
     for cell, by in cells.items():
         tag = "/".join(str(x) for x in cell)
-        # The expected unit is the BENCHMARK's, resolved from the cell's own rows (every row in a cell
-        # shares one benchmark): "patches" for dense PASTIS, "samples" for tabular -- never hardcoded.
         unit = _SA.label_access_unit(next(iter(by.values())).get("benchmark"))
 
         def _req(cond: bool, msg: str, _tag: str = tag) -> None:
             if not cond:
-                problems.append(f"{_tag}: {msg}")
-
-        def _req_eq(a: Any, b: Any, msg: str, _tag: str = tag) -> None:
-            # Report a genuine mismatch, but stay silent when either side is None: an absent/invalid
-            # field (or an underivable P) was already reported, so this avoids a duplicate complaint.
-            if a is not None and b is not None and a != b:
                 problems.append(f"{_tag}: {msg}")
 
         def _field(row: dict[str, Any] | None, field: str, where: str, _tag: str = tag) -> int | None:
@@ -610,10 +623,15 @@ def _validate_label_access_semantics(rows: list[dict[str, Any]]) -> list[str]:
                 problems.append(f"{_tag}: {where}: {err}")
             return iv
 
-        # Row-local: strictly parse every supervision count, then balance + unit on EVERY row.
+        count_fields = ("n_source_labels", "n_target_labels", "n_total_labels")
         norm: dict[tuple, dict[str, int | None]] = {}
         for (route, budget, es), r in by.items():
             where = f"{route}@{budget}/{es}"
+            if route in _RETIRED:
+                _req(False, f"{where}: retired route {route!r} must not be emitted")
+            if es == _SA.EVAL_COMPLETE_TARGET:
+                _req(False, f"{where}: label access emits no complete_target row "
+                            f"(the deployment estimand is the full-source E1 row)")
             vals = {f: _field(r, f, where) for f in count_fields}
             norm[(route, budget, es)] = vals
             ns, nt, ntot = vals["n_source_labels"], vals["n_target_labels"], vals["n_total_labels"]
@@ -622,70 +640,59 @@ def _validate_label_access_semantics(rows: list[dict[str, Any]]) -> list[str]:
             _req(r.get("label_budget_unit") == unit,
                  f"{where}: unit {r.get('label_budget_unit')!r} != {unit!r}")
 
-        so_key = (_SA.ROUTE_SOURCE_ONLY, 0, _SA.EVAL_TARGET_TEST)
-        diag_key = (_SA.ROUTE_SOURCE_ONLY, 0, _SA.EVAL_COMPLETE_TARGET)
-        so = by.get(so_key)
-        if so is None:
-            continue  # anchor absent -> completeness() blocks the run; every cross-check below needs it
-        b_src, b_tot = norm[so_key]["n_source_labels"], norm[so_key]["n_total_labels"]
-        _req_eq(norm[so_key]["n_target_labels"], 0, "source_only: n_target != 0")
+        _req(e1_counts.get(cell, 0) == 1,
+             f"expected exactly ONE full-source geographic row (budget_type=source, label_budget=1.0, "
+             f"evaluation_split=test) for this cell, found {e1_counts.get(cell, 0)}")
 
-        # Realized target-pool size P from the source_only rows' evaluated-UNIT counts. The field is
-        # unit-appropriate: tabular counts evaluated SAMPLES via n_test (which equals the unit), dense
-        # counts evaluated PATCHES via the explicit n_eval_patches (n_test there is pixels, a different
-        # unit). So the derived P is always in the SAME unit as the supervision counts it is checked against.
-        eval_field = "n_eval_patches" if unit == _SA.LABEL_ACCESS_DENSE_UNIT else "n_test"
-        diag = by.get(diag_key)
-        so_eval = _field(so, eval_field, "source_only/target_test")
-        diag_eval = _field(diag, eval_field, "source_only/complete_target") if diag is not None else None
-        pool_p: int | None = None
-        if so_eval is not None and diag_eval is not None:
-            pool_p = diag_eval - so_eval
-            if pool_p < 0:
-                _req(False, f"realized target pool P = complete_target.{eval_field} {diag_eval} - "
-                            f"target_test.{eval_field} {so_eval} is negative")
-                pool_p = None  # a bogus P must not propagate into the absolute checks below
+        # ---- the fixed-budget allocation curve --------------------------------------------------
+        alloc = {b: r for (route, b, es), r in by.items()
+                 if route == _SA.ROUTE_FIXED_BUDGET_ALLOCATION and es == _SA.EVAL_TARGET_TEST}
+        budgets = set()
+        for f_pct, r in sorted(alloc.items(), key=lambda kv: str(kv[0])):
+            where = f"allocation@{f_pct}"
+            B = _field(r, "allocation_total_budget", where)
+            if B is None:
+                continue
+            budgets.add(B)
+            k = _SA.allocation_target_count(int(f_pct), B)
+            v = norm[(_SA.ROUTE_FIXED_BUDGET_ALLOCATION, f_pct, _SA.EVAL_TARGET_TEST)]
+            if v["n_target_labels"] is not None:
+                _req(v["n_target_labels"] == k,
+                     f"{where}: n_target {v['n_target_labels']} != round_half_up({f_pct}% x {B}) = {k}")
+            if v["n_source_labels"] is not None:
+                _req(v["n_source_labels"] == B - k,
+                     f"{where}: n_source {v['n_source_labels']} != B - k = {B - k}")
+            if v["n_total_labels"] is not None:
+                _req(v["n_total_labels"] == B,
+                     f"{where}: n_total {v['n_total_labels']} != realized budget {B}")
+        if len(budgets) > 1:
+            _req(False, f"allocation rows disagree on the realized budget: {sorted(budgets)}")
 
-        for k in _SA.LABEL_ACCESS_COUNTS:
-            spt = norm.get((_SA.ROUTE_SOURCE_PLUS_TARGET, k, _SA.EVAL_TARGET_TEST))
-            if spt is not None:  # additive: same source base, +k target, total B_src + k
-                _req_eq(spt["n_source_labels"], b_src, f"source_plus_target@{k}: n_source != source_only base {b_src}")
-                _req_eq(spt["n_target_labels"], k, f"source_plus_target@{k}: n_target != {k}")
-                if b_src is not None:
-                    _req_eq(spt["n_total_labels"], b_src + k, f"source_plus_target@{k}: n_total != B_src+{k}")
-            ftm = norm.get((_SA.ROUTE_FIXED_TOTAL_MIXED, k, _SA.EVAL_TARGET_TEST))
-            if ftm is not None:  # fixed-total invariance: k target replaces k source, total unchanged
-                _req_eq(ftm["n_target_labels"], k, f"fixed_total_mixed@{k}: n_target != {k}")
-                _req_eq(ftm["n_total_labels"], b_tot, f"fixed_total_mixed@{k}: n_total != source_only total {b_tot}")
-
-        ms = norm.get((_SA.ROUTE_MATCHED_SOURCE, 0, _SA.EVAL_TARGET_TEST))
-        mt = norm.get((_SA.ROUTE_MATCHED_TARGET, 0, _SA.EVAL_TARGET_TEST))
-        if ms is not None:
-            _req_eq(ms["n_target_labels"], 0, "matched_source: trains on target labels")
-        if mt is not None:
-            _req_eq(mt["n_source_labels"], 0, "matched_target: trains on source labels")
-        ms_tot = ms["n_total_labels"] if ms is not None else None
-        mt_tot = mt["n_total_labels"] if mt is not None else None
-        _req_eq(ms_tot, mt_tot, f"matched sizes differ: source {ms_tot} != target {mt_tot}")
-        if b_src is not None and pool_p is not None:  # each matched route trains on exactly min(B, P)
-            m = min(b_src, pool_p)
-            _req_eq(ms_tot, m, f"matched_source size {ms_tot} != min(B={b_src}, P={pool_p})={m}")
-            _req_eq(mt_tot, m, f"matched_target size {mt_tot} != min(B={b_src}, P={pool_p})={m}")
+        # ---- the additive appendix routes -------------------------------------------------------
+        pool_n = None
+        spt_full = by.get((_SA.ROUTE_SOURCE_PLUS_TARGET_FULL, 0, _SA.EVAL_TARGET_TEST))
+        if spt_full is not None:
+            pool_n = _field(spt_full, "n_source_pool", "source_plus_target_full")
+        for (route, b, es), v in norm.items():
+            if route != _SA.ROUTE_SOURCE_PLUS_TARGET or es != _SA.EVAL_TARGET_TEST:
+                continue
+            where = f"source_plus_target@{b}"
+            if v["n_target_labels"] is not None and isinstance(b, int):
+                _req(v["n_target_labels"] == b, f"{where}: n_target {v['n_target_labels']} != {b}")
+            n_src_pool = _field(by[(route, b, es)], "n_source_pool", where)
+            if v["n_source_labels"] is not None and n_src_pool is not None:
+                _req(v["n_source_labels"] == n_src_pool,
+                     f"{where}: additive routes train on the COMPLETE source pool "
+                     f"({n_src_pool}), got n_source {v['n_source_labels']}")
 
         tof = norm.get((_SA.ROUTE_TARGET_ONLY_FULL, 0, _SA.EVAL_TARGET_TEST))
-        if tof is not None:  # the WHOLE realized pool P, no source
-            _req_eq(tof["n_source_labels"], 0, "target_only_full: trains on source labels")
-            _req_eq(tof["n_target_labels"], pool_p, f"target_only_full: n_target != realized target pool P={pool_p}")
-        sptf = norm.get((_SA.ROUTE_SOURCE_PLUS_TARGET_FULL, 0, _SA.EVAL_TARGET_TEST))
-        if sptf is not None:  # all source + the WHOLE realized pool P
-            _req_eq(sptf["n_source_labels"], b_src, f"source_plus_target_full: n_source != source_only base {b_src}")
-            _req_eq(sptf["n_target_labels"], pool_p, f"source_plus_target_full: n_target != realized target pool P={pool_p}")
-
-        if diag is not None:  # the diagnostic scores the source_only fit; its supervision must agree
-            d = norm[diag_key]
-            _req_eq(d["n_source_labels"], b_src, f"source_only diagnostic n_source != source_only fit {b_src}")
-            _req_eq(d["n_target_labels"], 0, "source_only diagnostic n_target != 0")
-            _req_eq(d["n_total_labels"], b_tot, f"source_only diagnostic n_total != source_only fit {b_tot}")
+        if tof is not None and tof["n_source_labels"] is not None:
+            _req(tof["n_source_labels"] == 0,
+                 f"target_only_full: n_source {tof['n_source_labels']} != 0")
+        spf = norm.get((_SA.ROUTE_SOURCE_PLUS_TARGET_FULL, 0, _SA.EVAL_TARGET_TEST))
+        if spf is not None and spf["n_source_labels"] is not None and pool_n is not None:
+            _req(spf["n_source_labels"] == pool_n,
+                 f"source_plus_target_full: n_source {spf['n_source_labels']} != complete source pool {pool_n}")
 
     return problems
 

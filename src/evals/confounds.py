@@ -30,13 +30,13 @@ class _Anchor(NamedTuple):
 def _ood_anchors(ood_target_budget: float | int) -> tuple[_Anchor, ...]:
     """The geographic DEPLOYMENT score: source-trained, scored on the whole held-out region.
 
-    Schema-v2 emits it as the label-access ``source_only`` route on the COMPLETE target; the
+    Schema-v2 emits it as the ordinary full-source (E1) row scored on the COMPLETE target; the
     pre-label-access schema emitted it as the zero-budget row of the target sweep. The new shape is
     resolved first and the legacy shape is retained only so historical result trees still compute --
     it never defines a new run.
     """
     return (
-        _Anchor("label_access", 0, _SA.ROUTE_SOURCE_ONLY, (_SA.EVAL_COMPLETE_TARGET,)),
+        _Anchor("source", 1.0, "", (_SA.EVAL_COMPLETE_TARGET,)),
         _Anchor("target", ood_target_budget, "", ("full", "test", "held_out")),
     )
 
@@ -48,7 +48,7 @@ def _ood_matched_anchors(ood_target_budget: float | int) -> tuple[_Anchor, ...]:
     which is scored on the complete target region.
     """
     return (
-        _Anchor("label_access", 0, _SA.ROUTE_SOURCE_ONLY, (_SA.EVAL_TARGET_TEST,)),
+        _Anchor("source", 1.0, "", ("test",)),
         _Anchor("target", ood_target_budget, "", ("held_out", "test")),
     )
 
@@ -151,7 +151,7 @@ def compute_deltas(
                 actual = "held_out" if budget_type == "target" else "test"
             if actual != es:
                 return False
-        # label_access rows are route-qualified: source_only and target_only_full share a cell,
+        # label_access rows are route-qualified: allocation and target_only_full share a cell,
         # a budget of 0, and an evaluation split, so the route is what separates them.
         if route is not None and str(r.get("label_access_route", "")) != route:
             return False

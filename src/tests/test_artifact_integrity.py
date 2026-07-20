@@ -968,7 +968,8 @@ def test_dense_pair_consumes_official_zero_shot_end_to_end(monkeypatch, tmp_path
     assert ok, problems
 
 
-def _run_dense_geographic(monkeypatch, tmp_path, *, write_predictions=False, probe_cap=None):
+def _run_dense_geographic(monkeypatch, tmp_path, *, write_predictions=False, probe_cap=None,
+                          controlled_cap=None):
     from evals import split_artifacts as SA
     from evals import split_spec
     from evals.benchmarks import pastis as pastis_mod
@@ -980,7 +981,7 @@ def _run_dense_geographic(monkeypatch, tmp_path, *, write_predictions=False, pro
     rng = np.random.default_rng(0)
     # 64 patches per tile: when a tile is the LODO target its 80% pool (51 patches) clears the label-
     # access feasibility floor max(LABEL_ACCESS_COUNTS)=50, and the 3-tile source (~152 train patches)
-    # clears it too, so the full 13-route PATCH suite fires for every tile.
+    # clears it too, so the full PATCH-level route suite fires for every tile.
     patches, pid = [], 100
     for tile in tiles:
         la, lo = centers[tile]
@@ -1045,6 +1046,8 @@ def _run_dense_geographic(monkeypatch, tmp_path, *, write_predictions=False, pro
     monkeypatch.setattr(artifacts, "capture_environment", lambda repo=None: _env(sklearn="1.9.0"))
     if probe_cap is not None:
         monkeypatch.setattr(RS.perf, "PROBE_CAP", probe_cap)   # exercised through the real dense dispatch
+    if controlled_cap is not None:                             # the label-access TOTAL-budget cap
+        monkeypatch.setattr(RS, "CONTROLLED_TOTAL_BUDGET_CAP", controlled_cap)
 
     RS._run_segmentation_pair(
         "pastis", "raw", [0], 10_000, ["random_id", "geographic_ood"], ["probing"], ["logistic"],
@@ -1055,7 +1058,7 @@ def _run_dense_geographic(monkeypatch, tmp_path, *, write_predictions=False, pro
 
 def test_dense_pair_consumes_geographic_tile_lodo_few_shot_end_to_end(monkeypatch, tmp_path) -> None:
     """geographic_ood dense (has_target=True, supports_target_labels=True): tile-LODO, the pair runs the
-    PATCH-level 13-route label-access suite (replacing the legacy target sweep) alongside the zero-shot
+    PATCH-level label-access route suite (replacing the legacy target sweep) alongside the zero-shot
     source sweep, scoring every route on the frozen target_test patches, and completes -- which means the
     patch-level semantic validation inside write_run_complete passed."""
     from evals import split_artifacts as SA
@@ -1078,15 +1081,17 @@ def test_dense_pair_consumes_geographic_tile_lodo_few_shot_end_to_end(monkeypatc
         tla = [r for r in la if r["holdout"] == str(tile)]
         assert {(r["label_access_route"], r["label_budget"], r["evaluation_split"]) for r in tla} == set(
             SA.label_access_expected_rows()
-        )  # exactly the 13 routes on target_test + the source_only complete-target diagnostic
+        )  # exactly the canonical route x budget set, all on the frozen target_test
         tt = [r for r in tla if r["evaluation_split"] == SA.EVAL_TARGET_TEST]
-        diag = [r for r in tla if r["evaluation_split"] == SA.EVAL_COMPLETE_TARGET]
-        assert len(tt) == 13 and len(diag) == 1
+        assert len(tt) == len(SA.label_access_expected_rows())
+        # label access emits NO complete_target row -- the deployment estimand is the E1 source row.
+        assert not [r for r in tla if r["evaluation_split"] == SA.EVAL_COMPLETE_TARGET]
         # patch-level accounting: every route scored on the SAME frozen target_test patch count; the
-        # diagnostic on the whole region (pool + test), so its n_test is strictly larger.
+        # E1 deployment scope covers the whole region (pool + test), so its n_test is strictly larger.
         assert len({r["n_test"] for r in tt}) == 1
-        assert diag[0]["n_test"] > tt[0]["n_test"]
-        assert diag[0]["label_access_route"] == SA.ROUTE_SOURCE_ONLY
+        deploy = [r for r in geo_rows if r["holdout"] == str(tile) and r["budget_type"] == "source"
+                  and r["evaluation_split"] == SA.EVAL_COMPLETE_TARGET]
+        assert len(deploy) == 1 and deploy[0]["n_test"] > tt[0]["n_test"]
 
     ok, problems = artifacts.validate_run_complete(
         results_dir, expected_signature=runstate.run_manifest_digest(_STUB_MANIFEST)
@@ -1094,22 +1099,28 @@ def test_dense_pair_consumes_geographic_tile_lodo_few_shot_end_to_end(monkeypatc
     assert ok, problems
 
 
-def test_dense_geographic_dispatch_honors_probe_cap(monkeypatch, tmp_path) -> None:
-    """The PRODUCTION dense dispatch threads the effective PROBE_CAP as cap_patches: with a non-None cap
-    the label-access base pool is restricted to exactly that many WHOLE source patches, and the pair
-    still completes (the patch-level semantic validation passes at the capped base)."""
+def test_dense_geographic_dispatch_honors_the_controlled_budget_cap(monkeypatch, tmp_path) -> None:
+    """The PRODUCTION dense dispatch threads CONTROLLED_TOTAL_BUDGET_CAP into the label-access suite.
+
+    Under the fixed-budget contract the cap is applied to the BUDGET (``B_dC = min(B_d, C)``) and never
+    after route construction -- a post-hoc cap would shrink a mixed route's realized total and silently
+    break the fixed-budget claim. So every allocation point still totals exactly ``B_dC``, and the pair
+    still completes (the patch-level semantic validation passes at the capped budget)."""
     from evals import split_artifacts as SA
 
-    results_dir, _tiles = _run_dense_geographic(monkeypatch, tmp_path, probe_cap=60)
+    results_dir, _tiles = _run_dense_geographic(monkeypatch, tmp_path, controlled_cap=30)
     rows = IOU.read_jsonl(results_dir / "probe_results.jsonl")
     la = [r for r in rows if r["budget_type"] == "label_access"]
     assert la
-    assert {r["n_source_base"] for r in la} == {60}      # base restricted to the cap
-    assert {r["probe_cap"] for r in la} == {60} and {r["probe_capped"] for r in la} == {1}
-    # matched routes now train on min(B=60, P) patches -- the accounting stays consistent, so the run
-    # published (write_run_complete's patch-level validation did not reject it).
-    ms = [r for r in la if r["label_access_route"] == SA.ROUTE_MATCHED_SOURCE]
-    assert ms and all(r["n_source_base"] == 60 for r in ms)
+    assert {r["controlled_budget_cap"] for r in la} == {30}
+    assert {r["allocation_total_budget"] for r in la} == {30}      # B_dC = min(B_d, C) = C
+    assert all(r["benchmark_budget"] >= 30 for r in la)            # the frozen B_d is the uncapped one
+    # the fixed-budget allocation curve is drawn at the CAPPED budget: total pinned, composition moves.
+    alloc = [r for r in la if r["label_access_route"] == SA.ROUTE_FIXED_BUDGET_ALLOCATION]
+    assert {r["label_budget"] for r in alloc} == set(SA.ALLOCATION_PERCENTS)
+    for r in alloc:
+        k = SA.allocation_target_count(int(r["label_budget"]), 30)
+        assert (r["n_total_labels"], r["n_target_labels"], r["n_source_labels"]) == (30, k, 30 - k)
     ok, problems = artifacts.validate_run_complete(
         results_dir, expected_signature=runstate.run_manifest_digest(_STUB_MANIFEST)
     )
@@ -1135,9 +1146,9 @@ def test_dense_geographic_streams_predictions_with_identity(monkeypatch, tmp_pat
     assert sample["sample_id"] == f'{sample["patch_id"]}:{sample["tile_row"]}:{sample["tile_col"]}:{sample["pixel_index"]}'
     assert {p["label_budget_unit"] for p in preds} == {"patches"}
     assert {p["holdout"] for p in preds} == {str(t) for t in tiles}
-    # every canonical route appears in the streamed predictions, plus the source_only diagnostic
+    # every canonical route appears in the streamed predictions, all on the frozen target_test
     assert {p["label_access_route"] for p in preds} == set(SA.LABEL_ACCESS_ROUTES)
-    assert SA.EVAL_COMPLETE_TARGET in {p["evaluation_split"] for p in preds}
+    assert {p["evaluation_split"] for p in preds} == {SA.EVAL_TARGET_TEST}
 
 
 def test_dense_prediction_resume_is_transactional(monkeypatch, tmp_path) -> None:
@@ -1355,7 +1366,7 @@ def test_tabular_pair_consumes_official_zero_shot_end_to_end(monkeypatch, tmp_pa
     assert SA.assignments_path(tmp_path / "splits", "cropharvest", "official", 0, labels[0]).is_file()
 
 
-# --- the HEALTHY GEOGRAPHIC path: source zero-shot + the 13-route label-access suite --------------
+# --- the HEALTHY GEOGRAPHIC path: source zero-shot + the label-access route suite ----------------
 #
 # geographic_ood is has_target=True / supports_target_labels=True and is the label-access HEADLINE
 # regime: the source budgets evaluate zero-shot on target_test, AND the frozen label_access.csv drives
@@ -1423,7 +1434,7 @@ def test_tabular_pair_consumes_geographic_few_shot_end_to_end(monkeypatch, tmp_p
     from evals.benchmarks import cropharvest as ch
 
     # per=70: kenya's 80% target_label_pool (56) and the 3-region source_train (168) both clear the
-    # label-access feasibility floor (>= max(LABEL_ACCESS_COUNTS)=50), so the full 13-route suite fires.
+    # label-access feasibility floor (>= max(LABEL_ACCESS_COUNTS)=50), so the full route suite fires.
     bench = _ch_geo_bench(per=70)
     split = _publish_geographic_kenya_split(tmp_path / "splits", bench, seed=0)
 
@@ -1453,35 +1464,42 @@ def test_tabular_pair_consumes_geographic_few_shot_end_to_end(monkeypatch, tmp_p
     assert {r["split_regime"] for r in rows} == {"geographic_ood", "random_id"}
     geo_rows = [r for r in rows if r["split_regime"] == "geographic_ood"]
     assert {r["holdout"] for r in geo_rows} == {"kenya"}
-    # geographic_ood headline runs the 13-route LABEL-ACCESS suite (which REPLACES the old target-budget
+    # geographic_ood headline runs the canonical LABEL-ACCESS suite (which REPLACES the old target-budget
     # sweep -- no legacy budget_type="target" rows) alongside the unchanged source-budget sweep.
     assert {r["budget_type"] for r in geo_rows} == {"source", "label_access"}
     assert not [r for r in rows if r["budget_type"] == "target"]
 
     la = [r for r in geo_rows if r["budget_type"] == "label_access"]
     tt = [r for r in la if r["evaluation_split"] == SA.EVAL_TARGET_TEST]
-    diag = [r for r in la if r["evaluation_split"] == SA.EVAL_COMPLETE_TARGET]
-    # 13 route fits scored on target_test + exactly ONE source_only complete-target diagnostic.
-    assert len(tt) == 13 and len(diag) == 1
+    # the whole suite is scored on target_test; label access emits NO complete_target row.
+    assert len(tt) == len(la) == len(SA.label_access_expected_rows())
+    assert not [r for r in la if r["evaluation_split"] == SA.EVAL_COMPLETE_TARGET]
     assert {(r["label_access_route"], r["label_budget"], r["evaluation_split"]) for r in la} == set(
         SA.label_access_expected_rows()
     )
-    # target-test INVARIANCE: every one of the 13 routes is scored on the SAME frozen target_test.
+    # target-test INVARIANCE: every route is scored on the SAME frozen target_test.
     assert {r["n_test"] for r in tt} == {len(split.target_test)}
-    # the diagnostic reuses the source_only fit and is scored on the WHOLE target region (pool + test).
-    assert diag[0]["label_access_route"] == SA.ROUTE_SOURCE_ONLY
-    assert diag[0]["n_test"] == len(split.target_label_pool) + len(split.target_test)
+    # the deployment estimand rides on the ordinary full-source (E1) fit, scored on the WHOLE region.
+    deploy = [r for r in geo_rows if r["budget_type"] == "source"
+              and r["evaluation_split"] == SA.EVAL_COMPLETE_TARGET]
+    assert len(deploy) == 1
+    assert deploy[0]["n_test"] == len(split.target_label_pool) + len(split.target_test)
+    assert deploy[0]["label_budget"] == 1.0 and deploy[0]["label_access_route"] == ""
 
-    # label accounting per route: source_only uses all S source labels + 0 target; source_plus_target(k)
-    # totals S+k; fixed_total_mixed(k) holds the TOTAL fixed at S (drops k source, adds k target).
+    # label accounting per route: the allocation curve pins the TOTAL at the realized budget B and only
+    # moves its composition; the additive routes hold the COMPLETE source pool and add k on top.
     S = len(split.source_train)
     by = {(r["label_access_route"], r["label_budget"]): r for r in tt}
-    assert by[(SA.ROUTE_SOURCE_ONLY, 0)]["n_source_labels"] == S
-    assert by[(SA.ROUTE_SOURCE_ONLY, 0)]["n_target_labels"] == 0
+    B = by[(SA.ROUTE_FIXED_BUDGET_ALLOCATION, 0)]["allocation_total_budget"]
+    for f in SA.ALLOCATION_PERCENTS:
+        k = SA.allocation_target_count(f, B)
+        row = by[(SA.ROUTE_FIXED_BUDGET_ALLOCATION, f)]
+        assert row["n_total_labels"] == B
+        assert row["n_target_labels"] == k and row["n_source_labels"] == B - k
     for k in SA.LABEL_ACCESS_COUNTS:
         assert by[(SA.ROUTE_SOURCE_PLUS_TARGET, k)]["n_total_labels"] == S + k
-        assert by[(SA.ROUTE_FIXED_TOTAL_MIXED, k)]["n_total_labels"] == S
-        assert by[(SA.ROUTE_FIXED_TOTAL_MIXED, k)]["n_target_labels"] == k
+        assert by[(SA.ROUTE_SOURCE_PLUS_TARGET, k)]["n_source_labels"] == S
+        assert by[(SA.ROUTE_SOURCE_PLUS_TARGET, k)]["n_target_labels"] == k
     # target_only_full trains on the pool alone (no source); source_plus_target_full uses S + whole pool.
     assert by[(SA.ROUTE_TARGET_ONLY_FULL, 0)]["n_source_labels"] == 0
     assert by[(SA.ROUTE_TARGET_ONLY_FULL, 0)]["n_target_labels"] == len(split.target_label_pool)

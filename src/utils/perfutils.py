@@ -318,7 +318,7 @@ def _record_cell_failure(
 
     ``extra`` carries route-specific fields for a label-access failure (label_access_route,
     evaluation_split, the three label counts, label_budget_unit) so two same-budget routes that fail --
-    e.g. additive source_plus_target(25) vs fixed_total_mixed(25) -- stay fully distinguishable in the
+    e.g. additive source_plus_target(25) vs allocation@25% -- stay fully distinguishable in the
     failure log and the run-completion summary, instead of collapsing to one ``method/holdout@25`` line."""
     rec = {
         "seed": meta.get("seed"),
@@ -376,7 +376,11 @@ def _sweep_budgets(
     meta = dict(meta or {})
     eval_sets = {name: (x, y, sample_ids, groups) for name, (x, y, sample_ids, groups) in (extra_evals or {}).items() if len(y)}
     for budget in budgets:
-        sub_seed = _budget_seed(seed, budget)
+        # The full-source fit (E1) uses the RUN SEED directly. Deriving a budget-keyed seed made sense
+        # when the source sweep had several fractional budgets; with only 1.0 it selects the same rows
+        # anyway and merely de-synchronises E1's probe init from the paired label-access routes, which
+        # all initialise on `seed`. Fractional budgets keep the derived seed.
+        sub_seed = seed if float(budget) >= 1.0 else _budget_seed(seed, budget)
         fit_budget = float(budget)
         identity = {
             "seed": seed,
@@ -753,10 +757,14 @@ def _sweep_label_access_routes(
     seed: int,
     fit_score: Any,
     *,
-    counts: tuple[int, ...],
-    matched_source_order: np.ndarray,
-    fixed_removal_order: np.ndarray,
+    source_order: np.ndarray,
     target_order: np.ndarray,
+    budget: int,
+    percents: tuple[int, ...] = (0, 25, 50, 75, 100),
+    counts: tuple[int, ...] = (5, 10, 25, 50),
+    controlled_cap: int | None = None,
+    full_target_reference: bool = True,
+    full_combined_reference: bool = True,
     meta: dict[str, Any] | None = None,
     groups_source: np.ndarray | None = None,
     groups_pool: np.ndarray | None = None,
@@ -769,77 +777,79 @@ def _sweep_label_access_routes(
     sample_ids_test: np.ndarray | None = None,
     sample_ids_full: np.ndarray | None = None,
 ) -> None:
-    """The geographic label-access suite: 13 distinct fits per fully-eligible cell, each scored on the
-    SAME frozen ``target_test`` (``x_test``/``y_test``). ``target_test`` NEVER enters any training set.
+    """The geographic label-access suite, scored on the SAME frozen ``target_test`` (``x_test``/
+    ``y_test``), which NEVER enters any training set.
 
-    The three frozen orders are POSITIONS: ``matched_source_order``/``fixed_removal_order`` permute the
-    source pool (``0..S-1``), ``target_order`` permutes the target label pool (``0..P-1``). They come
-    from the frozen ``label_access.csv`` -- this sweep regenerates no ordering. Counts come from the ONE
-    canonical set (``LABEL_ACCESS_COUNTS``, passed in); nothing is re-literaled.
+    HEADLINE -- the fixed-budget allocation curve. Total supervision is pinned at the realized budget
+    ``B_dC = min(B_d, C)`` (``B_d`` frozen at split generation, ``C`` the optional controlled cap) and
+    only its composition moves: at fraction ``f`` the fit trains on ``source_order[:B_dC - k]`` plus
+    ``target_order[:k]`` with ``k = round_half_up(f * B_dC)``. Both orders are PREFIXES of the single
+    frozen draw, so the five points are strictly NESTED -- f=0 and f=1 are the endpoints of one curve,
+    not separate matched routes.
 
-    ``source_only`` is fit ONCE and is the additive-``k=0`` and fixed-total baseline (Stage-5 contrasts
-    subtract it) -- no duplicate fit, no aliased row. Calibration routing: frozen ``source_val`` for
-    source_only / source_plus_target / source_plus_target_full / fixed_total_mixed; the existing
-    source-free route-internal procedure (``tune_internal``) for target_only_full / matched_source /
-    matched_target, applied INDEPENDENTLY to each route's own training set (never ``source_val``, never
-    ``target_test``). The run ``seed`` is the probe seed for every route -- no derived seeds.
+    The cap is applied to the BUDGET, never after route construction: a generic post-hoc cap would
+    shrink a mixed route's realized total and silently break the fixed-budget claim, and would land
+    differently on logistic than on MLP. Applying it here makes ``B_dC`` identical for both families.
+
+    APPENDIX -- the additive routes hold the COMPLETE source pool fixed and add ``k`` target units on
+    top. Their baseline is the complete source-trained probe (E1), so they keep the frozen source
+    validation set; the allocation points all use the source-free route-internal procedure, because
+    f=1.0 is target-only and must not inherit source validation while its siblings do.
+
+    There is no ``source_only`` route: the ordinary full-source geographic row (E1) is that fit, and it
+    also carries the complete-target deployment score. The run ``seed`` initialises every probe.
     """
     from evals import split_artifacts as _SA  # lazy: canonical route names, no import cycle
 
     meta = dict(meta or {})
+    percents = tuple(int(f) for f in percents)
     counts = tuple(int(c) for c in counts)
     S, P = len(y_source), len(y_pool)
-    mx = max(counts) if counts else 0
 
-    # Validate the three frozen orders BEFORE constructing any route or fitting anything.
-    matched_source_order = _validate_order(matched_source_order, S, "matched_source_order")
-    fixed_removal_order = _validate_order(fixed_removal_order, S, "fixed_removal_order")
+    source_order = _validate_order(source_order, S, "source_order")
     target_order = _validate_order(target_order, P, "target_order")
 
-    # PROBE_CAP preserves the experiment: select ONE deterministic, encoder-independent, class/group-
-    # balanced source BASE POOL of size B ONCE for the cell (seed keyed on cell identity, NOT the model
-    # and NOT the route), then restrict BOTH frozen source orders to that base while preserving their
-    # order. Every source-containing route is built from this shared base -- there is NO further
-    # per-route cap. Uncapped, B == S and the base is the whole source pool.
-    cap = PROBE_CAP
-    cap_active = cap is not None and family in _CAP_FAMILIES and int(cap) < S
-    if cap_active:
-        base_all = _cap_stratified_indices(
-            y_source, groups_source, int(cap), _cap_seed(seed, "label_access", "base", meta),
-        )
-        matched_source_order = matched_source_order[np.isin(matched_source_order, base_all)]
-        fixed_removal_order = fixed_removal_order[np.isin(fixed_removal_order, base_all)]
-    else:
-        base_all = np.arange(S, dtype=np.int64)
-    B = int(len(base_all))
-    if P < mx or B < mx:  # NEVER clamp; require B >= max(counts) (a cap below it cannot support the suite)
+    b_d = int(budget)
+    realized = min(b_d, int(controlled_cap)) if controlled_cap is not None else b_d
+    if realized < 1:
+        raise ValueError(f"label-access sweep infeasible: realized budget {realized} (B_d={b_d}, cap={controlled_cap})")
+    if realized > S or realized > P:
         raise ValueError(
-            f"label-access sweep infeasible: source base B={B}, target pool P={P}, max count={mx} (cap={cap})"
+            f"label-access sweep infeasible: realized budget {realized} exceeds source pool S={S} "
+            f"or target pool P={P} (B_d={b_d}, cap={controlled_cap})"
         )
-    m = min(B, P)
+    mx = max(counts) if counts else 0
+    if mx > P:
+        raise ValueError(f"label-access sweep infeasible: max additive count {mx} > target pool P={P}")
+
     _empty = np.empty(0, dtype=np.int64)
     groups_test_arr = np.asarray(groups_test) if groups_test is not None else None
-    cap_meta = {"probe_cap": int(cap) if cap is not None else 0, "probe_capped": int(cap_active),
-                "n_source_precap": int(S), "n_source_base": B}
+    budget_meta = {
+        "allocation_total_budget": int(realized),
+        "controlled_budget_cap": int(controlled_cap) if controlled_cap is not None else 0,
+        "benchmark_budget": int(b_d),
+        "n_source_pool": int(S),
+        "n_target_pool": int(P),
+    }
 
-    # (route, label_budget, source positions, target-pool positions, tune_internal). All source
-    # positions come from the shared base pool: source_only / source_plus_target(_full) use ALL B;
-    # matched-source takes the base-restricted prefix of matched_source_order; fixed-total removal drops
-    # the base-restricted prefix of fixed_removal_order and keeps the rest.
-    route_specs: list[tuple[str, int, np.ndarray, np.ndarray, bool]] = [
-        (_SA.ROUTE_SOURCE_ONLY, 0, base_all, _empty, False),
-        *[(_SA.ROUTE_SOURCE_PLUS_TARGET, k, base_all, target_order[:k], False) for k in counts],
-        (_SA.ROUTE_TARGET_ONLY_FULL, 0, _empty, target_order, True),
-        (_SA.ROUTE_SOURCE_PLUS_TARGET_FULL, 0, base_all, target_order, False),
-        (_SA.ROUTE_MATCHED_SOURCE, 0, matched_source_order[:m], _empty, True),
-        (_SA.ROUTE_MATCHED_TARGET, 0, _empty, target_order[:m], True),
-        *[(_SA.ROUTE_FIXED_TOTAL_MIXED, k, fixed_removal_order[k:], target_order[:k], False) for k in counts],
+    # (route, label_budget, source positions, target-pool positions, tune_internal)
+    route_specs: list[tuple[str, int, np.ndarray, np.ndarray, bool]] = []
+    for f in percents:
+        k = _SA.allocation_target_count(f, realized)
+        route_specs.append(
+            (_SA.ROUTE_FIXED_BUDGET_ALLOCATION, int(f), source_order[: realized - k], target_order[:k], True)
+        )
+    route_specs += [
+        (_SA.ROUTE_SOURCE_PLUS_TARGET, int(k), source_order, target_order[:k], False) for k in counts
     ]
+    if full_target_reference:
+        route_specs.append((_SA.ROUTE_TARGET_ONLY_FULL, 0, _empty, target_order, True))
+    if full_combined_reference:
+        route_specs.append((_SA.ROUTE_SOURCE_PLUS_TARGET_FULL, 0, source_order, target_order, False))
 
-    for route, budget, src_pos, tgt_pos, tune_internal in route_specs:
-        sx, sy = x_source[src_pos], y_source[src_pos]  # src_pos already restricted to the shared base
+    for route, budget_id, src_pos, tgt_pos, tune_internal in route_specs:
+        sx, sy = x_source[src_pos], y_source[src_pos]
         tx, ty = x_pool[tgt_pos], y_pool[tgt_pos]
-        # No further per-route cap: the base pool selected above is the single, shared cap for the cell.
         if len(sy) and len(ty):
             x_fit, y_fit = np.concatenate([sx, tx]), np.concatenate([sy, ty])
         elif len(ty):
@@ -850,7 +860,7 @@ def _sweep_label_access_routes(
 
         cal_x, cal_y = ((x_val, y_val) if (not tune_internal and x_val is not None and len(x_val)) else (None, None))
         identity = {"seed": seed, "holdout": meta.get("holdout"), "method": meta.get("method"),
-                    "budget_type": "label_access", "label_access_route": route, "label_budget": budget,
+                    "budget_type": "label_access", "label_access_route": route, "label_budget": budget_id,
                     "evaluation_split": _SA.EVAL_TARGET_TEST}
         set_identity(identity)
         try:
@@ -860,63 +870,37 @@ def _sweep_label_access_routes(
         except ValueError as exc:
             set_identity(None)
             # Record the FULL route identity + supervision counts (the fit never produced a row), so an
-            # additive vs fixed-total failure at the same budget k stays distinguishable in the log.
+            # allocation vs additive failure at the same numeric budget stays distinguishable in the log.
             _record_cell_failure(
                 {**meta, "label_access_route": route, "evaluation_split": _SA.EVAL_TARGET_TEST},
-                budget, "label_access", exc,
+                budget_id, "label_access", exc,
                 extra={"n_source_labels": n_source_labels, "n_target_labels": n_target_labels,
-                       "n_total_labels": int(len(y_fit)), "label_budget_unit": label_budget_unit},
+                       "n_total_labels": int(len(y_fit)), "label_budget_unit": label_budget_unit,
+                       **budget_meta},
             )
             continue
         scores, extra = result[0], result[1]
         per_sample = result[2] if len(result) >= 3 else None
-        score_fitted = result[3] if len(result) >= 4 else None
         set_identity(None)
         scores = {**scores, **regime_base._worst_group_scores(per_sample, groups_test_arr)}
         # The route's supervision counts + unit. Carried IDENTICALLY on the result row AND every
-        # prediction row so a per-sample reader can attribute each prediction to its route's label access
-        # without re-joining to summary.csv.
+        # prediction row so a per-sample reader can attribute each prediction to its route's label
+        # access without re-joining to summary.csv.
         supervision = {"n_source_labels": n_source_labels, "n_target_labels": n_target_labels,
                        "n_total_labels": int(len(y_fit)), "label_budget_unit": label_budget_unit}
         pred_meta = {**meta, "label_access_route": route, **supervision}
         rows.append({
-            **meta, "budget_type": "label_access", "label_access_route": route, "label_budget": budget,
+            **meta, "budget_type": "label_access", "label_access_route": route, "label_budget": budget_id,
             "evaluation_split": _SA.EVAL_TARGET_TEST, "seed": seed, "n_train_sub": int(len(y_fit)),
-            "n_test": int(len(y_test)), **supervision,
-            **dict(ERM_TUNING_METADATA), **cap_meta, **extra, **scores,
+            "n_test": int(len(y_test)), **supervision, **budget_meta,
+            **dict(ERM_TUNING_METADATA), **extra, **scores,
         })
         regime_base._append_prediction_rows(
             predictions, meta=pred_meta, seed=seed, budget_type="label_access",
-            label_budget=budget, n_train_sub=len(y_fit),
+            label_budget=budget_id, n_train_sub=len(y_fit),
             sample_ids=np.asarray(sample_ids_test if sample_ids_test is not None else np.arange(len(y_test))),
             groups_test=groups_test_arr, per_sample=per_sample, evaluation_split=_SA.EVAL_TARGET_TEST,
         )
-
-        # source_only complete-target diagnostic: reuse the SAME fitted scorer (NO refit) to score the
-        # complete target region (pool ++ test) -- the deployment estimand. One extra row, flagged with
-        # evaluation_split=complete_target so Stage-5 paired contrasts exclude it. Not a 14th fit.
-        if route == _SA.ROUTE_SOURCE_ONLY and score_fitted is not None:
-            x_full = np.concatenate([x_pool, x_test])
-            y_full = np.concatenate([y_pool, y_test])
-            g_full = (np.concatenate([np.asarray(groups_pool), groups_test_arr])
-                      if (groups_pool is not None and groups_test_arr is not None) else None)
-            scores_d, per_sample_d = score_fitted(x_full, y_full)
-            scores_d = {**scores_d, **regime_base._worst_group_scores(per_sample_d, g_full)}
-            rows.append({
-                **meta, "budget_type": "label_access", "label_access_route": route, "label_budget": budget,
-                "evaluation_split": _SA.EVAL_COMPLETE_TARGET, "seed": seed, "n_train_sub": int(len(y_fit)),
-                "n_test": int(len(y_full)), **supervision,
-                **dict(ERM_TUNING_METADATA), **cap_meta, **extra, **scores_d,
-            })
-            # The diagnostic predictions carry the SAME source-only supervision metadata (pred_meta), since
-            # source_only trains on B source labels + 0 target -- so a reader sees the diagnostic scored a
-            # source-only fit, not a distinct route.
-            regime_base._append_prediction_rows(
-                predictions, meta=pred_meta, seed=seed, budget_type="label_access",
-                label_budget=budget, n_train_sub=len(y_fit),
-                sample_ids=np.asarray(sample_ids_full if sample_ids_full is not None else np.arange(len(y_full))),
-                groups_test=g_full, per_sample=per_sample_d, evaluation_split=_SA.EVAL_COMPLETE_TARGET,
-            )
 
 
 def _cpu_capacity() -> int:

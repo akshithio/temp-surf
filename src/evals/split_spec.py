@@ -109,6 +109,10 @@ class BenchmarkSpec:
     source_only_units: tuple[str, ...] = ()
     #: supplementary one-class targets (source-only stress; excluded from headline mean/worst)
     supplementary_targets: tuple[str, ...] = ()
+    #: ``B_max,d`` -- optional frozen CEILING on the benchmark-common fixed-budget allocation budget.
+    #: ``B_d = min(B_max,d, min-cell N_source, min-cell N_target)`` over eligible cells; None leaves the
+    #: budget determined purely by the realized pools (unbounded ceiling).
+    max_label_budget: int | None = None
     #: Territorial exclusion. When True, geographic_ood additionally drops every source item lying
     #: INSIDE the target's realized footprint (convex hull of the target's own coordinates, expanded
     #: by ``purge_km``), not merely within ``purge_km`` of a labelled target sample.

@@ -439,13 +439,15 @@ def _load_generator():
 def _gen_tabular(gen, root, bench, bench_mod, regime, seed):
     """Drive the generator for one tabular (regime, seed) AND write the central log (the log is a
     single file the runtime discovers leaves from; main() writes it once after all benchmarks)."""
-    entries = gen.generate_tabular(root, bench, bench_mod, regime, seed, audit_only=False)
+    entries, _cands = gen.generate_tabular(root, bench, bench_mod, regime, seed, audit_only=False)
     SA.write_splits_log(SA.default_log_path(root), provenance=gen.build_provenance(), entries=entries)
     return entries
 
 
 def _gen_dense(gen, root, bench, bench_mod, regime, seed):
-    entries = gen.generate_dense(root, bench, bench_mod, regime, seed, audit_only=False, dense_cache=gen._dense_cache(bench))
+    entries, _cands = gen.generate_dense(
+        root, bench, bench_mod, regime, seed, audit_only=False, dense_cache=gen._dense_cache(bench)
+    )
     SA.write_splits_log(SA.default_log_path(root), provenance=gen.build_provenance(), entries=entries)
     return entries
 
@@ -462,17 +464,72 @@ def test_generator_rejects_a_missing_holdout(tmp_path):
         gen.generate_tabular(tmp_path / "splits", bench, ch, "geographic_ood", 0, audit_only=True)
 
 
-def test_label_access_failure_leaves_no_partial_leaf(tmp_path):
-    """A label-access failure (here an infeasible headline target -- pool < max count) aborts the leaf
-    BEFORE writing assignments.csv, so the failed canonical leaf is never partially published."""
+def _la_candidate(holdout, seed, n_source, n_pool, n_test=8, classes=("0", "1")):
+    """A label-access candidate as generate_tabular collects one, with balanced two-class pools."""
+    src = [f"{holdout}_s{i}" for i in range(n_source)]
+    pool = [f"{holdout}_p{i}" for i in range(n_pool)]
+    test = [f"{holdout}_t{i}" for i in range(n_test)]
+    class_of = {sid: frozenset({classes[i % len(classes)]}) for i, sid in enumerate(src)}
+    class_of.update({sid: frozenset({classes[i % len(classes)]}) for i, sid in enumerate(pool)})
+    return {
+        "seed": seed, "holdout": holdout, "source_ids": src, "pool_ids": pool, "test_ids": test,
+        "n_source": n_source, "n_target_pool": n_pool, "class_of": class_of,
+        "summary": {"holdout": holdout, "seed": seed},
+    }
+
+
+def test_undersized_headline_target_is_demoted_not_fatal(tmp_path):
+    """An undersized headline target is DEMOTED to supplementary stress, not fatal.
+
+    B_d is a benchmark-common minimum, so one small region must neither abort generation nor drag every
+    other region's budget down: it is excluded from the eligible set (with recorded reasons) and gets no
+    frozen order, while B_d is computed over the SURVIVING cells only."""
     gen = _load_generator()
-    bench = _ch_bench({"kenya": 130, "togo": 130, "lem-brazil": 20})  # lem-brazil target pool 16 < 50
     root = tmp_path / "splits"
-    with pytest.raises(SA.SplitArtifactError, match="target label pool"):
-        gen.generate_tabular(root, bench, ch, "geographic_ood", 0, audit_only=False)
-    leaf = SA.leaf_dir(root, "cropharvest", "geographic_ood", 0, "lem-brazil")
-    assert not (leaf / "assignments.csv").exists()
-    assert not (leaf / "label_access.csv").exists()
+    cands = [
+        _la_candidate("kenya", 0, 200, 120),
+        _la_candidate("togo", 0, 200, 140),
+        _la_candidate("sudan", 0, 200, 160),
+        _la_candidate("lem-brazil", 0, 200, 16),   # pool 16 < max additive count 50 -> ineligible
+    ]
+    gen._finalize_label_access(root, "cropharvest", cands, audit_only=False)
+    by = {c["holdout"]: c["summary"]["label_access"] for c in cands}
+
+    assert by["lem-brazil"]["excluded"] is True and by["lem-brazil"]["headline_eligible"] is False
+    assert any("target_label_pool" in r for r in by["lem-brazil"]["exclusion_reasons"])
+    assert not (SA.leaf_dir(root, "cropharvest", "geographic_ood", 0, "lem-brazil") / "label_access.csv").exists()
+
+    # B_d ignores the demoted cell entirely: min over SURVIVORS is pool=120 (kenya), not 16.
+    assert by["kenya"]["benchmark_budget"] == 120
+    assert by["kenya"]["headline_eligible"] is True
+    assert by["kenya"]["headline_targets"] == ["kenya", "sudan", "togo"]
+    assert (SA.leaf_dir(root, "cropharvest", "geographic_ood", 0, "kenya") / "label_access.csv").exists()
+
+
+def test_fewer_than_three_targets_loses_headline_status(tmp_path):
+    """A benchmark left with <3 eligible targets still freezes its orders but is flagged out of the
+    headline allocation aggregate -- a region bootstrap over two regions has no usable uncertainty."""
+    gen = _load_generator()
+    root = tmp_path / "splits"
+    cands = [_la_candidate("kenya", 0, 200, 120), _la_candidate("togo", 0, 200, 140)]
+    gen._finalize_label_access(root, "cropharvest", cands, audit_only=False)
+    for c in cands:
+        assert c["summary"]["label_access"]["headline_eligible"] is False
+    assert (SA.leaf_dir(root, "cropharvest", "geographic_ood", 0, "kenya") / "label_access.csv").exists()
+
+
+def test_allocation_fractions_are_recorded_and_sum_to_the_budget(tmp_path):
+    """The recorded fractions ARE the contract the runtime must reproduce: half-up target counts whose
+    source complement always restores exactly B_d."""
+    gen = _load_generator()
+    cands = [_la_candidate(h, 0, 200, 150) for h in ("kenya", "togo", "sudan")]
+    gen._finalize_label_access(tmp_path / "splits", "cropharvest", cands, audit_only=True)
+    la = cands[0]["summary"]["label_access"]
+    b = la["benchmark_budget"]
+    assert [f["percent"] for f in la["allocation_fractions"]] == [0, 25, 50, 75, 100]
+    for f in la["allocation_fractions"]:
+        assert f["n_source_labels"] + f["n_target_labels"] == b == f["n_total_labels"]
+        assert f["n_target_labels"] == int((f["percent"] / 100.0) * b + 0.5)
 
 
 def test_generator_rejects_a_duplicate_holdout(tmp_path, monkeypatch):

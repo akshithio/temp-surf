@@ -1,12 +1,17 @@
 """Stage 4 -- the dense (PASTIS) geographic label-access suite, at PATCH granularity.
 
-The 13-route contract is the same as tabular, but every selection/removal is over WHOLE patches and the
-unit is ``patches``. These tests pin the patch-level runtime with recording fakes for the fit + score
-(so the assertions are exact and encoder-free) AND drive the real capped cacheutils loader for the
-patch-first / paired-pixel guarantees: patch atomicity, frozen-order mapping, target_test non-leakage,
-calibration routing, the shared base-pool cap, run-seed probe init, deterministic paired pixel sampling,
-streamed predictions, resume/completeness identity, the dense loader round-trip, and the manifest unit +
-prediction-honesty contract. Patch ids live in feature 0."""
+The route contract is the same as tabular, but every selection is over WHOLE patches and the unit is
+``patches``: the fixed-budget ALLOCATION curve (``source_order[:B-k] + target_order[:k]`` with
+``k = round_half_up(f% * B)`` and ``B = min(B_d, controlled_cap)``), the additive appendix routes (the
+COMPLETE source pool plus ``target_order[:k]``), and the two full references. There is no ``source_only``
+route and no ``complete_target`` evaluation -- both retired.
+
+These tests pin the patch-level runtime with recording fakes for the fit + score (so the assertions are
+exact and encoder-free) AND drive the real capped cacheutils loader for the patch-first / paired-pixel
+guarantees: patch atomicity, strictly nested prefixes, half-up allocation in patch units, target_test
+non-leakage, calibration routing, the controlled budget cap, run-seed probe init, deterministic paired
+pixel sampling, streamed predictions, resume/completeness identity, the dense loader round-trip, and the
+manifest unit + prediction-honesty contract. Patch ids live in feature 0."""
 
 from __future__ import annotations
 
@@ -17,16 +22,21 @@ from evals import split_artifacts as SA
 from evals.benchmarks import pastis
 from utils import artifacts, cacheutils, runstate
 
-COUNTS = (5, 10, 25, 50)
-ROUTE_ORDER = [
-    SA.ROUTE_SOURCE_ONLY, *[SA.ROUTE_SOURCE_PLUS_TARGET] * 4, SA.ROUTE_TARGET_ONLY_FULL,
-    SA.ROUTE_SOURCE_PLUS_TARGET_FULL, SA.ROUTE_MATCHED_SOURCE, SA.ROUTE_MATCHED_TARGET,
-    *[SA.ROUTE_FIXED_TOTAL_MIXED] * 4,
-]
-INTERNAL_CALLS = {5, 7, 8}   # target_only_full, matched_source, matched_target tune internally
+PERCENTS = SA.ALLOCATION_PERCENTS          # (0, 25, 50, 75, 100)
+COUNTS = SA.LABEL_ACCESS_COUNTS            # (5, 10, 25, 50)
+#: B_d in PATCH units. 50 is chosen so 25% and 75% land exactly on .5 (12.5 / 37.5) -- the only way to
+#: tell half-up rounding apart from Python's banker's rounding.
+BUDGET = 50
+#: Emission order of route_specs: the five allocation points, the four additive points, then the two
+#: full references. The allocation points and target_only_full tune internally (no source calibration).
+INTERNAL_CALLS = {0, 1, 2, 3, 4, 9}
 SRC_PX, TGT_PX = 4, 3        # per-patch pixel counts (source vs target) -- used for atomicity
 POOL_BASE, TEST_BASE = 1000, 2000
 RUN_SEED = 7
+
+
+def _k(f, budget=BUDGET):
+    return SA.allocation_target_count(f, budget)
 
 
 def _block(patch_id, n_px, rng, n_features=4):
@@ -68,8 +78,7 @@ def _make_dense(S=60, P=55, T=8):
     return {
         "source_patches": frozenset(source_ids), "pool_patches": frozenset(pool_ids),
         "test_patches": frozenset(test_ids),
-        "matched": order_rng.permutation(source_ids).astype(np.int64),
-        "fixed": order_rng.permutation(source_ids).astype(np.int64),
+        "source": order_rng.permutation(source_ids).astype(np.int64),
         "target": order_rng.permutation(pool_ids).astype(np.int64),
         "x_val": store[0][0], "y_val": store[0][1],
         "load_pixels": load_pixels, "stream_eval": stream_eval,
@@ -120,8 +129,9 @@ class _RecScore:
         return {"miou": 0.5, "n_test": n_px}
 
 
-def _run(monkeypatch, *, cap_patches=None, counts=COUNTS, meta_extra=None, predictions_sink=None):
-    data = _make_dense()
+def _run(monkeypatch, *, budget=BUDGET, controlled_cap=None, percents=PERCENTS, counts=COUNTS,
+         meta_extra=None, predictions_sink=None, data=None):
+    data = data or _make_dense()
     fit, score = _RecFit(), _RecScore()
     monkeypatch.setattr(pastis, "fit_probe_multiclass", fit)
     monkeypatch.setattr(pastis, "score_segmentation_streamed", score)
@@ -132,11 +142,12 @@ def _run(monkeypatch, *, cap_patches=None, counts=COUNTS, meta_extra=None, predi
     pastis.run_probes_segmentation_label_access(
         rows, RUN_SEED,
         source_patches=data["source_patches"], pool_patches=data["pool_patches"],
-        target_test_patches=data["test_patches"], matched_source_order=data["matched"],
-        fixed_removal_order=data["fixed"], target_order=data["target"], counts=counts,
+        target_test_patches=data["test_patches"], source_order=data["source"],
+        target_order=data["target"], budget=budget, percents=percents, counts=counts,
+        controlled_cap=controlled_cap,
         load_pixels=data["load_pixels"], stream_eval=data["stream_eval"],
         x_val=data["x_val"], y_val=data["y_val"], meta=meta, family="logistic",
-        cap_patches=cap_patches, predictions_sink=predictions_sink,
+        label_budget_unit=SA.LABEL_ACCESS_DENSE_UNIT, predictions_sink=predictions_sink,
     )
     return rows, fit, score, data
 
@@ -149,19 +160,35 @@ def _tgt(call):
     return {p for p in call["patch_px"] if p >= POOL_BASE}
 
 
+def _e1(**over):
+    """The ordinary full-source geographic (E1) row the label-access cell reuses instead of refitting a
+    source_only probe. The semantic validator requires exactly one per cell."""
+    return {"model": "raw", "benchmark": "pastis", "method": "erm", "probe_family": "logistic",
+            "split_regime": SA.LABEL_ACCESS_REGIME, "holdout": "T1", "seed": RUN_SEED,
+            "budget_type": "source", "label_budget": 1.0, "evaluation_split": "test", **over}
+
+
 # --------------------------------------------------------------------------- #
 # structure + patch atomicity
 # --------------------------------------------------------------------------- #
-def test_thirteen_patch_fits_and_source_only_reuse(monkeypatch):
+def test_exactly_the_configured_allocation_additive_and_reference_patch_fits(monkeypatch):
+    """One fit per planned row and nothing more: 5 allocation points + 4 additive points + the two full
+    references. The retired source_only route and the complete_target diagnostic are both gone."""
     rows, fit, _score, _ = _run(monkeypatch)
-    assert len(fit.calls) == 13
-    tt = [r for r in rows if r["evaluation_split"] == SA.EVAL_TARGET_TEST]
-    diag = [r for r in rows if r["evaluation_split"] == SA.EVAL_COMPLETE_TARGET]
-    assert len(tt) == 13 and len(diag) == 1
-    assert {(r["label_access_route"], r["label_budget"], r["evaluation_split"]) for r in rows} == set(
-        SA.label_access_expected_rows()
-    )
-    assert {r["label_budget_unit"] for r in rows} == {"patches"}
+    expected = SA.label_access_expected_rows()
+    assert len(fit.calls) == len(expected) == len(PERCENTS) + len(COUNTS) + 2
+    assert len(rows) == len(expected)
+    assert {r["evaluation_split"] for r in rows} == {SA.EVAL_TARGET_TEST}
+    assert not [r for r in rows if r["evaluation_split"] == SA.EVAL_COMPLETE_TARGET]
+    assert {(r["label_access_route"], r["label_budget"], r["evaluation_split"]) for r in rows} == set(expected)
+    assert {r["label_budget_unit"] for r in rows} == {SA.LABEL_ACCESS_DENSE_UNIT}
+    assert {r["label_access_route"] for r in rows} <= set(SA.LABEL_ACCESS_ROUTES)
+
+
+def test_no_retired_route_is_emitted(monkeypatch):
+    rows, _fit, _score, _ = _run(monkeypatch)
+    retired = {"source_only", "matched_source", "matched_target", "fixed_total_mixed"}
+    assert not ({r["label_access_route"] for r in rows} & retired)
 
 
 def test_patch_atomicity_every_selected_patch_is_whole(monkeypatch):
@@ -172,35 +199,76 @@ def test_patch_atomicity_every_selected_patch_is_whole(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# frozen-order mapping + independent orders
+# the fixed-budget allocation curve: half-up rounding, exact totals, strict nesting
 # --------------------------------------------------------------------------- #
-def test_frozen_order_mapping_and_counts(monkeypatch):
-    _rows, fit, _score, data = _run(monkeypatch)
-    src_all = set(data["source_ids"])
-    matched, fixed, target = data["matched"].tolist(), data["fixed"].tolist(), data["target"].tolist()
-    m = min(len(src_all), len(target))
-    calls = fit.calls
-    assert _src(calls[0]) == src_all and _tgt(calls[0]) == set()
-    for idx, k in zip(range(1, 5), COUNTS, strict=True):
-        assert _src(calls[idx]) == src_all and _tgt(calls[idx]) == set(target[:k])
-    assert _src(calls[5]) == set() and _tgt(calls[5]) == set(target)
-    assert _src(calls[6]) == src_all and _tgt(calls[6]) == set(target)
-    assert _src(calls[7]) == set(matched[:m]) and _tgt(calls[7]) == set()
-    assert _src(calls[8]) == set() and _tgt(calls[8]) == set(target[:m])
-    for idx, k in zip(range(9, 13), COUNTS, strict=True):
-        assert _src(calls[idx]) == set(fixed[k:]) and _tgt(calls[idx]) == set(target[:k])
+def test_allocation_uses_half_up_rounding_in_patch_units(monkeypatch):
+    """B=50 puts 25% and 75% exactly on .5. Half-up gives k=13 and k=38; Python's banker's rounding
+    would give 12 at 25%, so the two conventions are distinguishable here."""
+    _rows, fit, _score, _ = _run(monkeypatch)
+    assert [_k(f) for f in PERCENTS] == [0, 13, 25, 38, 50]
+    assert round(0.25 * BUDGET) == 12 != _k(25)          # banker's rounding is NOT what is used
+    for idx, f in enumerate(PERCENTS):
+        assert len(_tgt(fit.calls[idx])) == _k(f), f"f={f}%"
 
 
-def test_matched_and_fixed_consume_separate_orders(monkeypatch):
+def test_allocation_source_plus_target_equals_the_budget_at_every_fraction(monkeypatch):
+    rows, fit, _score, _ = _run(monkeypatch)
+    for idx, f in enumerate(PERCENTS):
+        call = fit.calls[idx]
+        assert len(_src(call)) == BUDGET - _k(f)
+        assert len(_src(call)) + len(_tgt(call)) == BUDGET
+    alloc = [r for r in rows if r["label_access_route"] == SA.ROUTE_FIXED_BUDGET_ALLOCATION]
+    assert len(alloc) == len(PERCENTS)
+    for r in alloc:
+        k = _k(r["label_budget"])
+        assert (r["n_source_labels"], r["n_target_labels"]) == (BUDGET - k, k)
+        assert r["n_total_labels"] == r["n_source_labels"] + r["n_target_labels"] == BUDGET
+        assert r["allocation_total_budget"] == BUDGET
+    assert {r["allocation_total_budget"] for r in alloc} == {BUDGET}   # ONE realized budget
+
+
+def test_allocation_points_are_strictly_nested_prefixes_of_the_frozen_orders(monkeypatch):
+    """The single nested source order replaced the old independent matched/fixed draws: as f grows the
+    source patch sets SHRINK as prefixes and the target patch sets GROW as prefixes -- never two
+    unrelated permutations."""
     _rows, fit, _score, data = _run(monkeypatch)
-    assert data["matched"].tolist() != data["fixed"].tolist()
-    m = min(len(data["source_ids"]), len(data["target"]))
-    assert _src(fit.calls[7]) == set(data["matched"].tolist()[:m])
-    assert _src(fit.calls[9]) == set(data["fixed"].tolist()[COUNTS[0]:])
+    src, tgt = data["source"].tolist(), data["target"].tolist()
+    srcs = [_src(fit.calls[i]) for i in range(len(PERCENTS))]
+    tgts = [_tgt(fit.calls[i]) for i in range(len(PERCENTS))]
+    for idx, f in enumerate(PERCENTS):
+        assert srcs[idx] == set(src[: BUDGET - _k(f)])
+        assert tgts[idx] == set(tgt[: _k(f)])
+    for a, b in zip(srcs, srcs[1:], strict=False):
+        assert b < a          # strictly shrinking nested source prefixes
+    for a, b in zip(tgts, tgts[1:], strict=False):
+        assert a < b          # strictly growing nested target prefixes
+
+
+def test_additive_routes_hold_the_complete_source_pool(monkeypatch):
+    rows, fit, _score, data = _run(monkeypatch)
+    src_all, tgt = set(data["source_ids"]), data["target"].tolist()
+    for idx, k in enumerate(COUNTS, start=len(PERCENTS)):
+        assert _src(fit.calls[idx]) == src_all
+        assert _tgt(fit.calls[idx]) == set(tgt[:k])
+    for r in [r for r in rows if r["label_access_route"] == SA.ROUTE_SOURCE_PLUS_TARGET]:
+        assert r["n_source_labels"] == r["n_source_pool"] == len(src_all)
+        assert r["n_target_labels"] == r["label_budget"]
+
+
+def test_full_reference_routes(monkeypatch):
+    rows, fit, _score, data = _run(monkeypatch)
+    src_all, pool_all = set(data["source_ids"]), set(data["pool_ids"])
+    assert _src(fit.calls[9]) == set() and _tgt(fit.calls[9]) == pool_all
+    assert _src(fit.calls[10]) == src_all and _tgt(fit.calls[10]) == pool_all
+    tof = next(r for r in rows if r["label_access_route"] == SA.ROUTE_TARGET_ONLY_FULL)
+    spf = next(r for r in rows if r["label_access_route"] == SA.ROUTE_SOURCE_PLUS_TARGET_FULL)
+    assert tof["n_source_labels"] == 0 and tof["n_target_labels"] == len(pool_all)
+    assert spf["n_source_labels"] == spf["n_source_pool"] == len(src_all)
+    assert spf["n_target_labels"] == spf["n_target_pool"] == len(pool_all)
 
 
 # --------------------------------------------------------------------------- #
-# leakage + calibration routing + seeds (Issue 2)
+# leakage + calibration routing + seeds
 # --------------------------------------------------------------------------- #
 def test_no_target_test_patch_enters_any_training_set(monkeypatch):
     _rows, fit, _score, data = _run(monkeypatch)
@@ -210,17 +278,20 @@ def test_no_target_test_patch_enters_any_training_set(monkeypatch):
 
 
 def test_calibration_routing_matches_the_contract(monkeypatch):
+    """All five allocation points and target_only_full tune internally (f=1.0 is target-only and must
+    not inherit source calibration while its siblings do); the additive routes and the combined full
+    reference keep the frozen source validation set."""
     _rows, fit, _score, _ = _run(monkeypatch)
     for i, call in enumerate(fit.calls):
-        assert call["tune_internal"] == (i in INTERNAL_CALLS)
-        assert call["has_cal"] == (i not in INTERNAL_CALLS)
+        assert call["tune_internal"] == (i in INTERNAL_CALLS), f"call {i}"
+        assert call["has_cal"] == (i not in INTERNAL_CALLS), f"call {i}"
 
 
 def test_every_route_initializes_the_probe_with_the_run_seed(monkeypatch):
-    """No per-budget seed: every one of the 13 routes seeds its probe with the pipeline RUN seed, so
-    changing k never injects an unrelated random draw at probe-init time."""
+    """No per-budget seed: every route seeds its probe with the pipeline RUN seed, so changing f or k
+    never injects an unrelated random draw at probe-init time."""
     _rows, fit, _score, _ = _run(monkeypatch)
-    assert len(fit.calls) == 13
+    assert len(fit.calls) == len(SA.label_access_expected_rows())
     assert {c["seed"] for c in fit.calls} == {RUN_SEED}
 
 
@@ -234,37 +305,44 @@ def test_sweep_never_derives_a_budget_seed(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# scoring targets + n_test/n_eval_patches (Issue 5)
+# scoring targets + n_test/n_eval_patches (pixels vs patches)
 # --------------------------------------------------------------------------- #
 def test_scored_targets_and_pixel_vs_patch_counts(monkeypatch):
+    """Every route is scored on the SAME frozen target_test patch stream and nothing else -- there is no
+    complete_target pass any more. n_test stays the evaluated PIXEL count (like every seg row);
+    n_eval_patches is the patch count."""
     rows, _fit, score, data = _run(monkeypatch)
     test_set = set(data["test_ids"])
-    complete = set(data["pool_ids"]) | test_set
-    assert sum(set(c["patches"]) == test_set for c in score.calls) == 13   # 13 routes on target_test
-    assert sum(set(c["patches"]) == complete for c in score.calls) == 1    # 1 diagnostic on the region
-    tt = [r for r in rows if r["evaluation_split"] == SA.EVAL_TARGET_TEST]
-    diag = next(r for r in rows if r["evaluation_split"] == SA.EVAL_COMPLETE_TARGET)
-    # n_test stays the evaluated PIXEL count (like every seg row); n_eval_patches is the patch count.
-    assert {r["n_test"] for r in tt} == {len(test_set) * TGT_PX}
-    assert {r["n_eval_patches"] for r in tt} == {len(test_set)}
-    assert diag["n_test"] == len(complete) * TGT_PX and diag["n_eval_patches"] == len(complete)
+    n_routes = len(SA.label_access_expected_rows())
+    assert len(score.calls) == n_routes
+    assert all(set(c["patches"]) == test_set for c in score.calls)
+    assert {r["n_test"] for r in rows} == {len(test_set) * TGT_PX}
+    assert {r["n_eval_patches"] for r in rows} == {len(test_set)}
 
 
 def test_semantic_validation_uses_patch_counts_and_passes(monkeypatch):
-    """The generalized validator derives the realized pool P from n_eval_patches (patches), not n_test
-    (pixels), so the dense suite validates cleanly."""
+    """The dense rows carry the ``patches`` unit and the allocation arithmetic the generalized validator
+    re-derives, so the dense suite validates cleanly beside its E1 row."""
     rows, _fit, _score, _ = _run(monkeypatch)
     full = [{**r, "seed": RUN_SEED, "split_regime": SA.LABEL_ACCESS_REGIME, "holdout": "T1",
              "method": "erm", "probe_family": "logistic"} for r in rows]
-    assert artifacts._validate_label_access_semantics(full) == []
+    assert artifacts._validate_label_access_semantics([*full, _e1()]) == []
+
+
+def test_dense_rows_carry_the_patch_unit_not_samples(monkeypatch):
+    rows, _fit, _score, _ = _run(monkeypatch)
+    tampered = [{**r, "seed": RUN_SEED, "split_regime": SA.LABEL_ACCESS_REGIME, "holdout": "T1",
+                 "method": "erm", "probe_family": "logistic",
+                 "label_budget_unit": SA.LABEL_ACCESS_TABULAR_UNIT} for r in rows]
+    assert any("unit" in p for p in artifacts._validate_label_access_semantics([*tampered, _e1()]))
 
 
 # --------------------------------------------------------------------------- #
-# predictions: streamed with full stable identity (Issue 4)
+# predictions: streamed with full stable identity
 # --------------------------------------------------------------------------- #
 def test_predictions_stream_with_full_stable_identity(monkeypatch):
     recs: list[dict] = []
-    rows, _fit, _score, data = _run(monkeypatch, predictions_sink=recs.extend)
+    _rows, _fit, _score, data = _run(monkeypatch, predictions_sink=recs.extend)
     assert recs
     required = {"patch_id", "tile_row", "tile_col", "pixel_index", "sample_id", "label_access_route",
                 "evaluation_split", "label_budget", "seed", "budget_type", "n_source_labels",
@@ -273,16 +351,12 @@ def test_predictions_stream_with_full_stable_identity(monkeypatch):
         assert required <= set(r)
         # sample_id carries patch, tile row, tile col, and the within-tile valid-pixel index
         assert r["sample_id"] == f'{r["patch_id"]}:{r["tile_row"]}:{r["tile_col"]}:{r["pixel_index"]}'
-        assert r["budget_type"] == "label_access" and r["label_budget_unit"] == "patches"
+        assert r["budget_type"] == "label_access"
+        assert r["label_budget_unit"] == SA.LABEL_ACCESS_DENSE_UNIT
         assert r["seed"] == RUN_SEED
-    # target_test predictions cover exactly the frozen target_test patches; the diagnostic adds the pool
-    tt_patches = {r["patch_id"] for r in recs if r["evaluation_split"] == SA.EVAL_TARGET_TEST}
-    assert tt_patches == set(data["test_ids"])
-    diag_patches = {r["patch_id"] for r in recs if r["evaluation_split"] == SA.EVAL_COMPLETE_TARGET}
-    assert diag_patches == set(data["pool_ids"]) | set(data["test_ids"])
-    assert {r["label_access_route"] for r in recs if r["evaluation_split"] == SA.EVAL_COMPLETE_TARGET} == {
-        SA.ROUTE_SOURCE_ONLY
-    }
+    # every prediction is on the frozen target_test population -- no complete_target pass exists
+    assert {r["evaluation_split"] for r in recs} == {SA.EVAL_TARGET_TEST}
+    assert {r["patch_id"] for r in recs} == set(data["test_ids"])
     # UNIQUENESS within each fit (route + budget + evaluation_split): no sample_id repeats. (The same
     # route name spans budget arms that score the same patches, so budget is part of the fit identity.)
     by_group: dict[tuple, list[str]] = {}
@@ -298,54 +372,101 @@ def test_no_sink_writes_no_predictions(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# cap: the shared source base pool, at patch granularity
+# the controlled cap: applied to the BUDGET, before the mixture is built
 # --------------------------------------------------------------------------- #
-def test_uncapped_base_is_the_whole_source(monkeypatch):
-    rows, fit, _score, data = _run(monkeypatch, cap_patches=None)
-    assert _src(fit.calls[0]) == set(data["source_ids"])
-    assert {r["n_source_base"] for r in rows} == {len(data["source_ids"])}
-    assert {r["probe_capped"] for r in rows} == {0}
+def test_uncapped_budget_is_the_benchmark_budget(monkeypatch):
+    rows, fit, _score, _ = _run(monkeypatch, controlled_cap=None)
+    assert len(_src(fit.calls[0])) == BUDGET
+    assert {r["allocation_total_budget"] for r in rows} == {BUDGET}
+    assert {r["benchmark_budget"] for r in rows} == {BUDGET}
+    assert {r["controlled_budget_cap"] for r in rows} == {0}
 
 
-def test_cap_restricts_the_shared_base_and_both_orders(monkeypatch):
-    rows, fit, _score, data = _run(monkeypatch, cap_patches=52)
-    base = _src(fit.calls[0])
-    assert len(base) == 52 and base <= set(data["source_ids"])
-    assert _src(fit.calls[6]) == base
-    assert _src(fit.calls[7]) <= base
-    assert _src(fit.calls[9]) <= base
-    assert {r["n_source_base"] for r in rows} == {52} and {r["probe_capped"] for r in rows} == {1}
+def test_cap_shrinks_the_realized_budget_for_every_allocation_point(monkeypatch):
+    """The cap is a TOTAL-budget cap applied before the mixture is built -- never a post-hoc subsample of
+    an already-constructed route -- so B, k and B-k all move together and the fixed-budget claim holds."""
+    cap = 20
+    rows, fit, _score, data = _run(monkeypatch, controlled_cap=cap)
+    src, tgt = data["source"].tolist(), data["target"].tolist()
+    for idx, f in enumerate(PERCENTS):
+        k = _k(f, cap)
+        assert _src(fit.calls[idx]) == set(src[: cap - k])
+        assert _tgt(fit.calls[idx]) == set(tgt[:k])
+        assert len(_src(fit.calls[idx])) + len(_tgt(fit.calls[idx])) == cap
+    assert {r["allocation_total_budget"] for r in rows} == {cap}
+    assert {r["controlled_budget_cap"] for r in rows} == {cap}
+    assert {r["benchmark_budget"] for r in rows} == {BUDGET}
+    # the additive routes are NOT capped -- they are a separate operational question on the whole pool
+    add = next(r for r in rows if r["label_access_route"] == SA.ROUTE_SOURCE_PLUS_TARGET)
+    assert add["n_source_labels"] == len(data["source_ids"])
+
+
+def test_cap_above_the_budget_never_raises_it(monkeypatch):
+    rows, _fit, _score, _ = _run(monkeypatch, controlled_cap=BUDGET + 25)
+    assert {r["allocation_total_budget"] for r in rows} == {BUDGET}
 
 
 def test_cap_is_deterministic_and_encoder_independent(monkeypatch):
-    _a, fita, _sa, _da = _run(monkeypatch, cap_patches=52)
-    _b, fitb, _sb, _db = _run(monkeypatch, cap_patches=52, meta_extra={"model": "different-encoder"})
-    assert _src(fita.calls[0]) == _src(fitb.calls[0])
+    _a, fita, _sa, _da = _run(monkeypatch, controlled_cap=20)
+    _b, fitb, _sb, _db = _run(monkeypatch, controlled_cap=20, meta_extra={"model": "different-encoder"})
+    assert [_src(c) for c in fita.calls] == [_src(c) for c in fitb.calls]
+    assert [_tgt(c) for c in fita.calls] == [_tgt(c) for c in fitb.calls]
 
 
-def test_cap_below_max_count_hard_fails(monkeypatch):
+def test_budget_larger_than_a_pool_hard_fails(monkeypatch):
+    """B is never clamped: a budget the source or target pool cannot supply is a hard error."""
     with pytest.raises(ValueError, match="infeasible"):
-        _run(monkeypatch, cap_patches=40)
+        _run(monkeypatch, budget=56)     # target pool holds 55 patches
+
+
+def test_cap_that_empties_the_budget_hard_fails(monkeypatch):
+    with pytest.raises(ValueError, match="realized budget"):
+        _run(monkeypatch, controlled_cap=0)
+
+
+def test_additive_count_above_the_target_pool_hard_fails(monkeypatch):
+    with pytest.raises(ValueError, match="infeasible"):
+        _run(monkeypatch, counts=(5, 60))
 
 
 def test_order_rejects_non_permutation_of_source(monkeypatch):
     data = _make_dense()
+    bad = data["source"].copy()
+    bad[0] = 999999
+    data = {**data, "source": bad}
+    with pytest.raises(ValueError, match="source_order"):
+        _run(monkeypatch, data=data)
+
+
+def test_order_rejects_non_permutation_of_target(monkeypatch):
+    data = _make_dense()
+    bad = data["target"].copy()
+    bad[0] = 999999
+    data = {**data, "target": bad}
+    with pytest.raises(ValueError, match="target_order"):
+        _run(monkeypatch, data=data)
+
+
+def test_retired_keyword_arguments_are_gone(monkeypatch):
+    """``matched_source_order`` / ``fixed_removal_order`` / ``cap_patches`` belonged to the retired
+    two-order contract; passing one must be a hard TypeError, never silently ignored."""
+    data = _make_dense()
     monkeypatch.setattr(pastis, "fit_probe_multiclass", _RecFit())
     monkeypatch.setattr(pastis, "score_segmentation_streamed", _RecScore())
-    bad = data["matched"].copy()
-    bad[0] = 999999
-    with pytest.raises(ValueError, match="matched_source_order"):
-        pastis.run_probes_segmentation_label_access(
-            [], RUN_SEED, source_patches=data["source_patches"], pool_patches=data["pool_patches"],
-            target_test_patches=data["test_patches"], matched_source_order=bad,
-            fixed_removal_order=data["fixed"], target_order=data["target"], counts=COUNTS,
-            load_pixels=data["load_pixels"], stream_eval=data["stream_eval"],
-            x_val=data["x_val"], y_val=data["y_val"], meta={"benchmark": "pastis"},
-        )
+    for dead in ("matched_source_order", "fixed_removal_order", "cap_patches"):
+        with pytest.raises(TypeError):
+            pastis.run_probes_segmentation_label_access(
+                [], RUN_SEED, source_patches=data["source_patches"], pool_patches=data["pool_patches"],
+                target_test_patches=data["test_patches"], source_order=data["source"],
+                target_order=data["target"], budget=BUDGET, percents=PERCENTS, counts=COUNTS,
+                load_pixels=data["load_pixels"], stream_eval=data["stream_eval"],
+                x_val=data["x_val"], y_val=data["y_val"], meta={"benchmark": "pastis"},
+                **{dead: data["source"]},
+            )
 
 
 # --------------------------------------------------------------------------- #
-# real capped cacheutils loader: patch-first, paired, MAX_DENSE_PIXELS respected (Issue 3)
+# real capped cacheutils loader: patch-first, paired, MAX_DENSE_PIXELS respected
 # --------------------------------------------------------------------------- #
 def _write_patches(fold_dir, patch_ids, n_px, *, tiles=((0, 0),), n_feat=6, seed=0):
     """Write `n_px`-pixel cache tiles for each patch. `tiles` is the list of (row, col) quadrants -- the
@@ -415,9 +536,13 @@ def test_rows_carry_route_aware_identity_and_pass_completeness(monkeypatch):
     for r in rows:
         assert artifacts.cell_key(r) == runstate.budget_row_key(r)
     assert artifacts.completeness(expected, rows)["ok"]
-    spt = next(r for r in rows if r["label_access_route"] == SA.ROUTE_SOURCE_PLUS_TARGET and r["label_budget"] == 25)
-    ftm = next(r for r in rows if r["label_access_route"] == SA.ROUTE_FIXED_TOTAL_MIXED and r["label_budget"] == 25)
-    assert runstate.budget_row_key(spt) != runstate.budget_row_key(ftm)
+    # the numeric collision between allocation@25 (a PERCENT) and source_plus_target@25 (a COUNT) is
+    # resolved by the route field, so the two never share a resume key.
+    alloc = next(r for r in rows if r["label_access_route"] == SA.ROUTE_FIXED_BUDGET_ALLOCATION
+                 and r["label_budget"] == 25)
+    add = next(r for r in rows if r["label_access_route"] == SA.ROUTE_SOURCE_PLUS_TARGET
+               and r["label_budget"] == 25)
+    assert runstate.budget_row_key(alloc) != runstate.budget_row_key(add)
 
 
 def _dense_split(source, pool, test, label="T1"):
@@ -431,18 +556,25 @@ def _dense_split(source, pool, test, label="T1"):
     )
 
 
-def test_load_dense_label_access_resolves_patch_orders(tmp_path):
+def test_load_dense_label_access_resolves_one_nested_source_order(tmp_path):
     source, pool, test = list(range(60)), list(range(1000, 1055)), list(range(2000, 2008))
     la_rows = SA.build_label_access_rows(
         seed=0, source_ids=[str(p) for p in source], target_pool_ids=[str(p) for p in pool],
         target_test_ids=[str(p) for p in test],
     )
     _path, sha = SA.write_label_access(tmp_path / "splits", "pastis", 0, "T1", la_rows)
-    loaded = SA.load_dense_label_access(tmp_path / "splits", "pastis", 0, _dense_split(source, pool, test), sha)
-    assert set(loaded.matched_source_ranked_patches.tolist()) == set(source)
-    assert set(loaded.fixed_source_removal_ranked_patches.tolist()) == set(source)
-    assert set(loaded.target_ranked_patches.tolist()) == set(pool)
-    assert loaded.matched_source_ranked_patches.tolist() != loaded.fixed_source_removal_ranked_patches.tolist()
+    loaded = SA.load_dense_label_access(
+        tmp_path / "splits", "pastis", 0, _dense_split(source, pool, test), sha, benchmark_budget=BUDGET,
+    )
+    assert isinstance(loaded, SA.LoadedDenseLabelAccess)
+    assert loaded._fields == ("holdout", "source_ranked_patches", "target_ranked_patches", "benchmark_budget")
+    assert loaded.holdout == "T1" and loaded.benchmark_budget == BUDGET
+    assert sorted(loaded.source_ranked_patches.tolist()) == source     # exact permutation, one order
+    assert sorted(loaded.target_ranked_patches.tolist()) == pool
+    # every allocation point slices a PREFIX of this single order, so the curve is nested by construction
+    prefixes = [set(loaded.source_ranked_patches[: BUDGET - _k(f)].tolist()) for f in PERCENTS]
+    for a, b in zip(prefixes, prefixes[1:], strict=False):
+        assert b < a
 
 
 def test_load_dense_label_access_missing_file_hard_errors(tmp_path):
@@ -450,6 +582,7 @@ def test_load_dense_label_access_missing_file_hard_errors(tmp_path):
         SA.load_dense_label_access(
             tmp_path / "splits", "pastis", 0,
             _dense_split(range(60), range(1000, 1055), range(2000, 2008)), "0" * 64,
+            benchmark_budget=BUDGET,
         )
 
 
@@ -463,11 +596,25 @@ def test_load_dense_label_access_rejects_stale_population(tmp_path):
     with pytest.raises(SA.SplitArtifactError):
         SA.load_dense_label_access(
             tmp_path / "splits", "pastis", 0, _dense_split(list(range(1, 61)), pool, test), stale_sha,
+            benchmark_budget=BUDGET,
+        )
+
+
+def test_load_dense_label_access_requires_the_frozen_benchmark_budget(tmp_path):
+    source, pool, test = list(range(60)), list(range(1000, 1055)), list(range(2000, 2008))
+    la_rows = SA.build_label_access_rows(
+        seed=0, source_ids=[str(p) for p in source], target_pool_ids=[str(p) for p in pool],
+        target_test_ids=[str(p) for p in test],
+    )
+    _p, sha = SA.write_label_access(tmp_path / "splits", "pastis", 0, "T1", la_rows)
+    with pytest.raises(SA.SplitArtifactError, match="benchmark_budget"):
+        SA.load_dense_label_access(
+            tmp_path / "splits", "pastis", 0, _dense_split(source, pool, test), sha, benchmark_budget=None,
         )
 
 
 # --------------------------------------------------------------------------- #
-# manifest: patches unit + prediction honesty (Issue 4)
+# manifest: patches unit + prediction honesty
 # --------------------------------------------------------------------------- #
 def _manifest(benchmark, regimes, write_predictions=True):
     return runstate.build_run_manifest(
@@ -479,9 +626,13 @@ def _manifest(benchmark, regimes, write_predictions=True):
 
 def test_manifest_contract_unit_is_patches_for_pastis():
     contract = SA.label_access_contract(enabled=True, benchmark="pastis")
-    assert contract["unit"] == "patches" and contract["enabled"] is True
+    assert contract["unit"] == SA.LABEL_ACCESS_DENSE_UNIT and contract["enabled"] is True
+    assert contract["allocation_percents"] == list(PERCENTS)
+    assert contract["additive_counts"] == list(COUNTS)
+    assert contract["evaluation_splits"] == [SA.EVAL_TARGET_TEST]
     man = _manifest("pastis", ["geographic_ood", "official"])
-    assert man["label_access"]["enabled"] is True and man["label_access"]["unit"] == "patches"
+    assert man["label_access"]["enabled"] is True
+    assert man["label_access"]["unit"] == SA.LABEL_ACCESS_DENSE_UNIT
 
 
 def test_manifest_write_predictions_never_over_claims():

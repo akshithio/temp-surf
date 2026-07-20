@@ -721,10 +721,14 @@ def run_probes_segmentation_label_access(
     source_patches: Any,
     pool_patches: Any,
     target_test_patches: Any,
-    matched_source_order: Any,
-    fixed_removal_order: Any,
+    source_order: Any,
     target_order: Any,
+    budget: int,
+    percents: tuple[int, ...],
     counts: tuple[int, ...],
+    controlled_cap: int | None = None,
+    full_target_reference: bool = True,
+    full_combined_reference: bool = True,
     load_pixels: Any,
     stream_eval: Any,
     x_val: np.ndarray,
@@ -732,58 +736,66 @@ def run_probes_segmentation_label_access(
     meta: dict[str, Any] | None = None,
     family: str = "logistic",
     label_budget_unit: str = "patches",
-    cap_patches: int | None = None,
     patch_domain: dict[int, str] | None = None,
     predictions_sink: Any = None,
 ) -> None:
-    """The dense geographic label-access suite: 13 distinct fits per fully-eligible cell, each scored on
-    the SAME frozen ``target_test`` patch stream, plus the source_only complete-target diagnostic reusing
-    that fit. ``target_test`` patches NEVER enter any training set.
+    """The dense geographic label-access suite over WHOLE PATCHES, every route scored on the SAME frozen
+    ``target_test`` patch stream. ``target_test`` patches NEVER enter any training set.
 
-    PATCH-FIRST: allocation/removal is resolved entirely on patch IDS first; only then are pixels
-    assembled. ``load_pixels(patch_ids) -> (x, y, groups, patch_ids)`` subsamples EACH patch
-    deterministically (keyed on the run seed + patch id, NOT the route or budget), so retained patches
-    train on IDENTICAL pixels across paired routes and MAX_DENSE_PIXELS is respected. The source base and
-    the whole target pool are each loaded ONCE and sliced by patch membership -- never reloaded per route
-    and never globally re-subsampled.
+    Mirrors the tabular sweep exactly, in patch units: the realized budget is ``B = min(B_d, C)`` and the
+    allocation point at fraction ``f`` trains on ``source_order[:B-k] + target_order[:k]`` with
+    ``k = round_half_up(f*B)``. Patches are never split, so B, k and B-k are PATCH counts. The additive
+    appendix routes hold the COMPLETE source pool and add ``target_order[:k]``.
 
-    Every route initializes its probe with the RUN SEED directly (no per-budget seed), so changing ``k``
-    never injects an unrelated random draw. The three frozen orders are PATCH IDS. Calibration routing
-    mirrors the tabular suite. Counts are the ONE canonical set, in PATCH units."""
+    PATCH-FIRST: allocation is resolved entirely on patch IDS first; only then are pixels assembled.
+    ``load_pixels(patch_ids) -> (x, y, groups, patch_ids)`` subsamples EACH patch deterministically (keyed
+    on the run seed + patch id, NOT the route or budget), so retained patches train on IDENTICAL pixels
+    across paired routes and MAX_DENSE_PIXELS is respected. The source pool and the target pool are each
+    loaded ONCE and sliced by patch membership -- never reloaded per route, never globally re-subsampled.
+
+    Every route initializes its probe with the RUN SEED directly (no per-budget seed). All five allocation
+    points use route-internal calibration (``f=1.0`` is target-only); additive routes keep the frozen
+    source validation set."""
     from evals import split_artifacts as _SA
 
     meta = dict(meta or {})
     eval_classes = np.arange(19, dtype=np.int64)
+    percents = tuple(int(f) for f in percents)
     counts = tuple(int(c) for c in counts)
 
-    matched_source_order = _validate_patch_order(matched_source_order, source_patches, "matched_source_order")
-    fixed_removal_order = _validate_patch_order(fixed_removal_order, source_patches, "fixed_removal_order")
+    source_order = _validate_patch_order(source_order, source_patches, "source_order")
     target_order = _validate_patch_order(target_order, pool_patches, "target_order")
 
     test_set = {int(p) for p in target_test_patches}
-    complete_set = {int(p) for p in pool_patches} | test_set  # pool ++ test (deployment estimand)
+    src = [int(p) for p in source_order.tolist()]
+    tgt = [int(p) for p in target_order.tolist()]
+    S, P = len(src), len(tgt)
 
-    # Shared source BASE POOL of WHOLE patches; restrict BOTH source orders to it (order preserved).
-    cap_seed = perf._cap_seed(seed, "label_access", "base", meta)
-    base_set = _select_base_patches(source_patches, cap_patches, cap_seed, patch_domain)
-    matched_in_base = [p for p in matched_source_order.tolist() if p in base_set]
-    fixed_in_base = [p for p in fixed_removal_order.tolist() if p in base_set]
-    s_all, B, P = len({int(p) for p in source_patches}), len(base_set), int(target_order.size)
-    mx = max(counts) if counts else 0
-    if P < mx or B < mx:  # NEVER clamp: every configured count must be supportable at patch level
+    # The controlled cap IS the total patch budget, applied BEFORE the mixture is built -- never a
+    # subsample taken after a route is constructed -- so it constrains both probe families identically.
+    B = int(budget)
+    if controlled_cap is not None:
+        B = min(B, int(controlled_cap))
+    if B < 1:
+        raise ValueError(f"dense label-access: realized budget {B} < 1 (B_d={budget}, cap={controlled_cap})")
+    if S < B or P < B:
         raise ValueError(
-            f"dense label-access infeasible: source base B={B}, target pool P={P}, max count={mx} (cap={cap_patches})"
+            f"dense label-access infeasible: realized budget B={B} patches exceeds source pool S={S} or "
+            f"target pool P={P} (B_d={budget}, cap={controlled_cap}) -- never clamped"
         )
-    m = min(B, P)
-    cap_meta = {"probe_cap": int(cap_patches) if cap_patches is not None else 0,
-                "probe_capped": int(cap_patches is not None and int(cap_patches) < s_all),
-                "n_source_precap": int(s_all), "n_source_base": int(B)}
-    tgt = target_order.tolist()
+    mx = max(counts) if counts else 0
+    if counts and P < mx:
+        raise ValueError(f"dense label-access infeasible: target pool P={P} < max additive count {mx}")
+    budget_meta = {
+        "allocation_total_budget": int(B), "benchmark_budget": int(budget),
+        "controlled_budget_cap": int(controlled_cap) if controlled_cap is not None else 0,
+        "n_source_pool": int(S), "n_target_pool": int(P),
+    }
 
     # PATCH-FIRST pixel assembly: load the source base ONCE and the whole target pool ONCE (each patch
     # deterministically subsampled), then slice by patch membership. Because the per-patch subsample does
     # not depend on the co-loaded set, slicing is identical to reloading -- retained patches are paired.
-    xs_base, ys_base, _gs_base, base_pid = load_pixels(set(base_set))
+    xs_base, ys_base, _gs_base, base_pid = load_pixels({int(p) for p in source_patches})
     xt_pool, yt_pool, _gt_pool, pool_pid = load_pixels({int(p) for p in pool_patches})
 
     def _assemble(src_patches: set[int], tgt_patches: set[int]):
@@ -802,18 +814,21 @@ def run_probes_segmentation_label_access(
             return None, None
         return np.concatenate(parts_x), np.concatenate(parts_y)
 
-    # (route, budget, source patch set, target patch set, tune_internal). Whole-patch sets throughout.
-    route_specs: list[tuple[str, int, set[int], set[int], bool]] = [
-        (_SA.ROUTE_SOURCE_ONLY, 0, set(base_set), set(), False),
-        *[(_SA.ROUTE_SOURCE_PLUS_TARGET, k, set(base_set), set(tgt[:k]), False) for k in counts],
-        (_SA.ROUTE_TARGET_ONLY_FULL, 0, set(), set(tgt), True),
-        (_SA.ROUTE_SOURCE_PLUS_TARGET_FULL, 0, set(base_set), set(tgt), False),
-        (_SA.ROUTE_MATCHED_SOURCE, 0, set(matched_in_base[:m]), set(), True),
-        (_SA.ROUTE_MATCHED_TARGET, 0, set(), set(tgt[:m]), True),
-        *[(_SA.ROUTE_FIXED_TOTAL_MIXED, k, set(fixed_in_base[k:]), set(tgt[:k]), False) for k in counts],
+    # (route, label_budget, source patch set, target patch set, tune_internal). Whole patches throughout;
+    # allocation rows carry the PERCENT as label_budget, additive rows the absolute patch count.
+    route_specs: list[tuple[str, int, set[int], set[int], bool]] = []
+    for f in percents:
+        k = _SA.allocation_target_count(f, B)
+        route_specs.append((_SA.ROUTE_FIXED_BUDGET_ALLOCATION, int(f), set(src[: B - k]), set(tgt[:k]), True))
+    route_specs += [
+        (_SA.ROUTE_SOURCE_PLUS_TARGET, int(k), set(src), set(tgt[:k]), False) for k in counts
     ]
+    if full_target_reference:
+        route_specs.append((_SA.ROUTE_TARGET_ONLY_FULL, 0, set(), set(tgt), True))
+    if full_combined_reference:
+        route_specs.append((_SA.ROUTE_SOURCE_PLUS_TARGET_FULL, 0, set(src), set(tgt), False))
 
-    for route, budget, src_patches, tgt_patches, tune_internal in route_specs:
+    for route, label_budget, src_patches, tgt_patches, tune_internal in route_specs:
         supervision = {
             "n_source_labels": len(src_patches), "n_target_labels": len(tgt_patches),
             "n_total_labels": len(src_patches) + len(tgt_patches), "label_budget_unit": label_budget_unit,
@@ -821,7 +836,7 @@ def run_probes_segmentation_label_access(
         fail_meta = {**meta, "label_access_route": route, "evaluation_split": _SA.EVAL_TARGET_TEST}
         x_tr, y_tr = _assemble(src_patches, tgt_patches)
         if x_tr is None:
-            perf._record_cell_failure(fail_meta, budget, "label_access", ValueError("empty training set"), extra=supervision)
+            perf._record_cell_failure(fail_meta, label_budget, "label_access", ValueError("empty training set"), extra=supervision)
             continue
         if tune_internal:
             cal_x, cal_y = None, None
@@ -830,8 +845,8 @@ def run_probes_segmentation_label_access(
             cal_y = y_val if cal_x is not None else None
 
         identity = {"seed": seed, "holdout": meta.get("holdout"), "method": meta.get("method"),
-                    "budget_type": "label_access", "label_access_route": route, "label_budget": budget,
-                    "evaluation_split": _SA.EVAL_TARGET_TEST}
+                    "budget_type": "label_access", "label_access_route": route,
+                    "label_budget": label_budget, "evaluation_split": _SA.EVAL_TARGET_TEST}
         perf.set_identity(identity)
         try:
             with perf.measure(f"probe.label_access_seg/{meta.get('benchmark', '?')}/{route}", n_train=len(y_tr)):
@@ -841,11 +856,12 @@ def run_probes_segmentation_label_access(
                 )
         except ValueError as exc:
             perf.set_identity(None)
-            perf._record_cell_failure(fail_meta, budget, "label_access", exc, extra=supervision)
+            perf._record_cell_failure(fail_meta, label_budget, "label_access", exc, extra=supervision)
             continue
         perf.set_identity(None)
-        row_base = {**meta, "budget_type": "label_access", "label_access_route": route, "label_budget": budget,
-                    "seed": seed, "n_train_sub": int(len(y_tr)), **supervision, **cap_meta, **probe_meta}
+        row_base = {**meta, "budget_type": "label_access", "label_access_route": route,
+                    "label_budget": label_budget,
+                    "seed": seed, "n_train_sub": int(len(y_tr)), **supervision, **budget_meta, **probe_meta}
 
         def _scored_row(evaluation_split: str, patch_set: set[int], _rb: dict = row_base, _clf: Any = clf) -> dict[str, Any]:
             # ONE streamed inference pass computes metrics AND (optionally) emits per-pixel predictions.
@@ -879,8 +895,3 @@ def run_probes_segmentation_label_access(
             return {**_rb, "evaluation_split": evaluation_split, **scores, "n_eval_patches": len(patch_set)}
 
         rows.append(_scored_row(_SA.EVAL_TARGET_TEST, test_set))
-        # source_only complete-target diagnostic: reuse the SAME fitted clf (NO refit) to score the whole
-        # target region (pool ++ test). One extra row, flagged complete_target so paired contrasts exclude
-        # it. Not a 14th fit; carries the source_only supervision metadata unchanged.
-        if route == _SA.ROUTE_SOURCE_ONLY:
-            rows.append(_scored_row(_SA.EVAL_COMPLETE_TARGET, complete_set))

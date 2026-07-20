@@ -34,7 +34,7 @@ _CI_BOOT = 2000
 _CI_SEED = 0
 #: Accurate name for the across-seed uncertainty: a hierarchical bootstrap that resamples SEEDS then, in
 #: every drawn seed, that seed's TARGET-region rows -- so it captures both seed and target variance.
-_CI_CONVENTION = "hierarchical_seed_target_bootstrap_2.5_97.5"
+_CI_CONVENTION = "target_region_bootstrap_2.5_97.5"
 
 #: EXPLICIT, exhaustive metric-direction policy (no substring inference, no "unknown -> higher"). Every
 #: metric in the METRICS_* universe is classified as higher_is_better, lower_is_better, or structural
@@ -206,12 +206,34 @@ def _paired_row(*, contrast, cell, metric, budget, minuend_route, subtrahend_rou
     }
 
 
+def _resolve_full_source(rows: list[dict[str, Any]]) -> dict[tuple, dict[str, Any]]:
+    """The ordinary full-source geographic row (E1) per label-access cell: ``budget_type=source``,
+    ``label_budget=1.0``, ``evaluation_split=test`` under geographic_ood. This is the subtrahend the
+    label-access contrasts use INSTEAD of refitting a source-only probe, so a duplicate would silently
+    make the choice of leg arbitrary -- it is a hard error."""
+    out: dict[tuple, dict[str, Any]] = {}
+    for r in rows:
+        if (r.get("budget_type") != "source" or r.get("split_regime") != SA.LABEL_ACCESS_REGIME
+                or r.get("evaluation_split") != "test"):
+            continue
+        try:
+            if float(r.get("label_budget")) != 1.0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        key = _cell_key(r)
+        if key in out:
+            raise ContrastError(f"duplicate full-source geographic (E1) row for {key}")
+        out[key] = r
+    return out
+
+
 def compute_contrasts(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Return ``(paired_rows, summary_rows)``. ``paired_rows`` is the per-target, per-seed contrast value
     for every (contrast, metric) pair; ``summary_rows`` aggregates targets with EQUAL region weight within
     each seed, then reports across-seed mean/std/n_seeds/CI. Hard-fails (ContrastError) on any missing or
     duplicate operand and on an unresolvable anchor -- the incomplete pair is never silently dropped."""
-    # Frozen target_test rows ONLY -> the source_only complete_target diagnostic is EXCLUDED (item 2).
+    # Frozen target_test rows ONLY -- the canonical comparison population.
     la_rows = [
         r for r in rows
         if r.get("budget_type") == "label_access" and r.get("split_regime") == SA.LABEL_ACCESS_REGIME
@@ -222,22 +244,49 @@ def compute_contrasts(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
     metrics = sorted(_metric_universe() & {k for r in la_rows for k in r})
     cells = _index_routes(la_rows)
     anchors = _resolve_anchors(rows)
+    e1 = _resolve_full_source(rows)
 
     paired: list[dict[str, Any]] = []
     for cell in sorted(cells, key=lambda c: tuple(str(x) for x in c)):
         by = cells[cell]
         for metric in metrics:
             for name, minuend_route, subtrahend_route in SA.LABEL_ACCESS_CONTRASTS:
-                if name in ("additive_target_label_gain", "label_source_allocation_effect"):
-                    # pair the SAME k exactly: minuend at budget k, source_only at budget 0 (item 4).
-                    for k in SA.LABEL_ACCESS_COUNTS:
-                        m_row = _require(by, (minuend_route, int(k)), cell, name)
-                        s_row = _require(by, (subtrahend_route, 0), cell, name)
-                        paired.append(_paired_row(contrast=name, cell=cell, metric=metric, budget=k,
-                                                  minuend_route=minuend_route, subtrahend_route=subtrahend_route,
+                if subtrahend_route == SA.ALLOCATION_BASELINE:
+                    # The allocation EFFECT is measured against the curve's OWN f=0 endpoint (B_d source
+                    # units), not against E1 (the complete source pool) -- both legs must hold the same
+                    # total budget or the contrast confounds budget size with composition.
+                    s_row = _require(by, (minuend_route, 0), cell, name)
+                    for f in SA.ALLOCATION_PERCENTS:
+                        if int(f) == 0:
+                            continue
+                        m_row = _require(by, (minuend_route, int(f)), cell, name)
+                        paired.append(_paired_row(contrast=name, cell=cell, metric=metric, budget=int(f),
+                                                  minuend_route=minuend_route,
+                                                  subtrahend_route=SA.ALLOCATION_BASELINE,
                                                   m_row=m_row, s_row=s_row))
+                elif subtrahend_route == SA.ANCHOR_GEOGRAPHIC_FULL_SOURCE:
+                    # Subtract the ordinary full-source geographic row (E1). Label access does not refit
+                    # a source-only probe, so this is the one complete-source leg for the whole suite.
+                    base = e1.get(cell)
+                    if base is None:
+                        raise ContrastError(
+                            f"missing full-source geographic (E1) row for {cell} -- budget_type=source, "
+                            f"label_budget=1.0, evaluation_split=test is required for contrast {name!r}"
+                        )
+                    if name == "additive_target_label_gain":
+                        for k in SA.LABEL_ACCESS_COUNTS:
+                            m_row = _require(by, (minuend_route, int(k)), cell, name)
+                            paired.append(_paired_row(contrast=name, cell=cell, metric=metric, budget=int(k),
+                                                      minuend_route=minuend_route,
+                                                      subtrahend_route=subtrahend_route,
+                                                      m_row=m_row, s_row=base))
+                    else:
+                        m_row = _require(by, (minuend_route, 0), cell, name)
+                        paired.append(_paired_row(contrast=name, cell=cell, metric=metric, budget=0,
+                                                  minuend_route=minuend_route,
+                                                  subtrahend_route=subtrahend_route,
+                                                  m_row=m_row, s_row=base))
                 elif minuend_route == SA.ANCHOR_SOURCE_ID_REFERENCE:
-                    # target_reference_deficit: minuend is the random_id full-source anchor.
                     anchor = anchors.get(cell[:4])
                     if anchor is None:
                         raise ContrastError(
@@ -257,46 +306,54 @@ def compute_contrasts(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
     return paired, _aggregate(paired)
 
 
-def _hierarchical_ci(seed_targets: list[np.ndarray]) -> tuple[float, float]:
-    """The repository's HIERARCHICAL uncertainty convention -- a nested percentile bootstrap that
-    captures BOTH seed and target-region variance.
+def _region_ci(target_means: np.ndarray) -> tuple[float, float]:
+    """Percentile bootstrap over TARGET REGIONS -- the unit of generalization.
 
-    ``seed_targets`` is one array of per-target contrast values PER SEED (targets NOT collapsed). Each
-    bootstrap draw: resample SEEDS with replacement; within every drawn seed resample THAT seed's
-    target-region rows with replacement and average them equally; then average the drawn seeds. A
-    seed-only bootstrap (over pre-collapsed per-seed means) would give a zero-width interval whenever the
-    seed means coincide even though the targets disagree; this does not. Fixed seed -> deterministic."""
-    if not seed_targets:
+    The input is one value per target region, already averaged across seeds. Regions are resampled with
+    replacement; seeds are NOT resampled, because seed noise is a property of the estimator rather than
+    of the population we generalize to, and is reported separately as ``std_across_seeds``. Bootstrapping
+    seeds jointly (the previous seed-first nested convention) mixed the two and let three seeds of one
+    region masquerade as three independent observations. Fixed seed -> deterministic."""
+    n = int(target_means.size)
+    if n < SA.MIN_HEADLINE_TARGETS:
         return float("nan"), float("nan")
     rng = np.random.default_rng(_CI_SEED)
-    n_seeds = len(seed_targets)
     boot = np.empty(_CI_BOOT)
     for b in range(_CI_BOOT):
-        drawn = rng.integers(0, n_seeds, n_seeds)               # resample seeds with replacement
-        seed_means = np.empty(n_seeds)
-        for j, si in enumerate(drawn):
-            t = seed_targets[si]
-            seed_means[j] = t[rng.integers(0, t.size, t.size)].mean()  # resample this seed's targets
-        boot[b] = seed_means.mean()                             # equal-seed average of drawn seeds
+        boot[b] = target_means[rng.integers(0, n, n)].mean()
     return float(np.percentile(boot, 2.5)), float(np.percentile(boot, 97.5))
 
 
 def _aggregate(paired: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    groups: dict[tuple, dict[Any, list[float]]] = defaultdict(lambda: defaultdict(list))
+    """Aggregate paired contrasts: pair within (target, seed), average seeds WITHIN each target, then
+    bootstrap target regions. Seed variation is reported separately rather than folded into the CI. A
+    benchmark aggregate resting on fewer than ``MIN_HEADLINE_TARGETS`` regions is refused a headline
+    interval (NaN CI + ``headline=False``) instead of publishing an interval no one should read."""
+    groups: dict[tuple, dict[Any, dict[Any, list[float]]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     prov: dict[tuple, dict[str, Any]] = {}
     for r in paired:
         gkey = (r["benchmark"], r["model"], r["probe_family"], r["metric"], r["contrast"], r["budget"])
-        groups[gkey][r["seed"]].append(r["difference"])   # per-target diffs kept, one list PER SEED
+        groups[gkey][r["target"]][r["seed"]].append(r["difference"])
         prov.setdefault(gkey, r)
     out: list[dict[str, Any]] = []
     for gkey in sorted(groups, key=lambda g: tuple(str(x) for x in g)):
-        by_seed = groups[gkey]
-        seeds = sorted(by_seed, key=lambda s: (s is None, s))
-        # POINT ESTIMATE: equal-region mean within each seed, then mean across seeds (unchanged).
-        per_seed = [float(np.mean(by_seed[s])) for s in seeds]
-        n_targets = sorted({len(by_seed[s]) for s in seeds})
-        # CI: the hierarchical seed->target bootstrap (targets are NOT collapsed before bootstrapping).
-        lo, hi = _hierarchical_ci([np.asarray(by_seed[s], dtype=float) for s in seeds])
+        by_target = groups[gkey]
+        targets = sorted(by_target, key=lambda t: str(t))
+        # 1) within a target: one value per seed, then 2) the seed-average for that target
+        per_target_seed = {
+            t: {s: float(np.mean(v)) for s, v in by_target[t].items()} for t in targets
+        }
+        target_means = np.asarray(
+            [float(np.mean(list(per_target_seed[t].values()))) for t in targets], dtype=float
+        )
+        # seed variation, reported SEPARATELY: spread of the equal-region seed means
+        seeds = sorted({s for t in targets for s in per_target_seed[t]}, key=lambda s: (s is None, s))
+        per_seed = [
+            float(np.mean([per_target_seed[t][s] for t in targets if s in per_target_seed[t]]))
+            for s in seeds
+        ]
+        headline = len(targets) >= SA.MIN_HEADLINE_TARGETS
+        lo, hi = _region_ci(target_means)
         r0 = prov[gkey]
         bench, model, probe, metric, contrast, budget = gkey
         out.append({
@@ -304,10 +361,11 @@ def _aggregate(paired: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "metric": metric, "metric_direction": metric_direction(metric), "budget": int(budget),
             "minuend_route": r0["minuend_route"], "subtrahend_route": r0["subtrahend_route"],
             "subtraction_order": r0["subtraction_order"], "region_weighting": "equal",
-            "mean_difference": float(np.mean(per_seed)), "std_difference": float(np.std(per_seed)),
-            "n_seeds": len(seeds), "ci_convention": _CI_CONVENTION,
-            "ci_lo": lo, "ci_hi": hi,
-            "n_targets_per_seed": ";".join(str(n) for n in n_targets),
+            "mean_difference": float(np.mean(target_means)),
+            "std_across_seeds": float(np.std(per_seed)) if per_seed else float("nan"),
+            "std_across_targets": float(np.std(target_means)),
+            "n_seeds": len(seeds), "n_targets": len(targets), "headline": bool(headline),
+            "ci_convention": _CI_CONVENTION, "ci_lo": lo, "ci_hi": hi,
         })
     return out
 

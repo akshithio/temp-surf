@@ -16,6 +16,10 @@ from utils import perfutils as perf
 
 VALID_RUN_STAGES = {"gen_embeddings", "probing"}
 
+#: The deployment evaluation scope, named once so the dense emitter and the dense
+#: completion planner can never disagree about it.
+_SA_EVAL_COMPLETE_TARGET = "complete_target"
+
 
 def validate_run_stages(run_stages: list[str]) -> set[str]:
     stages = set(run_stages)
@@ -187,6 +191,7 @@ def _probe_cell(
     budgets=None,
     source_val=None,
     source_test=None,
+    complete_target=None,
     write_predictions: bool = True,
 ) -> tuple[list[dict], list[dict]]:
     x_tr, x_cond_te = emb[train], emb[test]
@@ -194,7 +199,11 @@ def _probe_cell(
     x_val = emb[val] if len(val) else None
     y_val = y[val] if len(val) else None
     extra_evals = {}
-    for label, idx in (("source_validation", source_val), ("source_test", source_test)):
+    # ``complete_target`` (target pool ++ target test) is the geographic DEPLOYMENT estimand: the
+    # source-trained probe scored on the WHOLE held-out region, as opposed to the frozen ``target_test``
+    # subset used as the paired contrast operand. It reuses this same fit -- no extra probe.
+    for label, idx in (("source_validation", source_val), ("source_test", source_test),
+                       ("complete_target", complete_target)):
         if idx is not None and len(idx):
             extra_evals[label] = (emb[idx], y[idx], np.asarray(idx), np.asarray(groups)[idx])
     mname = meta.get("method", "?")
@@ -293,6 +302,27 @@ def _probe_cell_target(
     return rows, preds if write_predictions else []
 
 
+#: Label-access run configuration, pushed down from main.py's committed constants (same idiom as
+#: perf.PROBE_CAP) so a re-imported worker subprocess sees exactly these values and the run manifest
+#: records them verbatim. No plan/profile objects.
+LABEL_ACCESS_ENABLED: bool = True
+ALLOCATION_PERCENTS: tuple[int, ...] = (0, 25, 50, 75, 100)
+ADDITIVE_TARGET_COUNTS: tuple[int, ...] = (5, 10, 25, 50)
+FULL_TARGET_REFERENCE: bool = True
+FULL_COMBINED_REFERENCE: bool = True
+CONTROLLED_TOTAL_BUDGET_CAP: int | None = None
+
+
+def label_access_expected_rows():
+    """The expected (route, budget, evaluation_split) rows under THIS run's configuration."""
+    from evals import split_artifacts as _SA
+
+    return _SA.label_access_expected_rows(
+        tuple(ALLOCATION_PERCENTS), tuple(ADDITIVE_TARGET_COUNTS),
+        full_target_reference=FULL_TARGET_REFERENCE, full_combined_reference=FULL_COMBINED_REFERENCE,
+    )
+
+
 def _probe_cell_label_access(
     probe_fn,
     emb,
@@ -300,9 +330,9 @@ def _probe_cell_label_access(
     val,
     target_pool,
     target_test,
-    matched_source_ranked_idx,
-    fixed_source_removal_ranked_idx,
+    source_ranked_idx,
     target_ranked_idx,
+    benchmark_budget,
     y,
     groups,
     meta,
@@ -310,7 +340,8 @@ def _probe_cell_label_access(
     family="logistic",
     write_predictions: bool = True,
 ) -> tuple[list[dict], list[dict]]:
-    """One geographic_ood label-access cell: all 13 routes + the source_only complete-target diagnostic.
+    """One geographic_ood label-access cell: the fixed-budget allocation curve at the frozen benchmark
+    budget B_d, the additive appendix routes, and the optional full references -- all on target_test.
     Maps the frozen label-access order (CURRENT row indices, already validated against the split at load)
     to EXACT positions within the source-train / target-pool arrays, hard-failing if any index is not in
     its partition. Runs the whole suite in ONE call so source_only is fit once and its scorer reused."""
@@ -329,8 +360,7 @@ def _probe_cell_label_access(
             out[i] = pos[v]
         return out
 
-    matched = _to_positions(matched_source_ranked_idx, train, "matched_source")
-    fixed = _to_positions(fixed_source_removal_ranked_idx, train, "fixed_source_removal")
+    source = _to_positions(source_ranked_idx, train, "source")
     target = _to_positions(target_ranked_idx, target_pool, "target")
 
     g = np.asarray(groups) if groups is not None else None
@@ -346,7 +376,12 @@ def _probe_cell_label_access(
     ):
         probe_fn(
             rows, emb[train], emb[target_pool], emb[target_test], y[train], y[target_pool], y[target_test], seed,
-            matched_source_order=matched, fixed_removal_order=fixed, target_order=target,
+            source_order=source, target_order=target,
+            budget=int(benchmark_budget),
+            percents=tuple(ALLOCATION_PERCENTS), counts=tuple(ADDITIVE_TARGET_COUNTS),
+            controlled_cap=CONTROLLED_TOTAL_BUDGET_CAP,
+            full_target_reference=FULL_TARGET_REFERENCE,
+            full_combined_reference=FULL_COMBINED_REFERENCE,
             meta=meta,
             groups_source=g[train] if g is not None else None,
             groups_pool=g[target_pool] if g is not None else None,
@@ -416,6 +451,13 @@ def _run_segmentation_cell(
     source_test_patches = {int(p) for p in cfg.source_test_patches}
     if cfg.has_target and source_test_patches:
         eval_streams["source_test"] = lambda sp=source_test_patches: stream_dense(sp)
+    # The geographic DEPLOYMENT estimand: the full-source probe scored on the WHOLE held-out region
+    # (target label pool ++ target test), mirroring the tabular `complete_target_ref`. Label access no
+    # longer emits a source_only/complete_target row, so without this the dense geographic runs would
+    # carry no deployment score at all and compute_deltas would resolve no anchor.
+    if cfg.has_target and cfg.target_label_pool_patches:
+        _complete_patches = {int(p) for p in cfg.target_label_pool_patches} | {int(p) for p in test_patches}
+        eval_streams[_SA_EVAL_COMPLETE_TARGET] = lambda cp=_complete_patches: stream_dense(cp)
     rows: list[dict] = []
     EV.run_probes_segmentation(
         rows, x_train, x_val, y_train, y_val, seed,
@@ -436,7 +478,7 @@ def _run_segmentation_cell(
             # via load_pixels, which subsamples EACH patch deterministically (run seed + patch id) to a
             # per-patch cap sized so the largest route (all source base + whole pool) stays within
             # MAX_DENSE_PIXELS. It does NOT reuse the globally-subsampled x_train above (that stays the
-            # source-sweep training set). cap_patches threads the effective PROBE_CAP; patch_domain
+            # source-sweep training set). The controlled cap is applied to the budget; patch_domain
             # balances the base pool across source domains.
             n_units = len(cfg.source_train_patches) + len(cfg.target_label_pool_patches)
             per_patch_cap = max(1, int(max_dense_pixels) // max(1, n_units))
@@ -454,12 +496,16 @@ def _run_segmentation_cell(
                 source_patches=frozenset(int(p) for p in cfg.source_train_patches),
                 pool_patches=frozenset(pool_patches),
                 target_test_patches=frozenset(target_test_patches),
-                matched_source_order=label_access.matched_source_ranked_patches,
-                fixed_removal_order=label_access.fixed_source_removal_ranked_patches,
+                source_order=label_access.source_ranked_patches,
                 target_order=label_access.target_ranked_patches,
+                budget=int(label_access.benchmark_budget),
+                percents=tuple(ALLOCATION_PERCENTS), counts=tuple(ADDITIVE_TARGET_COUNTS),
+                controlled_cap=CONTROLLED_TOTAL_BUDGET_CAP,
+                full_target_reference=FULL_TARGET_REFERENCE,
+                full_combined_reference=FULL_COMBINED_REFERENCE,
                 load_pixels=_load_pixels, stream_eval=_stream_eval,
                 x_val=x_val, y_val=y_val, meta={**meta, "budget_type": "label_access"},
-                family=family, cap_patches=perf.PROBE_CAP, patch_domain=patch_domain,
+                family=family, patch_domain=patch_domain,
                 predictions_sink=predictions_sink,
             )
         else:
@@ -536,7 +582,8 @@ def _run_segmentation_pair(
             for _ld in splits_by_seed[_s]:
                 if _ld.regime == split_artifacts.LABEL_ACCESS_REGIME and _ld.split.supports_target_labels:
                     dense_la_by_cell[(_s, _ld.split.label)] = split_artifacts.load_dense_label_access(
-                        splits_root, bench_mod.BENCHMARK, _s, _ld.split, _ld.label_access_sha256
+                        splits_root, bench_mod.BENCHMARK, _s, _ld.split, _ld.label_access_sha256,
+                        benchmark_budget=_ld.label_access_budget
                     )
 
     bench_for_emb = bench.s2_only() if s2_only else bench
@@ -620,7 +667,7 @@ def _run_segmentation_pair(
     present_by_family: dict[tuple, set] = {}
     for r in rows:
         # Include the label_access_route (empty for non-label-access) so two same-budget routes
-        # (e.g. source_plus_target(25) vs fixed_total_mixed(25)) are never confused on resume.
+        # (e.g. source_plus_target(25) vs allocation@25%) are never confused on resume.
         present_by_family.setdefault(_fam_key(r), set()).add(
             (r.get("budget_type"), r.get("label_budget"), r.get("evaluation_split"), r.get("label_access_route", ""))
         )
@@ -653,6 +700,9 @@ def _run_segmentation_pair(
         splits = ("validation", "test")
         if has_source_diag.get((key[0], key[2], key[3]), False):
             splits = (*splits, "source_test")
+        # ...plus the deployment score on every target-bearing geographic cell (see eval_streams above)
+        if supports_target.get((key[0], key[2], key[3]), False):
+            splits = (*splits, _SA_EVAL_COMPLETE_TARGET)
         exp = {("source", b, s, "") for b in source_budgets for s in splits}
         if supports_target.get((key[0], key[2], key[3]), False):
             # geographic_ood headline runs the label-access suite; other target-label regimes

@@ -1,8 +1,6 @@
-"""Orchestrator for the frozen-embedding robustness pipeline.
-
-Edit the config block below, then run:
-
-    cd src && python main.py
+"""
+Orchestrator for the frozen-embedding robustness pipeline.
+cd src && python main.py
 """
 
 from __future__ import annotations
@@ -34,10 +32,29 @@ RUN_STAGES = ["gen_embeddings", "probing"]
 PROBE_CAP = None       # None = uncapped source-head training; or an int cap (probe-capacity check)
 PROBE_TUNING = False   # True = sweep the probe hyperparameter grid
 S2_ONLY = False        # True = restrict every model to the shared Sentinel-2 input (fairness ablation)
+# The ordinary source sweep is now a SINGLE full-source fit: it is the E1 reference the label-access
+# contrasts subtract, and label access no longer refits a source-only probe of its own. The target
+# sweep is retained only for the non-geographic target-label regime (spatial_cluster_ood).
 BUDGET_REGIMES = {
-    "source": [0.05, 0.10, 0.25, 1.0],
-    "target": [0, 5, 10, 25, 50, EV.TARGET_ID_UPPER_BOUND],
+    "source": [1.0],
+    "target": [0],
 }
+
+# ---- Label access (geographic_ood headline) --------------------------------
+# Direct knobs, edited per machine. No plan objects, no profile system: the run manifest records these
+# constants verbatim, so two boxes running different caps or fractions are distinguishable from the
+# manifest alone.
+RUN_LABEL_ACCESS = True
+#: fixed-budget allocation curve, as integer PERCENT of the frozen benchmark budget B_d
+ALLOCATION_PERCENTS = [0, 25, 50, 75, 100]
+#: additive appendix routes: absolute target-label counts added on top of the COMPLETE source pool
+ADDITIVE_TARGET_COUNTS = [5, 10, 25, 50]
+RUN_FULL_TARGET_REFERENCE = True
+RUN_FULL_COMBINED_REFERENCE = True
+#: ``C`` -- the controlled TOTAL label budget. The realized allocation budget is ``min(B_d, C)`` and the
+#: source/target mixture is built FROM that, so the cap constrains both probe families identically. One
+#: cap per run (E5 uses separate runs at 25k / 50k / 100k); None = uncapped.
+CONTROLLED_TOTAL_BUDGET_CAP = None
 MAX_DENSE_PIXELS = 50_000  # sampled pixels per PASTIS fold partition
 OVERWRITE_MODE = False
 STRICT_MODE = False
@@ -52,6 +69,12 @@ GPU_SHARDS = None
 # above -- no env var can override them, and a worker subprocess (which re-imports this file) gets
 # exactly these values.
 perf.PROBE_CAP = PROBE_CAP
+runstate.LABEL_ACCESS_ENABLED = RUN_LABEL_ACCESS
+runstate.ALLOCATION_PERCENTS = tuple(ALLOCATION_PERCENTS)
+runstate.ADDITIVE_TARGET_COUNTS = tuple(ADDITIVE_TARGET_COUNTS)
+runstate.FULL_TARGET_REFERENCE = RUN_FULL_TARGET_REFERENCE
+runstate.FULL_COMBINED_REFERENCE = RUN_FULL_COMBINED_REFERENCE
+runstate.CONTROLLED_TOTAL_BUDGET_CAP = CONTROLLED_TOTAL_BUDGET_CAP
 _probes.configure(tuning=PROBE_TUNING)
 
 runstate.validate_run_stages(RUN_STAGES)  # fail fast on a bad config edit
@@ -162,6 +185,7 @@ def _run_tabular_pair(
                 label_access_by_cell[(_ls.seed, _ls.split.label)] = split_artifacts.load_label_access(
                     splits_root, bench_mod.BENCHMARK, _ls.seed, _ls.split, _la_id_map,
                     _ls.label_access_sha256,
+                    benchmark_budget=_ls.label_access_budget,
                 )
 
     bench_for_emb = bench.s2_only() if s2_only else bench
@@ -243,17 +267,25 @@ def _run_tabular_pair(
 
     jobs = []
 
-    def _scopes(budget_type, b, source_diag=False):
+    def _scopes(budget_type, b, source_diag=False, deployment=False):
         if budget_type == "target":
             return ("full", "held_out") if b == 0 else ("held_out",)
         # source_test is the untouched within-source reference, evaluated alongside the primary eval
-        # (target_test for OOD) when the 80/10/10 split carries a source_test partition.
-        return ("test", "source_test") if source_diag else ("test",)
+        # (target_test for OOD) when the 80/10/10 split carries a source_test partition. complete_target
+        # is the deployment estimand (whole held-out region) on geographic_ood headline cells -- scored
+        # from the SAME full-source fit, which is why label access no longer needs a source_only route.
+        scopes = ["test"]
+        if source_diag:
+            scopes.append("source_test")
+        if deployment:
+            scopes.append(split_artifacts.EVAL_COMPLETE_TARGET)
+        return tuple(scopes)
 
-    def _missing(base, budget_type, expected, source_diag=False):
+    def _missing(base, budget_type, expected, source_diag=False, deployment=False):
         return [
             b for b in expected
-            if not all((*base, budget_type, b, sc, "") in done for sc in _scopes(budget_type, b, source_diag))
+            if not all((*base, budget_type, b, sc, "") in done
+                       for sc in _scopes(budget_type, b, source_diag, deployment))
         ]
 
     rerun_keys: set = set()
@@ -311,14 +343,25 @@ def _run_tabular_pair(
                 }
                 base = (seed, split_regime, split_label, mname, family)
                 has_source_diag = len(source_test_ref) > 0
+                # The geographic deployment score rides along on the full-source fit.
+                has_deployment = (
+                    supports_target_labels and split_regime == split_artifacts.LABEL_ACCESS_REGIME
+                )
+                complete_target_ref = (
+                    np.concatenate([st.target_label_pool, st.target_test])
+                    if has_deployment else np.empty(0, dtype=np.int64)
+                )
                 # Same key shape as `done` / `rerun_keys`: every scope of every budget this
                 # cell is planned to emit. Target-budget sweeps run ONLY when the regime supports
                 # target labels; official (has_target but supports_target_labels=False) is zero-shot.
-                is_label_access = supports_target_labels and split_regime == split_artifacts.LABEL_ACCESS_REGIME
+                is_label_access = (
+                    RUN_LABEL_ACCESS and supports_target_labels
+                    and split_regime == split_artifacts.LABEL_ACCESS_REGIME
+                )
                 # The source-budget sweep runs for EVERY regime (unchanged experiment; empty route id).
                 expected_keys.update(
                     (*base, "source", b, sc, "")
-                    for b in source_budgets for sc in _scopes("source", b, has_source_diag)
+                    for b in source_budgets for sc in _scopes("source", b, has_source_diag, has_deployment)
                 )
                 if is_label_access:
                     # geographic_ood headline: the 13-route label-access suite REPLACES the old target-
@@ -328,7 +371,7 @@ def _run_tabular_pair(
                     la = label_access_by_cell[(seed, split_label)]
                     cell_keys = [
                         (*base, "label_access", b, es, route)
-                        for (route, b, es) in split_artifacts.label_access_expected_rows()
+                        for (route, b, es) in runstate.label_access_expected_rows()
                     ]
                     expected_keys.update(cell_keys)
                     if not all(k in done for k in cell_keys):
@@ -336,8 +379,8 @@ def _run_tabular_pair(
                         jobs.append(
                             delayed(runstate._probe_cell_label_access)(
                                 probe_fn_la, emb, train, val, st.target_label_pool, st.target_test,
-                                la.matched_source_ranked_idx, la.fixed_source_removal_ranked_idx,
-                                la.target_ranked_idx, y, groups,
+                                la.source_ranked_idx, la.target_ranked_idx,
+                                la.benchmark_budget, y, groups,
                                 {**meta, "budget_type": "label_access"}, seed, family,
                                 write_predictions=write_predictions,
                             )
@@ -359,9 +402,9 @@ def _run_tabular_pair(
                                     write_predictions=write_predictions,
                                 )
                             )
-                todo_src = _missing(base, "source", source_budgets, has_source_diag)
+                todo_src = _missing(base, "source", source_budgets, has_source_diag, has_deployment)
                 if todo_src:
-                    rerun_keys.update((*base, "source", b, sc, "") for b in todo_src for sc in _scopes("source", b, has_source_diag))
+                    rerun_keys.update((*base, "source", b, sc, "") for b in todo_src for sc in _scopes("source", b, has_source_diag, has_deployment))
                     for budget in todo_src:
                         jobs.append(
                             delayed(runstate._probe_cell)(
@@ -378,6 +421,7 @@ def _run_tabular_pair(
                                 [budget],
                                 None,               # no source_validation diagnostic (source_val is the calibration set)
                                 source_test_ref,    # the untouched within-source reference (source_test scope)
+                                complete_target_ref,  # deployment estimand: the whole held-out region
                                 write_predictions=write_predictions,
                             )
                         )

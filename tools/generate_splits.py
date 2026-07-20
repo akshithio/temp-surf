@@ -123,7 +123,7 @@ def generate_tabular(root, bench, bench_mod, regime, seed, *, audit_only):
 
     regime_base.clear_split_audit_events()
     events = regime_base.SPLIT_AUDIT_EVENTS
-    entries, prev = [], 0
+    entries, candidates, prev = [], [], 0
     for split in regime_mod.iter_source_target_splits(bench, bench_mod, seed):
         window = list(events[prev:len(events)])
         prev = len(events)
@@ -132,41 +132,34 @@ def generate_tabular(root, bench, bench_mod, regime, seed, *, audit_only):
             split=split, domains=domains, labels=y, sample_ids=sample_ids,
             audit_events=window, purge_km=purge_km,
         )
-        # Validation-before-write (NOT atomic publication): both artifacts are constructed + validated
-        # against the frozen split BEFORE either is written, so a validation failure (feasibility /
-        # structure) never publishes anything for the leaf. The two writes below remain sequential --
-        # there is no staging/atomic rename -- so a write-time I/O failure after assignments.csv could
-        # still leave a partial leaf. Assignments rows were validated in build_tabular_leaf; the
-        # geographic_ood label-access order is constructed + validated here in BOTH audit and write
-        # mode. An included headline target that cannot support every configured count is a hard failure
-        # -- never clamped. Supplementary / no-target-training targets stay out.
-        la_rows = None
+        # Assignments rows were validated in build_tabular_leaf and are written here. The label-access
+        # order canNOT be finalized at this point: B_d is a BENCHMARK-common budget derived from the
+        # minimum over every eligible (target, seed) cell, so no single leaf knows it yet. This loop only
+        # COLLECTS the candidate populations; eligibility, B_d, allocation construction, the realized
+        # validity audit and the writes all happen once per benchmark in _finalize_label_access().
         if regime == SA.LABEL_ACCESS_REGIME and split.supports_target_labels:
             src_ids = [str(sample_ids[int(i)]) for i in split.source_train]
             pool_ids = [str(sample_ids[int(i)]) for i in split.target_label_pool]
             test_ids = [str(sample_ids[int(i)]) for i in split.target_test]
-            where = f"{bench_mod.BENCHMARK}/{regime}/{seed}/{split.label}/{SA.LABEL_ACCESS_FILENAME}"
-            SA.assert_label_access_feasible(len(src_ids), len(pool_ids), where=where)
-            la_rows = SA.build_label_access_rows(
-                seed=seed, source_ids=src_ids, target_pool_ids=pool_ids, target_test_ids=test_ids, where=where,
-            )
-            SA.validate_label_access_rows(
-                la_rows, source_ids=src_ids, target_pool_ids=pool_ids, target_test_ids=test_ids, where=where,
-            )
+            candidates.append({
+                "seed": int(seed), "holdout": str(split.label),
+                "source_ids": src_ids, "pool_ids": pool_ids, "test_ids": test_ids,
+                "n_source": len(src_ids), "n_target_pool": len(pool_ids),
+                # one singleton class set per sample, keyed by stable id (dense uses real patch sets)
+                "class_of": {
+                    **{s: frozenset({str(y[int(i)])}) for s, i in zip(src_ids, split.source_train, strict=True)},
+                    **{s: frozenset({str(y[int(i)])}) for s, i in zip(pool_ids, split.target_label_pool, strict=True)},
+                },
+                "summary": summary,
+            })
         if not audit_only:
             _path, sha = SA.write_assignments(root, bench_mod.BENCHMARK, regime, seed, str(split.label), rows)
             summary["sha256"] = sha
-            if la_rows is not None:
-                la_path, la_sha = SA.write_label_access(root, bench_mod.BENCHMARK, seed, str(split.label), la_rows)
-                # The frozen label DRAW is bound as tightly as the frozen partitions: a different valid
-                # permutation passes every structural check but changes every matched/fixed-total route.
-                summary["label_access_csv"] = str(la_path.relative_to(root))
-                summary["label_access_sha256"] = la_sha
         entries.append(summary)
     _check_expected_coverage(
         regime, bench_mod.BENCHMARK, seed, _expected_tabular_labels(regime, bench_mod), [e["holdout"] for e in entries]
     )
-    return entries
+    return entries, candidates
 
 
 def _dense_cache(bench):
@@ -185,7 +178,7 @@ def generate_dense(root, bench, bench_mod, regime, seed, *, audit_only, dense_ca
 
     regime_base.clear_split_audit_events()
     events = regime_base.SPLIT_AUDIT_EVENTS
-    entries, prev = [], 0
+    entries, candidates, prev = [], [], 0
     for dense_split in regime_mod.iter_dense_source_target_splits(bench, bench_mod, seed):
         window = list(events[prev:len(events)])
         prev = len(events)
@@ -194,37 +187,142 @@ def generate_dense(root, bench, bench_mod, regime, seed, *, audit_only, dense_ca
             all_patch_ids=dense_cache["all_patch_ids"], domain_of=domain_of,
             class_sets=dense_cache["class_sets"], patch_latlon=dense_cache["patch_latlon"], purge_km=purge_km,
         )
-        # Same label-access contract as tabular, at PATCH granularity: the geographic_ood headline target
-        # carries a frozen label_access.csv over stable patch ids (two source orders + one target order),
-        # constructed + validated in BOTH audit and write mode. Feasibility is a hard failure -- never
-        # clamped. Patches are never split; the orders rank WHOLE patches.
-        la_rows = None
+        # Same benchmark-global label-access contract as tabular, at PATCH granularity: collect the
+        # candidate populations now; B_d, eligibility, the allocation audit and the writes happen once
+        # per benchmark in _finalize_label_access(). Patches are never split; the order ranks WHOLE
+        # patches, and a patch's whole class set is what the allocation audit sees.
         if regime == SA.LABEL_ACCESS_REGIME and dense_split.supports_target_labels:
             src_ids = [str(int(p)) for p in sorted(dense_split.source_train_patches)]
             pool_ids = [str(int(p)) for p in sorted(dense_split.target_label_pool_patches)]
             test_ids = [str(int(p)) for p in sorted(dense_split.target_test_patches)]
-            where = f"{bench_mod.BENCHMARK}/{regime}/{seed}/{dense_split.label}/{SA.LABEL_ACCESS_FILENAME}"
-            SA.assert_label_access_feasible(len(src_ids), len(pool_ids), where=where)
-            la_rows = SA.build_label_access_rows(
-                seed=seed, source_ids=src_ids, target_pool_ids=pool_ids, target_test_ids=test_ids, where=where,
-            )
-            SA.validate_label_access_rows(
-                la_rows, source_ids=src_ids, target_pool_ids=pool_ids, target_test_ids=test_ids, where=where,
-            )
+            class_sets = dense_cache["class_sets"]
+            candidates.append({
+                "seed": int(seed), "holdout": str(dense_split.label),
+                "source_ids": src_ids, "pool_ids": pool_ids, "test_ids": test_ids,
+                "n_source": len(src_ids), "n_target_pool": len(pool_ids),
+                "class_of": {
+                    s: frozenset(str(c) for c in class_sets.get(int(s), ()))
+                    for s in (*src_ids, *pool_ids)
+                },
+                "summary": summary,
+            })
         if not audit_only:
             _path, sha = SA.write_assignments(root, bench_mod.BENCHMARK, regime, seed, str(dense_split.label), rows)
             summary["sha256"] = sha
-            if la_rows is not None:
-                la_path, la_sha = SA.write_label_access(
-                    root, bench_mod.BENCHMARK, seed, str(dense_split.label), la_rows
-                )
-                summary["label_access_csv"] = str(la_path.relative_to(root))
-                summary["label_access_sha256"] = la_sha
         entries.append(summary)
     _check_expected_coverage(
         regime, bench_mod.BENCHMARK, seed, _expected_dense_labels(regime, bench_mod), [e["holdout"] for e in entries]
     )
-    return entries
+    return entries, candidates
+
+
+def _finalize_label_access(root, benchmark, candidates, *, audit_only):
+    """The benchmark-global label-access pass, in the one order that is scientifically defensible:
+
+      1. predeclared ELIGIBILITY over every (target, seed) cell -- sizing only, no peeking at results
+      2. ``B_d = min(B_max,d, min-cell N_source, min-cell N_target)`` over the ELIGIBLE cells ONLY
+      3. construct the frozen order and the five allocation sets from that B_d
+      4. AUDIT the realized sets for scientific validity (class collapse, undrawable fractions)
+      5. DEMOTE any target failing the audit to supplementary stress
+      6. a benchmark left with fewer than ``MIN_HEADLINE_TARGETS`` targets is omitted from the headline
+         allocation aggregate (its targets remain as supplementary stress)
+
+    Computing B_d BEFORE the audit is what keeps demotion non-vacuous: eligibility answers "is this
+    region big enough to take part in the budget at all", while the audit answers "does the budget's
+    realized allocation actually train". Excluding ineligible cells from step 2 is what stops one tiny
+    region from dragging the whole benchmark's budget down. Writes each survivor's label_access.csv and
+    records the entire decision -- B_d, eligibility, exclusions, fractions, realized counts -- on the
+    per-leaf summaries that become ``splits.json``."""
+    if not candidates:
+        return
+    spec = split_spec.ALL_SPECS[benchmark]
+    unit = SA.label_access_unit(benchmark)
+    eligible, demoted = [], {}
+    for c in candidates:
+        why = SA.label_access_eligibility(n_source=c["n_source"], n_target_pool=c["n_target_pool"])
+        if why:
+            demoted[(c["seed"], c["holdout"])] = list(why)
+        else:
+            eligible.append(c)
+    if not eligible:
+        raise SA.SplitArtifactError(
+            f"{benchmark}: no geographic_ood target is eligible for the label-access contract -- "
+            f"{len(demoted)} cell(s) failed the predeclared sizing rules"
+        )
+    b_d = SA.benchmark_budget(eligible, spec.max_label_budget)
+
+    survivors = []
+    for c in eligible:
+        where = f"{benchmark}/{SA.LABEL_ACCESS_REGIME}/{c['seed']}/{c['holdout']}/{SA.LABEL_ACCESS_FILENAME}"
+        rows = SA.build_label_access_rows(
+            seed=c["seed"], source_ids=c["source_ids"], target_pool_ids=c["pool_ids"],
+            target_test_ids=c["test_ids"], where=where,
+        )
+        SA.validate_label_access_rows(
+            rows, source_ids=c["source_ids"], target_pool_ids=c["pool_ids"],
+            target_test_ids=c["test_ids"], where=where,
+        )
+        src_ranked, tgt_ranked = SA.ranked_ids(rows)
+        cls = c["class_of"]
+        problems = SA.audit_allocation(
+            source_classes=[cls[s] for s in src_ranked], target_classes=[cls[s] for s in tgt_ranked],
+            budget=b_d, where=where,
+        )
+        if problems:
+            demoted[(c["seed"], c["holdout"])] = problems
+            continue
+        c["rows"] = rows
+        survivors.append(c)
+
+    headline_targets = sorted({c["holdout"] for c in survivors})
+    headline_ok = len(headline_targets) >= SA.MIN_HEADLINE_TARGETS
+    fractions = [
+        {
+            "percent": int(f),
+            "n_target_labels": SA.allocation_target_count(f, b_d),
+            "n_source_labels": int(b_d) - SA.allocation_target_count(f, b_d),
+            "n_total_labels": int(b_d),
+        }
+        for f in SA.ALLOCATION_PERCENTS
+    ]
+    for c in survivors:
+        c["summary"]["label_access"] = {
+            "headline_eligible": bool(headline_ok),
+            "benchmark_budget": int(b_d),
+            "max_label_budget": (None if spec.max_label_budget is None else int(spec.max_label_budget)),
+            "unit": unit,
+            "n_source_pool": int(c["n_source"]),
+            "n_target_pool": int(c["n_target_pool"]),
+            "allocation_fractions": fractions,
+            "additive_counts": list(SA.LABEL_ACCESS_COUNTS),
+            "headline_targets": headline_targets,
+        }
+    by_key = {(c["seed"], c["holdout"]): c for c in candidates}
+    for key, why in sorted(demoted.items()):
+        cand = by_key.get(key)
+        if cand is None:
+            continue
+        cand["summary"]["label_access"] = {
+            "headline_eligible": False,
+            "excluded": True,
+            "exclusion_reasons": list(why),
+            "benchmark_budget": int(b_d),
+            "unit": unit,
+        }
+
+    if not audit_only:
+        for c in survivors:
+            # The frozen label DRAW is bound as tightly as the frozen partitions: a different valid
+            # permutation passes every structural check but silently changes every allocation point.
+            la_path, la_sha = SA.write_label_access(root, benchmark, c["seed"], c["holdout"], c["rows"])
+            c["summary"]["label_access_csv"] = str(la_path.relative_to(root))
+            c["summary"]["label_access_sha256"] = la_sha
+    print(
+        f"  [label-access] {benchmark}: B_d={b_d} {unit} over {len(eligible)} eligible cell(s); "
+        f"{len(survivors)} survivor(s), {len(demoted)} demoted; {len(headline_targets)} headline target(s)"
+        f"{'' if headline_ok else f' -- FEWER THAN {SA.MIN_HEADLINE_TARGETS}, omitted from headline aggregate'}",
+        flush=True,
+    )
 
 
 def generate_benchmark(root, benchmark, *, audit_only):
@@ -236,15 +334,20 @@ def generate_benchmark(root, benchmark, *, audit_only):
     regimes = [r for r in REGIMES if r in supported]
 
     dense_cache = _dense_cache(bench) if dense else None
-    entries = []
+    entries, la_candidates = [], []
     for seed in SEEDS:
         for regime in regimes:
             if dense:
-                leaves = generate_dense(root, bench, bench_mod, regime, seed, audit_only=audit_only, dense_cache=dense_cache)
+                leaves, cands = generate_dense(
+                    root, bench, bench_mod, regime, seed, audit_only=audit_only, dense_cache=dense_cache
+                )
             else:
-                leaves = generate_tabular(root, bench, bench_mod, regime, seed, audit_only=audit_only)
+                leaves, cands = generate_tabular(root, bench, bench_mod, regime, seed, audit_only=audit_only)
             entries.extend(leaves)
+            la_candidates.extend(cands)
             print(f"  {benchmark}/{regime}/seed={seed}: {len(leaves)} leaf(s)", flush=True)
+    # Benchmark-global: B_d spans every eligible (target, seed) cell, so this must run after all seeds.
+    _finalize_label_access(root, bench_mod.BENCHMARK, la_candidates, audit_only=audit_only)
     return entries
 
 

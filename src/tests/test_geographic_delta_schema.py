@@ -1,13 +1,15 @@
 """Geographic ID-to-OOD deltas under the schema-v2 label-access row shape.
 
-The label-access suite replaced the legacy target-budget sweep for ``geographic_ood``, so the
-deployment OOD score now arrives as ``budget_type="label_access"`` / ``label_access_route="source_only"``
-/ ``evaluation_split="complete_target"`` instead of ``budget_type="target"`` / ``label_budget=0``.
+The label-access suite replaced the legacy target-budget sweep for ``geographic_ood``, and it no longer
+refits a ``source_only`` probe: the deployment OOD score now arrives as the ordinary full-source (E1)
+row -- ``budget_type="source"`` / ``label_budget=1.0`` -- scored on
+``evaluation_split="complete_target"``, instead of ``budget_type="target"`` / ``label_budget=0``.
 Selecting only the legacy shape produced an EMPTY ``deltas.csv`` that still certified as complete.
 
-These tests pin: the new shape resolves, it agrees numerically with the legacy shape, the two
-source-only rows are not confused (complete_target is the deployment score, target_test is the paired
-contrast operand), and an empty/incomplete delta table can no longer certify a run that should have one.
+These tests pin: the new shape resolves, it agrees numerically with the legacy shape, the two SCOPES of
+the one E1 fit are not confused (complete_target is the deployment score, the frozen target_test is the
+paired contrast operand), and an empty/incomplete delta table can no longer certify a run that should
+have one.
 """
 
 from __future__ import annotations
@@ -39,6 +41,15 @@ def _la_row(route, es, value, *, holdout="kenya", seed=0, budget=0):
                 **{METRIC: value})
 
 
+def _e1_row(es, value, *, holdout="kenya", seed=0, metric=METRIC):
+    """The ordinary full-source geographic row (E1). ONE fit, two scopes: ``complete_target`` is the
+    deployment OOD score, ``test`` (the frozen target_test) is the paired contrast operand. The retired
+    ``source_only`` label-access route used to carry both."""
+    return _row(split_regime="geographic_ood", holdout=holdout, budget_type="source",
+                label_budget=1.0, evaluation_split=es, label_access_route="", seed=seed,
+                **{metric: value})
+
+
 def _legacy_ood_row(value, *, holdout="kenya", seed=0, budget=0, es="full"):
     return _row(split_regime="geographic_ood", holdout=holdout, budget_type="target",
                 label_budget=budget, evaluation_split=es, label_access_route="", seed=seed,
@@ -51,8 +62,8 @@ def _legacy_ood_row(value, *, holdout="kenya", seed=0, budget=0, es="full"):
 def test_new_schema_geographic_pair_produces_a_nonempty_delta():
     rows = [
         _id_row(0.80),
-        _la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, 0.50, holdout="kenya"),
-        _la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, 0.60, holdout="brazil"),
+        _e1_row(SA.EVAL_COMPLETE_TARGET, 0.50, holdout="kenya"),
+        _e1_row(SA.EVAL_COMPLETE_TARGET, 0.60, holdout="brazil"),
     ]
     deltas = IOU.compute_deltas(rows, [METRIC])
     assert len(deltas) == 1
@@ -68,8 +79,8 @@ def test_new_and_legacy_schemas_yield_the_same_delta():
     id_row = _id_row(0.80)
     new = IOU.compute_deltas(
         [id_row,
-         _la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, 0.50, holdout="kenya"),
-         _la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, 0.60, holdout="brazil")],
+         _e1_row(SA.EVAL_COMPLETE_TARGET, 0.50, holdout="kenya"),
+         _e1_row(SA.EVAL_COMPLETE_TARGET, 0.60, holdout="brazil")],
         [METRIC],
     )
     legacy = IOU.compute_deltas(
@@ -83,40 +94,43 @@ def test_new_and_legacy_schemas_yield_the_same_delta():
 
 
 def test_complete_target_is_the_deployment_score_not_target_test():
-    """Both source_only rows exist in a real run; only the complete_target one is the OOD score."""
+    """Both E1 scopes exist in a real run; only the complete_target one is the OOD score."""
     rows = [
         _id_row(0.80),
-        _la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, 0.50),   # deployment score
-        _la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_TARGET_TEST, 0.30),       # paired contrast operand
+        _e1_row(SA.EVAL_COMPLETE_TARGET, 0.50),   # deployment score
+        _e1_row("test", 0.30),                    # paired contrast operand
     ]
     d = IOU.compute_deltas(rows, [METRIC])[0]
     assert d["ood"] == pytest.approx(0.50)
     assert d["n_ood"] == 1
 
 
-def test_target_test_source_only_is_the_operand_paired_with_the_reference():
+def test_target_test_full_source_is_the_operand_paired_with_the_reference():
     """ood_matched pairs with the target reference on IDENTICAL target_test examples."""
     rows = [
         _id_row(0.80),
-        _la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, 0.50),
-        _la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_TARGET_TEST, 0.30),
+        _e1_row(SA.EVAL_COMPLETE_TARGET, 0.50),
+        _e1_row("test", 0.30),
         _la_row(SA.ROUTE_TARGET_ONLY_FULL, SA.EVAL_TARGET_TEST, 0.70),
     ]
     d = IOU.compute_deltas(rows, [METRIC])[0]
     assert d["ood"] == pytest.approx(0.50)              # deployment score: complete_target
     assert d["target_id"] == pytest.approx(0.70)        # reference: target_only_full on target_test
-    assert d["ood_matched"] == pytest.approx(0.30)      # operand: source_only on target_test
+    assert d["ood_matched"] == pytest.approx(0.30)      # operand: E1 on the frozen target_test
     assert d["adjusted_delta"] == pytest.approx(0.40)   # 0.70 - 0.30, both on target_test
 
 
 def test_route_qualification_separates_rows_sharing_budget_and_eval_split():
-    """source_only and target_only_full share seed/budget/eval split -- only the route distinguishes them."""
+    """The label-access routes share seed, budget 0 and evaluation split -- only ``label_access_route``
+    distinguishes ``target_only_full`` from the other zero-budget routes, and only ``budget_type``
+    separates the whole family from the E1 source row."""
     rows = [
         _id_row(0.80),
-        _la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_TARGET_TEST, 0.30),
+        _e1_row("test", 0.30),
         _la_row(SA.ROUTE_TARGET_ONLY_FULL, SA.EVAL_TARGET_TEST, 0.70),
-        _la_row(SA.ROUTE_MATCHED_TARGET, SA.EVAL_TARGET_TEST, 0.65),
-        _la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, 0.50),
+        _la_row(SA.ROUTE_SOURCE_PLUS_TARGET_FULL, SA.EVAL_TARGET_TEST, 0.65),
+        _la_row(SA.ROUTE_FIXED_BUDGET_ALLOCATION, SA.EVAL_TARGET_TEST, 0.45),
+        _e1_row(SA.EVAL_COMPLETE_TARGET, 0.50),
     ]
     d = IOU.compute_deltas(rows, [METRIC])[0]
     assert d["ood"] == pytest.approx(0.50)
@@ -127,19 +141,19 @@ def test_route_qualification_separates_rows_sharing_budget_and_eval_split():
 def test_worst_region_uses_the_new_schema_anchor():
     rows = [
         _id_row(0.80),
-        _la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, 0.20, holdout="kenya"),
-        _la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, 0.60, holdout="brazil"),
+        _e1_row(SA.EVAL_COMPLETE_TARGET, 0.20, holdout="kenya"),
+        _e1_row(SA.EVAL_COMPLETE_TARGET, 0.60, holdout="brazil"),
     ]
     d = IOU.compute_deltas(rows, [METRIC])[0]
     assert d["ood_worst_region"] == pytest.approx(0.20)
 
 
 def test_supplementary_stress_targets_stay_out_of_the_new_schema_aggregation():
-    stress = _la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, 0.05, holdout="tanzania")
+    stress = _e1_row(SA.EVAL_COMPLETE_TARGET, 0.05, holdout="tanzania")
     stress["target_role"] = "supplementary_stress"
     rows = [
         _id_row(0.80),
-        _la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, 0.50, holdout="kenya"),
+        _e1_row(SA.EVAL_COMPLETE_TARGET, 0.50, holdout="kenya"),
         stress,
     ]
     d = IOU.compute_deltas(rows, [METRIC])[0]
@@ -149,7 +163,7 @@ def test_supplementary_stress_targets_stay_out_of_the_new_schema_aggregation():
 
 def test_regime_discovery_sees_label_access_rows():
     """Discovery gated on budget_type=='target' alone found nothing once geographic_ood moved schema."""
-    rows = [_id_row(0.80), _la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, 0.50)]
+    rows = [_id_row(0.80), _e1_row(SA.EVAL_COMPLETE_TARGET, 0.50)]
     assert IOU.compute_deltas(rows, [METRIC])[0]["ood_regime"] == "geographic_ood"
 
 
@@ -157,7 +171,7 @@ def test_anchor_order_prefers_the_new_schema_over_a_stale_legacy_row():
     """A tree carrying both shapes resolves on the schema-v2 row, never the historical one."""
     rows = [
         _id_row(0.80),
-        _la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, 0.50),
+        _e1_row(SA.EVAL_COMPLETE_TARGET, 0.50),
         _legacy_ood_row(0.10),          # stale pre-label-access row for the same cell
     ]
     assert IOU.compute_deltas(rows, [METRIC])[0]["ood"] == pytest.approx(0.50)
@@ -167,15 +181,20 @@ def test_anchor_order_prefers_the_new_schema_over_a_stale_legacy_row():
 # an empty / incomplete delta table can no longer certify
 # --------------------------------------------------------------------------- #
 def _geographic_rows():
-    return [_id_row(0.80), _la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, 0.50)]
+    """A real geographic run: the random_id reference, the E1 deployment score, and the label-access
+    suite that makes the run a geographic one."""
+    return [
+        _id_row(0.80),
+        _e1_row(SA.EVAL_COMPLETE_TARGET, 0.50),
+        _e1_row("test", 0.30),
+        _la_row(SA.ROUTE_TARGET_ONLY_FULL, SA.EVAL_TARGET_TEST, 0.70),
+    ]
 
 
 def test_expects_geographic_deltas_requires_both_legs():
     assert artifacts.expects_geographic_deltas(_geographic_rows())
-    assert not artifacts.expects_geographic_deltas([_id_row(0.80)])
-    assert not artifacts.expects_geographic_deltas(
-        [_la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, 0.50)]
-    )
+    assert not artifacts.expects_geographic_deltas([_id_row(0.80)])            # no OOD leg
+    assert not artifacts.expects_geographic_deltas(_geographic_rows()[1:])     # no random_id leg
 
 
 @pytest.mark.parametrize("content", ["", "\n", "   \n"])
@@ -223,12 +242,22 @@ def test_a_run_with_no_geographic_rows_is_not_forced_to_have_deltas(tmp_path):
 
 
 def test_anchor_specs_cover_both_schemas():
-    """The legacy shape stays reachable for historical trees; the new shape is tried first."""
+    """The legacy shape stays reachable for historical trees; the new shape is tried first. The new
+    deployment anchor is the ordinary full-source row -- there is no ``source_only`` route to name."""
     new, legacy = confounds._ood_anchors(0.0)
-    assert (new.budget_type, new.route, new.eval_splits) == (
-        "label_access", SA.ROUTE_SOURCE_ONLY, (SA.EVAL_COMPLETE_TARGET,)
+    assert (new.budget_type, new.budget, new.route, new.eval_splits) == (
+        "source", 1.0, "", (SA.EVAL_COMPLETE_TARGET,)
     )
     assert legacy.budget_type == "target" and legacy.route == ""
+    matched_new, _matched_legacy = confounds._ood_matched_anchors(0.0)
+    assert (matched_new.budget_type, matched_new.budget, matched_new.route, matched_new.eval_splits) == (
+        "source", 1.0, "", ("test",)
+    )
+    ref_new, _ref_legacy = confounds._target_reference_anchors(-1.0)
+    assert (ref_new.budget_type, ref_new.route, ref_new.eval_splits) == (
+        "label_access", SA.ROUTE_TARGET_ONLY_FULL, (SA.EVAL_TARGET_TEST,)
+    )
+    assert not any(hasattr(SA, n) for n in ("ROUTE_SOURCE_ONLY", "ROUTE_MATCHED_TARGET"))
 
 
 # --------------------------------------------------------------------------- #
@@ -246,8 +275,8 @@ def test_worst_region_averages_each_target_over_seeds_before_ranking():
     """
     rows = [_id_row(0.80, seed=0), _id_row(0.80, seed=1)]
     for seed, (kenya, brazil) in enumerate([(0.1, 0.9), (0.9, 0.1)]):
-        rows.append(_la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, kenya, holdout="kenya", seed=seed))
-        rows.append(_la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, brazil, holdout="brazil", seed=seed))
+        rows.append(_e1_row(SA.EVAL_COMPLETE_TARGET, kenya, holdout="kenya", seed=seed))
+        rows.append(_e1_row(SA.EVAL_COMPLETE_TARGET, brazil, holdout="brazil", seed=seed))
     d = IOU.compute_deltas(rows, [METRIC])[0]
     assert d["ood_worst_region"] == pytest.approx(0.5)
     assert d["ood_worst_region"] != pytest.approx(0.1)
@@ -257,8 +286,8 @@ def test_worst_region_picks_the_genuinely_worst_target_not_the_noisiest():
     """A target that is consistently mediocre must lose to one that is consistently bad."""
     rows = [_id_row(0.80, seed=0), _id_row(0.80, seed=1)]
     for seed, (bad, ok) in enumerate([(0.20, 0.60), (0.24, 0.64)]):
-        rows.append(_la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, bad, holdout="sudan", seed=seed))
-        rows.append(_la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, ok, holdout="kenya", seed=seed))
+        rows.append(_e1_row(SA.EVAL_COMPLETE_TARGET, bad, holdout="sudan", seed=seed))
+        rows.append(_e1_row(SA.EVAL_COMPLETE_TARGET, ok, holdout="kenya", seed=seed))
     d = IOU.compute_deltas(rows, [METRIC])[0]
     assert d["ood_worst_region"] == pytest.approx(0.22)          # sudan's seed-mean
     assert d["ood_worst_region_std"] == pytest.approx(0.02)      # spread of THAT region
@@ -273,9 +302,7 @@ def test_worst_region_respects_metric_direction_after_seed_averaging():
     ]
     for seed, (kenya, brazil) in enumerate([(0.20, 0.60), (0.60, 0.20)]):
         for holdout, v in (("kenya", kenya), ("brazil", brazil)):
-            rows.append(_row(split_regime="geographic_ood", holdout=holdout, budget_type="label_access",
-                             label_budget=0, evaluation_split=SA.EVAL_COMPLETE_TARGET,
-                             label_access_route=SA.ROUTE_SOURCE_ONLY, seed=seed, brier=v))
+            rows.append(_e1_row(SA.EVAL_COMPLETE_TARGET, v, holdout=holdout, seed=seed, metric="brier"))
     d = IOU.compute_deltas(rows, ["brier"])[0]
     # both regions average to 0.40; the worst (max, since lower is better) is 0.40 -- not the 0.60
     # a within-seed worst-then-average would have produced
@@ -283,11 +310,11 @@ def test_worst_region_respects_metric_direction_after_seed_averaging():
 
 
 def test_worst_region_still_excludes_supplementary_stress_targets():
-    stress = _la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, 0.01, holdout="tanzania")
+    stress = _e1_row(SA.EVAL_COMPLETE_TARGET, 0.01, holdout="tanzania")
     stress["target_role"] = "supplementary_stress"
     rows = [
         _id_row(0.80),
-        _la_row(SA.ROUTE_SOURCE_ONLY, SA.EVAL_COMPLETE_TARGET, 0.50, holdout="kenya"),
+        _e1_row(SA.EVAL_COMPLETE_TARGET, 0.50, holdout="kenya"),
         stress,
     ]
     assert IOU.compute_deltas(rows, [METRIC])[0]["ood_worst_region"] == pytest.approx(0.50)

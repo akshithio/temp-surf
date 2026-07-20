@@ -45,13 +45,21 @@ def freeze(root, built) -> list[dict[str, Any]]:
     return entries
 
 
-def attach_label_access(root, benchmark, seed, holdout, la_rows) -> str:
-    """Write a leaf's label_access.csv AFTER the log was frozen, recording its sha256 on the entry.
+def attach_label_access(root, benchmark, seed, holdout, la_rows, *, benchmark_budget=None) -> str:
+    """Write a leaf's label_access.csv AFTER the log was frozen, recording its sha256 AND the
+    ``label_access`` block on the entry.
 
     The loaders verify that checksum, so a fixture that writes the file without updating the central
-    log would be refused -- exactly as a real tampered or regenerated draw would be.
+    log would be refused -- exactly as a real tampered or regenerated draw would be. They also REQUIRE
+    the recorded ``benchmark_budget`` (B_d), without which the fixed-budget allocation curve is
+    undefined; when not given it is derived from this leaf alone, the way
+    :func:`SA.benchmark_budget` derives it from the eligible cells.
     """
     la_path, sha = SA.write_label_access(root, benchmark, seed, holdout, la_rows)
+    n_source = sum(1 for r in la_rows if r["population"] == SA.POP_SOURCE)
+    n_pool = sum(1 for r in la_rows if r["population"] == SA.POP_TARGET_POOL)
+    if benchmark_budget is None:
+        benchmark_budget = SA.benchmark_budget([{"n_source": n_source, "n_target_pool": n_pool}])
     log_path = SA.default_log_path(root)
     log = json.loads(Path(log_path).read_text())
     for entry in log["leaves"]:
@@ -59,5 +67,13 @@ def attach_label_access(root, benchmark, seed, holdout, la_rows) -> str:
                 and int(entry["seed"]) == int(seed) and str(entry["holdout"]) == str(holdout)):
             entry["label_access_csv"] = str(la_path.relative_to(root))
             entry["label_access_sha256"] = sha
+            entry["label_access"] = {
+                "headline_eligible": True,
+                "benchmark_budget": int(benchmark_budget),
+                "unit": SA.label_access_unit(benchmark),
+                "n_source_pool": int(n_source),
+                "n_target_pool": int(n_pool),
+                "additive_counts": list(SA.LABEL_ACCESS_COUNTS),
+            }
     Path(log_path).write_text(json.dumps(log, indent=2) + "\n")
     return sha

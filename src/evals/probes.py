@@ -6,6 +6,7 @@ Each has its own hyper-parameter grid and build function.
 
 from __future__ import annotations
 
+import hashlib
 import warnings
 from typing import Any
 
@@ -62,7 +63,6 @@ def _build_logistic(hp: float, *, solver: str, seed: int, n_fit: int) -> Any:
     clf = LogisticRegression(
         C=hp,
         max_iter=LINEAR_MAX_ITER,
-        class_weight="balanced",
         solver=solver,
         tol=LINEAR_TOL,
         random_state=seed,
@@ -153,18 +153,54 @@ def _build_probe(family: str, hp: float, *, solver: str, seed: int, n_fit: int) 
 # ── Shared helpers ───────────────────────────────────────────────────────────
 
 
-def _class_balanced_resample(x: np.ndarray, y: np.ndarray, seed: int):
-    """Uniform class-balanced resample for the MLP/kNN families (ordinary probe machinery)."""
-    rng = np.random.default_rng(seed)
-    classes = np.unique(y)
-    per_class = max(1, len(y) // len(classes))
-    parts = []
-    for c in classes:
-        c_idx = np.where(y == c)[0]
-        parts.append(rng.choice(c_idx, size=per_class, replace=per_class > len(c_idx)))
-    sel = np.concatenate(parts)
-    rng.shuffle(sel)
-    return x[sel], y[sel]
+#: Families whose sklearn estimator accepts ``sample_weight`` at fit time. kNN does not, so it simply
+#: trains on the same selected rows unweighted -- it never trains on a DIFFERENT set.
+_WEIGHTED_FAMILIES = frozenset({"logistic", "mlp"})
+
+
+def class_balance_weights(y: np.ndarray) -> np.ndarray:
+    """``w_i = n / (C * n_{y_i})`` -- inverse class frequency, computed once and applied identically by
+    every probe family that supports weights.
+
+    This REPLACES the old class-balanced resample. Resampling changed WHICH rows the MLP/kNN families
+    trained on, so a probe-family comparison confounded model capacity with sample identity: logistic
+    and MLP were not scored on the same experiment. Weighting leaves the selected row set byte-identical
+    across families and moves the imbalance correction into the loss, which is why logistic's
+    ``class_weight="balanced"`` was also removed -- applying both would correct the imbalance twice."""
+    ya = np.asarray(y)
+    classes, counts = np.unique(ya, return_counts=True)
+    n, c = int(len(ya)), int(len(classes))
+    per = {cl: n / (c * int(cnt)) for cl, cnt in zip(classes.tolist(), counts.tolist(), strict=True)}
+    return np.asarray([per[v] for v in ya.tolist()], dtype=np.float64)
+
+
+def selected_set_digest(x: np.ndarray, y: np.ndarray) -> str:
+    """Content digest of the EXACT rows a probe was handed, so a test (and a reader) can prove that two
+    families consumed an identical training set rather than merely equal-sized ones."""
+    h = hashlib.sha256()
+    xa = np.ascontiguousarray(x)
+    ya = np.ascontiguousarray(y)
+    h.update(str(xa.shape).encode())
+    h.update(memoryview(xa).cast("B"))
+    h.update(memoryview(ya).cast("B"))
+    return h.hexdigest()[:16]
+
+
+def weight_metadata(w: np.ndarray | None, x: np.ndarray, y: np.ndarray) -> dict[str, Any]:
+    """Per-fit weight statistics + the selected-set digest, recorded on every probe row."""
+    digest = selected_set_digest(x, y)
+    if w is None:
+        return {**ERM_WEIGHT_METADATA, "probe_selected_set_digest": digest}
+    wa = np.asarray(w, dtype=np.float64)
+    ess = float((wa.sum() ** 2) / float(np.square(wa).sum())) if wa.size else float("nan")
+    return {
+        "probe_sample_weighted": 1,
+        "probe_weight_min": float(wa.min()) if wa.size else float("nan"),
+        "probe_weight_max": float(wa.max()) if wa.size else float("nan"),
+        "probe_weight_std": float(wa.std()) if wa.size else float("nan"),
+        "probe_weight_ess": ess,
+        "probe_selected_set_digest": digest,
+    }
 
 
 #: ERM fits probes on unweighted samples, so these are constants. They are emitted directly rather
@@ -187,13 +223,21 @@ def _fit_probe(
     hp: float,
     solver: str,
     seed: int,
+    sample_weight: np.ndarray | None = None,
 ):
-    if family in ("mlp", "knn"):
-        x, y = _class_balanced_resample(x, y, seed)
     clf = _build_probe(family, hp, solver=solver, seed=seed, n_fit=len(y))
+    # Same rows for every family; imbalance is handled by weights where the estimator supports them.
+    w = sample_weight
+    if w is None and family in _WEIGHTED_FAMILIES:
+        w = class_balance_weights(y)
+    if w is not None and family not in _WEIGHTED_FAMILIES:
+        w = None
+    fit_kw = {} if w is None else {f"{clf.steps[-1][0]}__sample_weight": np.asarray(w, dtype=np.float64)}
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", ConvergenceWarning)
-        clf.fit(x, y)
+        clf.fit(x, y, **fit_kw)
+    # Published on the fitted pipeline so the caller records the ACTUAL final-fit weights and row set.
+    clf._probe_fit_meta = weight_metadata(w, x, y)
     convergence_warnings = [w for w in caught if issubclass(w.category, ConvergenceWarning)]
     estimator = clf.steps[-1][1]
     n_iter = int(np.max(estimator.n_iter_)) if hasattr(estimator, "n_iter_") else -1
@@ -307,7 +351,7 @@ def fit_probe_with_calibration(
         "probe_hp": chosen_hp,
         "probe_C": chosen_hp if family == "logistic" else float("nan"),
         "probe_grid_size": grid_size,
-        **ERM_WEIGHT_METADATA,
+        **getattr(clf, "_probe_fit_meta", ERM_WEIGHT_METADATA),
     }
     if cal_prob is None:
         cal_prob = clf.predict_proba(cal_x)[:, 1]
@@ -401,6 +445,6 @@ def fit_probe_multiclass(
         "probe_hp": chosen_hp,
         "probe_C": chosen_hp if family == "logistic" else float("nan"),
         "probe_grid_size": grid_size,
-        **ERM_WEIGHT_METADATA,
+        **getattr(clf, "_probe_fit_meta", ERM_WEIGHT_METADATA),
     }
     return clf, probe_meta

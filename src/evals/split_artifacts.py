@@ -77,19 +77,17 @@ _PART_RANK = {p: i for i, p in enumerate(PARTITIONS)}
 #: Second per-leaf artifact, ``geographic_ood`` headline targets ONLY: the frozen, label-blind
 #: label-access order the runtime loads instead of regenerating an ordering inside probing. One row
 #: per unit in the source label pool, the target label pool, and the target test set. The source pool
-#: carries TWO independent orders -- ``matched_source_rank`` (matched-source selection) and
-#: ``fixed_source_removal_rank`` (fixed-total source removal) -- so those two interventions never
-#: share a draw; ``target_rank`` orders the target pool (additive + matched-target selection);
+#: carries ONE nested order -- ``source_rank`` -- so every fixed-budget allocation point takes its
+#: source share as a PREFIX of that same order and the five points are strictly nested rather than
+#: independent draws; ``target_rank`` orders the target pool (allocation + additive selection);
 #: target_test units carry no rank. Integrity is BOTH structural (population-correct / complete /
 #: contiguous, validated at load against the frozen split) AND cryptographic: the file's SHA-256 is
 #: recorded in the central log beside the assignments checksum and re-verified at load, because a
 #: DIFFERENT valid permutation over the same id sets passes every structural check while silently
-#: changing every matched-label and fixed-total experiment.
+#: changing every allocation and additive experiment.
 LABEL_ACCESS_FILENAME = "label_access.csv"
-LABEL_ACCESS_HEADER: list[str] = [
-    "stable_id", "population", "matched_source_rank", "fixed_source_removal_rank", "target_rank",
-]
-SOURCE_RANK_COLS = ("matched_source_rank", "fixed_source_removal_rank")
+LABEL_ACCESS_HEADER: list[str] = ["stable_id", "population", "source_rank", "target_rank"]
+SOURCE_RANK_COLS = ("source_rank",)
 LABEL_ACCESS_REGIME = "geographic_ood"
 #: The ONE canonical label-access count set (target few-shot AND fixed-total source removal); every
 #: module referencing these counts imports this, never a re-literal. A headline target that cannot
@@ -111,75 +109,109 @@ def label_access_unit(benchmark: str) -> str:
     return LABEL_ACCESS_DENSE_UNIT if str(benchmark) in DENSE_LABEL_ACCESS_BENCHMARKS else LABEL_ACCESS_TABULAR_UNIT
 
 #: Canonical label-access routes (single source of truth). Stage 2 fits these; Stage 5 contrasts them.
-ROUTE_SOURCE_ONLY = "source_only"
-ROUTE_SOURCE_PLUS_TARGET = "source_plus_target"          # one per LABEL_ACCESS_COUNTS
+#: The HEADLINE experiment is the fixed-budget ALLOCATION curve: at fraction ``f`` the cell trains on
+#: ``B - k`` source units plus ``k`` target units (``k = round_half_up(f * B)``), so TOTAL supervision is
+#: pinned at the benchmark-common budget ``B_d`` and only its source/target COMPOSITION moves. f=0 and
+#: f=1 are the two endpoints of that single curve -- they are NOT separate "matched-source" /
+#: "matched-target" routes, which is why the old two-order draw is gone: every point slices a prefix of
+#: the SAME frozen ``source_rank`` / ``target_rank``, so the curve is strictly nested.
+#: The ADDITIVE routes are a separate operational question -- hold the COMPLETE source pool fixed and add
+#: k target units on top -- and must never be pooled into the fixed-budget allocation claim.
+ROUTE_FIXED_BUDGET_ALLOCATION = "fixed_budget_allocation"  # one per ALLOCATION_PERCENTS
+ROUTE_SOURCE_PLUS_TARGET = "source_plus_target"            # one per LABEL_ACCESS_COUNTS (appendix)
 ROUTE_TARGET_ONLY_FULL = "target_only_full"
 ROUTE_SOURCE_PLUS_TARGET_FULL = "source_plus_target_full"
-ROUTE_MATCHED_SOURCE = "matched_source"
-ROUTE_MATCHED_TARGET = "matched_target"
-ROUTE_FIXED_TOTAL_MIXED = "fixed_total_mixed"            # one per LABEL_ACCESS_COUNTS
-#: The 7 canonical route NAMES, in emission order (source_plus_target / fixed_total_mixed expand across
-#: LABEL_ACCESS_COUNTS at runtime). The manifest contract and any route enumeration import this tuple.
+#: The 4 canonical route NAMES, in emission order (fixed_budget_allocation / source_plus_target expand
+#: across their budget axes at runtime). The manifest contract and any route enumeration import this.
 LABEL_ACCESS_ROUTES: tuple[str, ...] = (
-    ROUTE_SOURCE_ONLY, ROUTE_SOURCE_PLUS_TARGET, ROUTE_TARGET_ONLY_FULL, ROUTE_SOURCE_PLUS_TARGET_FULL,
-    ROUTE_MATCHED_SOURCE, ROUTE_MATCHED_TARGET, ROUTE_FIXED_TOTAL_MIXED,
+    ROUTE_FIXED_BUDGET_ALLOCATION, ROUTE_SOURCE_PLUS_TARGET,
+    ROUTE_TARGET_ONLY_FULL, ROUTE_SOURCE_PLUS_TARGET_FULL,
 )
-#: The in-distribution source reference (random_id source) -- the only cross-regime contrast anchor,
-#: resolved at aggregation; never a label-access route/fit.
+#: The frozen allocation fractions as INTEGER PERCENT -- the ``label_budget`` axis for allocation rows.
+#: A percent and an additive COUNT can collide numerically (allocation@25 vs source_plus_target@25); they
+#: stay distinct because the cell key carries ``label_access_route`` beside ``label_budget``, so no
+#: widening of the result schema is needed to tell the two 25s apart.
+ALLOCATION_PERCENTS: tuple[int, ...] = (0, 25, 50, 75, 100)
+
+#: The in-distribution source reference (random_id source) -- a cross-regime contrast anchor resolved at
+#: aggregation; never a label-access route/fit.
 ANCHOR_SOURCE_ID_REFERENCE = "source_ID_reference"
+#: The ordinary geographic full-source row (E1: geographic_ood / budget_type=source / label_budget=1.0 /
+#: target_test). Label access does NOT refit it -- the completion check requires the existing row and the
+#: contrasts read it -- so the complete-source probe is fit exactly once per cell, not twice.
+ANCHOR_GEOGRAPHIC_FULL_SOURCE = "geographic_full_source"
+#: Subtrahend sentinel: the f=0 endpoint of the allocation curve itself (B_d source units, no target).
+#: Distinct from ANCHOR_GEOGRAPHIC_FULL_SOURCE, which trains on the COMPLETE source pool (N_S >= B_d).
+ALLOCATION_BASELINE = "fixed_budget_allocation@0"
 
-#: The scientific contrast contract: each a (name, minuend, subtrahend) triple and a DISTINCT
-#: deployment question that must NOT be merged. Computed within (benchmark, model, target, seed, frozen
-#: target_test, frozen orders) on the target_test evaluation ONLY (complete-target scores excluded).
-#: source_plus_target / fixed_total_mixed contrasts are emitted once per LABEL_ACCESS_COUNTS count.
+#: The scientific contrast contract: each a (name, minuend, subtrahend) triple and a DISTINCT deployment
+#: question that must NOT be merged. Computed within (benchmark, model, target, seed, frozen target_test,
+#: frozen orders) on the ``target_test`` evaluation ONLY. ``allocation_effect`` expands over the non-zero
+#: ALLOCATION_PERCENTS (so f=1.0 vs f=0 -- the whole-budget reallocation -- is one of its points, not a
+#: separate contrast); ``additive_target_label_gain`` expands over LABEL_ACCESS_COUNTS.
 LABEL_ACCESS_CONTRASTS: tuple[tuple[str, str, str], ...] = (
-    ("target_label_advantage", ROUTE_TARGET_ONLY_FULL, ROUTE_SOURCE_ONLY),
-    ("target_reference_deficit", ANCHOR_SOURCE_ID_REFERENCE, ROUTE_TARGET_ONLY_FULL),
-    ("additive_target_label_gain", ROUTE_SOURCE_PLUS_TARGET, ROUTE_SOURCE_ONLY),
-    ("full_supervision_gain", ROUTE_SOURCE_PLUS_TARGET_FULL, ROUTE_SOURCE_ONLY),
-    ("size_matched_source_target_difference", ROUTE_MATCHED_TARGET, ROUTE_MATCHED_SOURCE),
-    ("label_source_allocation_effect", ROUTE_FIXED_TOTAL_MIXED, ROUTE_SOURCE_ONLY),
+    ("target_label_advantage", ROUTE_TARGET_ONLY_FULL, ANCHOR_GEOGRAPHIC_FULL_SOURCE),
+    ("allocation_effect", ROUTE_FIXED_BUDGET_ALLOCATION, ALLOCATION_BASELINE),
+    ("additive_target_label_gain", ROUTE_SOURCE_PLUS_TARGET, ANCHOR_GEOGRAPHIC_FULL_SOURCE),
+    ("full_supervision_gain", ROUTE_SOURCE_PLUS_TARGET_FULL, ANCHOR_GEOGRAPHIC_FULL_SOURCE),
 )
 
-#: Evaluation-split identities for the label-access suite. Every route is scored on the frozen
-#: ``target_test``; ``source_only`` additionally yields ONE complete-target diagnostic row from the
-#: SAME fit (deployment estimand) -- flagged so Stage-5 paired contrasts exclude it.
+#: Evaluation-split identity for the label-access suite: every route is scored on the frozen
+#: ``target_test`` and nothing else. ``complete_target`` remains defined for the LEGACY target-budget
+#: sweep (spatial_cluster_ood) but is no longer a label-access row -- the canonical comparison population
+#: is the frozen ``target_test``.
 EVAL_TARGET_TEST = "target_test"
 EVAL_COMPLETE_TARGET = "complete_target"
-#: The evaluation splits a fully-eligible cell emits: every route on ``target_test`` + the source_only
-#: complete-target diagnostic. Single source of truth for the manifest contract.
-LABEL_ACCESS_EVAL_SPLITS: tuple[str, ...] = (EVAL_TARGET_TEST, EVAL_COMPLETE_TARGET)
+LABEL_ACCESS_EVAL_SPLITS: tuple[str, ...] = (EVAL_TARGET_TEST,)
 
 
-def label_access_contract(*, enabled: bool, benchmark: str) -> dict[str, Any]:
+def allocation_target_count(percent: int, budget: int) -> int:
+    """``k = round_half_up(f * B)`` -- the target share of a fixed-budget allocation point. Explicit
+    half-up rounding (never Python's banker's rounding), so k is reproducible across platforms and the
+    source share is always exactly ``B - k``."""
+    return int((int(percent) / 100.0) * int(budget) + 0.5)
+
+
+def label_access_contract(
+    *, enabled: bool, benchmark: str, percents: tuple[int, ...] = ALLOCATION_PERCENTS,
+    counts: tuple[int, ...] = LABEL_ACCESS_COUNTS, full_target_reference: bool = True,
+    full_combined_reference: bool = True, controlled_budget_cap: int | None = None,
+) -> dict[str, Any]:
     """The readable label-access contract recorded in the run manifest: whether the suite is config-active
-    (geographic_ood requested), the canonical counts / routes / evaluation splits, and the benchmark's
-    label unit (``patches`` for dense PASTIS, else ``samples``). Derived entirely from the canonical
-    constants so the manifest can never drift from the runtime."""
+    (geographic_ood requested), the requested allocation fractions / additive counts / optional full
+    references / controlled total-budget cap, the canonical routes and evaluation split, and the
+    benchmark's label unit (``patches`` for dense PASTIS, else ``samples``). Derived entirely from the
+    canonical constants and the caller's direct config so the manifest can never drift from the runtime --
+    and so two machines running different caps or fractions are distinguishable from the manifest alone."""
     return {
         "enabled": bool(enabled),
-        "counts": list(LABEL_ACCESS_COUNTS),
+        "allocation_percents": [int(f) for f in percents],
+        "additive_counts": [int(k) for k in counts],
+        "full_target_reference": bool(full_target_reference),
+        "full_combined_reference": bool(full_combined_reference),
+        "controlled_budget_cap": (None if controlled_budget_cap is None else int(controlled_budget_cap)),
         "routes": list(LABEL_ACCESS_ROUTES),
         "evaluation_splits": list(LABEL_ACCESS_EVAL_SPLITS),
         "unit": label_access_unit(benchmark),
     }
 
 
-def label_access_expected_rows(counts: tuple[int, ...] = LABEL_ACCESS_COUNTS) -> list[tuple[str, int, str]]:
+def label_access_expected_rows(
+    percents: tuple[int, ...] = ALLOCATION_PERCENTS, counts: tuple[int, ...] = LABEL_ACCESS_COUNTS,
+    *, full_target_reference: bool = True, full_combined_reference: bool = True,
+) -> list[tuple[str, int, str]]:
     """The (label_access_route, label_budget, evaluation_split) rows one fully-eligible geographic_ood
-    headline cell must emit: the 13 route fits scored on ``target_test`` plus the ``source_only``
+    headline cell must emit, all scored on ``target_test``: one allocation fit per requested fraction,
+    one additive fit per requested count, and the two optional full references. There is deliberately NO
+    ``source_only`` row (the ordinary geographic full-source E1 row is reused instead) and NO
     complete-target diagnostic. Single source of truth for expected-key / completeness planning AND the
     sweep's emitted set (a test locks the two together)."""
-    rows = [(ROUTE_SOURCE_ONLY, 0, EVAL_TARGET_TEST)]
+    rows = [(ROUTE_FIXED_BUDGET_ALLOCATION, int(f), EVAL_TARGET_TEST) for f in percents]
     rows += [(ROUTE_SOURCE_PLUS_TARGET, int(k), EVAL_TARGET_TEST) for k in counts]
-    rows += [
-        (ROUTE_TARGET_ONLY_FULL, 0, EVAL_TARGET_TEST),
-        (ROUTE_SOURCE_PLUS_TARGET_FULL, 0, EVAL_TARGET_TEST),
-        (ROUTE_MATCHED_SOURCE, 0, EVAL_TARGET_TEST),
-        (ROUTE_MATCHED_TARGET, 0, EVAL_TARGET_TEST),
-    ]
-    rows += [(ROUTE_FIXED_TOTAL_MIXED, int(k), EVAL_TARGET_TEST) for k in counts]
-    rows += [(ROUTE_SOURCE_ONLY, 0, EVAL_COMPLETE_TARGET)]  # diagnostic; excluded from paired contrasts
+    if full_target_reference:
+        rows.append((ROUTE_TARGET_ONLY_FULL, 0, EVAL_TARGET_TEST))
+    if full_combined_reference:
+        rows.append((ROUTE_SOURCE_PLUS_TARGET_FULL, 0, EVAL_TARGET_TEST))
     return rows
 POP_SOURCE, POP_TARGET_POOL, POP_TARGET_TEST = "source", "target_pool", "target_test"
 _LA_POP_RANK = {POP_SOURCE: 0, POP_TARGET_POOL: 1, POP_TARGET_TEST: 2}
@@ -530,26 +562,105 @@ def _blind_order(ids: list[str], rng: np.random.Generator) -> dict[str, int]:
     return {sid: rank for rank, sid in enumerate(order)}
 
 
-def assert_label_access_feasible(
-    n_source: int, n_target_pool: int, *, counts: tuple[int, ...] = LABEL_ACCESS_COUNTS, where: str = "label_access",
-) -> None:
-    """A headline geographic_ood target must support EVERY configured label-access count -- never
-    clamp or skip one. The target pool must hold at least ``max(counts)`` units (nested target
-    selection, matched-target, full pool), and the source pool must hold at least ``max(counts)`` so
-    every fixed-total removal is possible -- removing all ``k`` source units (``k == n_source``) is
-    valid: the source contribution is simply empty and the fit trains on the ``k`` target units alone.
-    Otherwise this is a hard preprocessing failure."""
-    m = max(counts)
+#: A benchmark needs at least this many ELIGIBLE headline targets for its fixed-budget allocation
+#: aggregate to be reported. Below it the benchmark is omitted from the headline allocation aggregate
+#: and its remaining targets are recorded as supplementary stress -- a region-level bootstrap over one
+#: or two regions has no usable uncertainty.
+MIN_HEADLINE_TARGETS = 3
+
+
+def label_access_eligibility(
+    *, n_source: int, n_target_pool: int, counts: tuple[int, ...] = LABEL_ACCESS_COUNTS,
+) -> list[str]:
+    """PREDECLARED eligibility for a headline geographic_ood target, applied BEFORE any budget exists.
+    Returns the reasons this target is ineligible (empty == eligible).
+
+    This is a PREDICATE, not an assertion: an undersized region is demoted to supplementary stress
+    rather than aborting generation, because ``B_d`` is a benchmark-common minimum and one tiny region
+    must not be able to drag the whole benchmark's budget down (or kill the run). Sizing is the only
+    question asked here -- realized allocation validity is audited AFTER construction, against the
+    frozen order, by :func:`audit_allocation`."""
+    m = max(counts) if counts else 0
+    problems: list[str] = []
+    if n_source < 1 or n_target_pool < 1:
+        problems.append(f"empty pool (source={n_source}, target_label_pool={n_target_pool})")
+        return problems
     if n_target_pool < m:
-        raise SplitArtifactError(
-            f"{where}: target label pool has {n_target_pool} units < max configured count {m} ({list(counts)}) "
-            f"-- an included headline target must support every configured target count"
-        )
+        problems.append(f"target_label_pool {n_target_pool} < max additive count {m}")
     if n_source < m:
-        raise SplitArtifactError(
-            f"{where}: source pool has {n_source} units < max configured count {m} ({list(counts)}) "
-            f"-- cannot remove {m} source units for the fixed-total route"
-        )
+        problems.append(f"source_train {n_source} < max additive count {m}")
+    return problems
+
+
+def benchmark_budget(cells: list[dict[str, Any]], max_label_budget: int | None = None) -> int:
+    """``B_d = min(B_max,d, min-cell N_source, min-cell N_target)`` over the ELIGIBLE (target, seed)
+    cells ONLY -- ineligible cells are excluded before this is called, so an undersized region cannot
+    lower the budget. One budget per benchmark, shared by every target and seed, which is what makes
+    the allocation curve comparable across regions. ``max_label_budget`` (``B_max,d``) is an optional
+    frozen ceiling; unbounded when None."""
+    if not cells:
+        raise SplitArtifactError("benchmark_budget: no eligible cells to derive B_d from")
+    b = min(
+        min(int(c["n_source"]) for c in cells),
+        min(int(c["n_target_pool"]) for c in cells),
+    )
+    if max_label_budget is not None:
+        b = min(b, int(max_label_budget))
+    if b < 1:
+        raise SplitArtifactError(f"benchmark_budget: B_d resolved to {b} -- no allocation is constructible")
+    return int(b)
+
+
+def audit_allocation(
+    *, source_classes: list[frozenset[str]], target_classes: list[frozenset[str]], budget: int,
+    percents: tuple[int, ...] = ALLOCATION_PERCENTS, where: str = "allocation",
+) -> list[str]:
+    """Post-construction scientific validity of one target's REALIZED allocation sets. Returns the
+    problems found (empty == valid); a target with any problem is demoted to supplementary stress.
+
+    ``source_classes`` / ``target_classes`` are the per-unit class sets in FROZEN RANK ORDER -- one
+    singleton per sample for tabular benchmarks, the patch's whole class set for dense PASTIS -- because
+    the audit inspects the exact prefixes the runtime will train on (``source[:B-k] + target[:k]``), not
+    the pools in the abstract. Catches what row counts cannot: a training set that collapses to a single
+    class (unfittable) at any fraction, and a fraction whose realized set cannot be drawn at all."""
+    problems: list[str] = []
+    n_src, n_tgt = len(source_classes), len(target_classes)
+    for f in percents:
+        k = allocation_target_count(f, budget)
+        s = int(budget) - k
+        if s < 0 or k < 0:
+            problems.append(f"{where}: f={f}% yields source={s}, target={k}")
+            continue
+        if s > n_src:
+            problems.append(f"{where}: f={f}% needs {s} source units, pool holds {n_src}")
+            continue
+        if k > n_tgt:
+            problems.append(f"{where}: f={f}% needs {k} target units, pool holds {n_tgt}")
+            continue
+        classes: set[str] = set()
+        for cs in source_classes[:s]:
+            classes |= set(cs)
+        for cs in target_classes[:k]:
+            classes |= set(cs)
+        if len(classes) < 2:
+            problems.append(f"{where}: f={f}% training set holds {len(classes)} class(es) -- not fittable")
+    return problems
+
+
+def ranked_ids(rows: list[dict[str, str]]) -> tuple[list[str], list[str]]:
+    """The (source, target-pool) stable ids of a built label-access table in frozen rank order --
+    exactly the prefixes the runtime slices. Used by the generator to audit realized allocation sets
+    without re-deriving the draw."""
+    n_src = sum(1 for r in rows if r["population"] == POP_SOURCE)
+    n_pool = sum(1 for r in rows if r["population"] == POP_TARGET_POOL)
+    src: list[str] = [""] * n_src
+    tgt: list[str] = [""] * n_pool
+    for r in rows:
+        if r["population"] == POP_SOURCE:
+            src[int(r["source_rank"])] = r["stable_id"]
+        elif r["population"] == POP_TARGET_POOL:
+            tgt[int(r["target_rank"])] = r["stable_id"]
+    return src, tgt
 
 
 def build_label_access_rows(
@@ -557,32 +668,28 @@ def build_label_access_rows(
     where: str = "label_access",
 ) -> list[dict[str, str]]:
     """Label-blind, deterministic, contiguous per-population label-access ranking for one
-    geographic_ood target. The source pool carries TWO independent orders -- ``matched_source_rank``
-    (matched-source selection) and ``fixed_source_removal_rank`` (fixed-total source removal) -- so
-    the two interventions never share a draw. ``target_rank`` orders the target label pool (additive +
-    matched-target selection). target_test units are listed (population-complete) but never ranked.
-    All three orders come from the run ``seed`` directly (drawn in sequence from one Generator) --
-    no derived or per-route seeds, no checksum/version. Duplicate/overlapping ids are a hard error
-    (never silently de-duplicated)."""
+    geographic_ood target. The source pool carries ONE nested order -- ``source_rank`` -- so every
+    fixed-budget allocation point takes its source share as a prefix of the same order and the five
+    points are strictly nested. ``target_rank`` orders the target label pool (allocation + additive
+    selection). target_test units are listed (population-complete) but never ranked. Both orders come
+    from the run ``seed`` directly (drawn in sequence from one Generator) -- no derived or per-route
+    seeds, no checksum/version. Duplicate/overlapping ids are a hard error (never silently
+    de-duplicated)."""
     _assert_disjoint_unique(source_ids, target_pool_ids, target_test_ids, where)
     rng = np.random.default_rng(int(seed))
-    matched_src = _blind_order(list(source_ids), rng)
-    fixed_rm = _blind_order(list(source_ids), rng)
+    src = _blind_order(list(source_ids), rng)
     tgt = _blind_order(list(target_pool_ids), rng)
     rows: list[dict[str, str]] = []
     rows += [
-        {"stable_id": s, "population": POP_SOURCE, "matched_source_rank": str(matched_src[s]),
-         "fixed_source_removal_rank": str(fixed_rm[s]), "target_rank": ""}
-        for s in matched_src
+        {"stable_id": s, "population": POP_SOURCE, "source_rank": str(r), "target_rank": ""}
+        for s, r in src.items()
     ]
     rows += [
-        {"stable_id": s, "population": POP_TARGET_POOL, "matched_source_rank": "",
-         "fixed_source_removal_rank": "", "target_rank": str(r)}
+        {"stable_id": s, "population": POP_TARGET_POOL, "source_rank": "", "target_rank": str(r)}
         for s, r in tgt.items()
     ]
     rows += [
-        {"stable_id": str(s), "population": POP_TARGET_TEST, "matched_source_rank": "",
-         "fixed_source_removal_rank": "", "target_rank": ""}
+        {"stable_id": str(s), "population": POP_TARGET_TEST, "source_rank": "", "target_rank": ""}
         for s in target_test_ids
     ]
     return rows
@@ -591,7 +698,7 @@ def build_label_access_rows(
 def _label_access_sort_key(row: dict[str, str]) -> tuple[int, int, tuple[int, Any]]:
     pop = row["population"]
     if pop == POP_SOURCE:
-        rank_str = row["matched_source_rank"]
+        rank_str = row["source_rank"]
     elif pop == POP_TARGET_POOL:
         rank_str = row["target_rank"]
     else:
@@ -692,10 +799,9 @@ def validate_label_access_rows(
                 f"{where}: population {pop!r} does not match the frozen split -- {len(missing)} missing "
                 f"(e.g. {missing[:5]}), {len(extra)} unexpected (e.g. {extra[:5]})"
             )
-    # source pool: BOTH independent orders contiguous 0..S-1; neither source unit carries a target_rank.
-    _assert_contiguous_rank(by_pop[POP_SOURCE], "matched_source_rank", ("target_rank",), where)
-    _assert_contiguous_rank(by_pop[POP_SOURCE], "fixed_source_removal_rank", ("target_rank",), where)
-    # target pool: target_rank contiguous 0..P-1; neither source order.
+    # source pool: the ONE nested order contiguous 0..S-1; no source unit carries a target_rank.
+    _assert_contiguous_rank(by_pop[POP_SOURCE], "source_rank", ("target_rank",), where)
+    # target pool: target_rank contiguous 0..P-1; not the source order.
     _assert_contiguous_rank(by_pop[POP_TARGET_POOL], "target_rank", SOURCE_RANK_COLS, where)
     for r in by_pop[POP_TARGET_TEST]:
         if any(r[c] != "" for c in (*SOURCE_RANK_COLS, "target_rank")):
@@ -705,15 +811,15 @@ def validate_label_access_rows(
 
 class LoadedLabelAccess(NamedTuple):
     """One geographic_ood target's frozen label-access order, resolved to CURRENT row indices, in
-    ascending rank order (rank 0 first). The source pool exposes TWO independent orders --
-    ``matched_source_ranked_idx`` (matched-source selection) and ``fixed_source_removal_ranked_idx``
-    (fixed-total source removal) -- and ``target_ranked_idx`` orders the target pool (additive +
-    matched-target). The routes slice prefixes of these."""
+    ascending rank order (rank 0 first). The source pool exposes ONE nested order --
+    ``source_ranked_idx`` -- and ``target_ranked_idx`` orders the target pool (allocation +
+    additive). The routes slice prefixes of these."""
 
     holdout: str
-    matched_source_ranked_idx: np.ndarray
-    fixed_source_removal_ranked_idx: np.ndarray
+    source_ranked_idx: np.ndarray
     target_ranked_idx: np.ndarray
+    #: B_d, the benchmark-common allocation budget frozen at generation.
+    benchmark_budget: int = 0
 
 
 def _verify_label_access_checksum(data: bytes, expected_sha256: str | None, where: str) -> None:
@@ -721,7 +827,7 @@ def _verify_label_access_checksum(data: bytes, expected_sha256: str | None, wher
 
     Structural validation accepts ANY contiguous permutation over the correct id sets, so it cannot
     distinguish a regenerated or hand-edited draw from the frozen one -- and a different valid draw
-    silently changes every matched-label and fixed-total experiment. Only the checksum catches that.
+    silently changes every allocation and additive experiment. Only the checksum catches that.
     """
     if expected_sha256 is None:
         raise SplitArtifactError(
@@ -738,7 +844,7 @@ def _verify_label_access_checksum(data: bytes, expected_sha256: str | None, wher
 
 def load_label_access(
     root: str | os.PathLike, benchmark: str, seed: int, split: SourceTargetSplit, id_map: dict[str, Any],
-    expected_sha256: str | None = None,
+    expected_sha256: str | None = None, benchmark_budget: int | None = None,
 ) -> LoadedLabelAccess:
     """Load + structurally validate one geographic_ood target's frozen ``label_access.csv`` and
     resolve its ranked stable ids to CURRENT row indices. Missing or malformed => hard error. The
@@ -760,39 +866,43 @@ def load_label_access(
     )
     n_src = sum(1 for r in rows if r["population"] == POP_SOURCE)
     n_pool = sum(1 for r in rows if r["population"] == POP_TARGET_POOL)
-    matched: list[int] = [0] * n_src
-    fixed: list[int] = [0] * n_src
+    src: list[int] = [0] * n_src
     tgt: list[int] = [0] * n_pool
     for r in rows:
         if r["population"] == POP_SOURCE:
-            matched[int(r["matched_source_rank"])] = id_map[r["stable_id"]]
-            fixed[int(r["fixed_source_removal_rank"])] = id_map[r["stable_id"]]
+            src[int(r["source_rank"])] = id_map[r["stable_id"]]
         elif r["population"] == POP_TARGET_POOL:
             tgt[int(r["target_rank"])] = id_map[r["stable_id"]]
+    if benchmark_budget is None:
+        raise SplitArtifactError(
+            f"{where}: the split log records no label_access benchmark_budget (B_d) -- the allocation "
+            f"curve is undefined; regenerate the label-access artifacts with the current generator"
+        )
     return LoadedLabelAccess(
         holdout=holdout,
-        matched_source_ranked_idx=np.asarray(matched, dtype=np.int64),
-        fixed_source_removal_ranked_idx=np.asarray(fixed, dtype=np.int64),
+        source_ranked_idx=np.asarray(src, dtype=np.int64),
         target_ranked_idx=np.asarray(tgt, dtype=np.int64),
+        benchmark_budget=int(benchmark_budget),
     )
 
 
 class LoadedDenseLabelAccess(NamedTuple):
     """One geographic_ood dense (PASTIS) target's frozen label-access order, resolved to STABLE PATCH IDs
     in ascending rank order (rank 0 first). Unlike the tabular loader there is no row-index remap: the
-    patch id IS the stable unit. The source pool exposes TWO independent orders --
-    ``matched_source_ranked_patches`` / ``fixed_source_removal_ranked_patches`` -- and
-    ``target_ranked_patches`` orders the target label pool. Every selection/removal is a WHOLE patch."""
+    patch id IS the stable unit. The source pool exposes ONE nested order --
+    ``source_ranked_patches`` -- and ``target_ranked_patches`` orders the target label pool. Every
+    selection/removal is a WHOLE patch."""
 
     holdout: str
-    matched_source_ranked_patches: np.ndarray
-    fixed_source_removal_ranked_patches: np.ndarray
+    source_ranked_patches: np.ndarray
     target_ranked_patches: np.ndarray
+    #: B_d in PATCH units, frozen at generation.
+    benchmark_budget: int = 0
 
 
 def load_dense_label_access(
     root: str | os.PathLike, benchmark: str, seed: int, dense_split: DenseSourceTargetSplit,
-    expected_sha256: str | None = None,
+    expected_sha256: str | None = None, benchmark_budget: int | None = None,
 ) -> LoadedDenseLabelAccess:
     """Load + structurally validate one geographic_ood PASTIS target's frozen ``label_access.csv`` and
     resolve its ranked stable patch ids to PATCH IDs in rank order. Missing/malformed => hard error. The
@@ -813,20 +923,23 @@ def load_dense_label_access(
     )
     n_src = sum(1 for r in rows if r["population"] == POP_SOURCE)
     n_pool = sum(1 for r in rows if r["population"] == POP_TARGET_POOL)
-    matched: list[int] = [0] * n_src
-    fixed: list[int] = [0] * n_src
+    src: list[int] = [0] * n_src
     tgt: list[int] = [0] * n_pool
     for r in rows:
         if r["population"] == POP_SOURCE:
-            matched[int(r["matched_source_rank"])] = int(r["stable_id"])
-            fixed[int(r["fixed_source_removal_rank"])] = int(r["stable_id"])
+            src[int(r["source_rank"])] = int(r["stable_id"])
         elif r["population"] == POP_TARGET_POOL:
             tgt[int(r["target_rank"])] = int(r["stable_id"])
+    if benchmark_budget is None:
+        raise SplitArtifactError(
+            f"{where}: the split log records no label_access benchmark_budget (B_d) -- the allocation "
+            f"curve is undefined; regenerate the label-access artifacts with the current generator"
+        )
     return LoadedDenseLabelAccess(
         holdout=holdout,
-        matched_source_ranked_patches=np.asarray(matched, dtype=np.int64),
-        fixed_source_removal_ranked_patches=np.asarray(fixed, dtype=np.int64),
+        source_ranked_patches=np.asarray(src, dtype=np.int64),
         target_ranked_patches=np.asarray(tgt, dtype=np.int64),
+        benchmark_budget=int(benchmark_budget),
     )
 
 
@@ -844,6 +957,8 @@ class LoadedTabularSplit(NamedTuple):
     #: sha256 of this leaf's label_access.csv as recorded in the central log (None where the leaf
     #: carries no label-access order). Threaded to load_label_access so the frozen draw is verified.
     label_access_sha256: str | None = None
+    #: the benchmark-common fixed-budget allocation budget B_d frozen at generation (None where absent).
+    label_access_budget: int | None = None
 
 
 class LoadedDenseSplit(NamedTuple):
@@ -854,6 +969,8 @@ class LoadedDenseSplit(NamedTuple):
     split: DenseSourceTargetSplit
     #: sha256 of this leaf's label_access.csv as recorded in the central log (None where absent).
     label_access_sha256: str | None = None
+    #: the benchmark-common fixed-budget allocation budget B_d frozen at generation (None where absent).
+    label_access_budget: int | None = None
 
 
 def read_splits_log(logs_path: str | os.PathLike) -> dict[str, Any]:
@@ -1007,6 +1124,7 @@ def load_tabular_splits(
                 loaded.append(LoadedTabularSplit(
                     seed=int(seed), regime=str(regime), domains=domains, split=split,
                     label_access_sha256=entry.get("label_access_sha256"),
+                    label_access_budget=(entry.get("label_access") or {}).get("benchmark_budget"),
                 ))
     return loaded
 
@@ -1065,6 +1183,7 @@ def load_dense_splits(
                 leaves.append(LoadedDenseSplit(
                     seed=int(seed), regime=str(regime), split=dsplit,
                     label_access_sha256=entry.get("label_access_sha256"),
+                    label_access_budget=(entry.get("label_access") or {}).get("benchmark_budget"),
                 ))
         by_seed[int(seed)] = leaves
     return by_seed

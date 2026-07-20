@@ -110,12 +110,20 @@ def _assert_erm_contract(rows, *, budget_type, family="logistic", tuning=True):
             assert np.isnan(r["method_selection_score"]), "method_selection_score must stay NaN"
         else:
             assert "method_tuned" not in r, "dense rows must not gain the tabular tuning fields"
-        # ERM never weights samples; the zero/NaN companions must survive the removal even though
-        # the weighting machinery does not.
-        assert r["probe_sample_weighted"] == 0
-        for k in ERM_WEIGHT_METADATA:
+        # Class-balanced weighting is now applied through EXPLICIT sample weights on every fit, so
+        # logistic and MLP consume the identical selected rows and differ only in the estimator. The
+        # old convention (resample for MLP, class_weight="balanced" for logistic, no weights on ERM)
+        # is gone, so ERM rows carry real weight statistics rather than the NaN placeholders.
+        assert r["probe_sample_weighted"] == 1
+        for k in ("probe_weight_min", "probe_weight_max", "probe_weight_std", "probe_weight_ess"):
             assert k in r, f"ERM row lost the {k!r} column"
-            assert np.isnan(r[k]), f"{k}={r[k]!r} -- must stay NaN for ERM"
+            assert np.isfinite(r[k]), f"{k}={r[k]!r} -- weighted fits must report a real statistic"
+        assert r["probe_weight_min"] > 0, "a zero weight would silently drop a selected row"
+        assert 0 < r["probe_weight_ess"] <= r["n_train_sub"], (
+            f"effective sample size {r['probe_weight_ess']!r} must lie within the selected rows"
+        )
+        # The digest is what makes the identical-IDs guarantee auditable across probe families.
+        assert r.get("probe_selected_set_digest"), "ERM row lost the selected-set digest"
 
 
 # --- tabular binary ---------------------------------------------------------
