@@ -10,6 +10,7 @@ benchmark data, no real model, no real checkpoints.
 from __future__ import annotations
 
 import importlib.util
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -324,6 +325,40 @@ class _FakeDenseModel:
 
     def encode_dense(self, tile):
         return tile.features + self._delta
+
+
+@dataclass(frozen=True)
+class _TrackedPatch:
+    patch_id: int
+    fold: int
+
+
+@dataclass(frozen=True)
+class _TrackedDenseBench:
+    patches: tuple[_TrackedPatch, ...]
+    visited: list[int]
+
+    def iter_tiles(self):
+        for patch in self.patches:
+            self.visited.append(patch.patch_id)
+            for col in (0, 1):
+                tile_id = f"{patch.patch_id}_0_{col}"
+                yield tile_id, patch.fold, tile_id, np.zeros(1, dtype=np.uint8)
+
+
+def test_dense_spotcheck_loads_only_selected_patches():
+    adopt = _load_tool("adopt_embeddings")
+    visited = []
+    bench = _TrackedDenseBench(
+        patches=tuple(_TrackedPatch(patch_id, 1) for patch_id in range(100, 110)),
+        visited=visited,
+    )
+    picks = {"fold_1/102_0_1.npy", "fold_1/108_0_0.npy"}
+
+    selected = list(adopt._iter_selected_dense_tiles(bench, picks))
+
+    assert [tile_id for tile_id, _fold, _tile, _labels in selected] == ["102_0_1", "108_0_0"]
+    assert visited == [102, 108]
 
 
 def _write_tile(root: Path, rel: str, arr: np.ndarray) -> None:

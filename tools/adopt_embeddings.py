@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -112,6 +113,21 @@ def _refused(report: dict, reason: str, spot_check=None) -> _Plan:
     if spot_check is not None:
         result["spot_check"] = spot_check
     return _Plan(result)
+
+
+def _iter_selected_dense_tiles(bench, picks: set[str]):
+    """Load only patches containing selected PASTIS tiles."""
+    patches = getattr(bench, "patches", None)
+    selected_bench = bench
+    if patches is not None:
+        patch_ids = {int(Path(rel).stem.split("_", 1)[0]) for rel in picks}
+        selected_bench = replace(
+            bench,
+            patches=tuple(patch for patch in patches if int(patch.patch_id) in patch_ids),
+        )
+    for tile_id, fold, tile, labels in selected_bench.iter_tiles():
+        if f"fold_{fold}/{tile_id}.npy" in picks:
+            yield tile_id, fold, tile, labels
 
 
 def _existing_ancestor(path: Path) -> Path:
@@ -349,10 +365,8 @@ def _prepare_dense(cand, enc_kwargs) -> _Plan:
         for index in _spotcheck_indices(len(feature_rels), CONFIG["spotcheck_k"])
     }
     max_err, checked = 0.0, 0
-    for tile_id, fold, tile, _labels in bench.iter_tiles():
+    for tile_id, fold, tile, _labels in _iter_selected_dense_tiles(bench, picks):
         rel = f"fold_{fold}/{tile_id}.npy"
-        if rel not in picks:
-            continue
         if hasattr(model_obj, "encode_dense"):
             features = model_obj.encode_dense(tile)
         else:
@@ -472,13 +486,27 @@ def main() -> int:
     candidates = CONFIG["candidates"]
     print(f"[adopt] mode={CONFIG['mode']}  candidates={len(candidates)}")
 
-    plans = [_prepare_candidate(candidate, enc_kwargs) for candidate in candidates]
+    plans = []
+    for index, candidate in enumerate(candidates, start=1):
+        candidate_name = f"{candidate['benchmark']}/{candidate['model']}"
+        started = time.perf_counter()
+        print(f"[prepare {index}/{len(candidates)}] {candidate_name}", flush=True)
+        plan = _prepare_candidate(candidate, enc_kwargs)
+        elapsed = time.perf_counter() - started
+        print(
+            f"[prepare {index}/{len(candidates)}] {candidate_name}: "
+            f"{plan.report['status']} ({elapsed:.1f}s)",
+            flush=True,
+        )
+        plans.append(plan)
     failures = _summarize([plan.report for plan in plans])
     if failures or CONFIG["mode"] == "report":
         return 1 if failures else 0
 
     results = []
-    for plan in plans:
+    for index, plan in enumerate(plans, start=1):
+        candidate_name = plan.report.get("candidate", "unknown")
+        print(f"[apply {index}/{len(plans)}] {candidate_name}", flush=True)
         if plan.apply is None:
             results.append(plan.report)
             continue
