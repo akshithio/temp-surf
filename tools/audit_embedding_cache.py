@@ -14,13 +14,20 @@ What it checks per required cell, without modifying it:
     full embedding-file SHA-256; baseline-vs-s2only input contract.
   * dense (PASTIS): exact expected non-void feature+label tile set (no missing / extra / unpaired);
     per-pair row-count agreement; shapes, dtypes, feature width, finiteness; stable tile identity;
-    and a deterministic aggregate content digest: each tile is streamed in 8MiB blocks and the
-    per-tile hashes are folded in sorted relative-path order (never completion order).
+    and a deterministic aggregate content digest (see :func:`_dense_digest_order`).
 
-Semantic (re-encode) evidence is never recomputed here. It is reused only when it can be bound to
-the exact current bytes -- for tabular cells that binding is the recorded ``artifact_sha256``.
-Dense records carry no content digest, so prior dense spot-checks cannot be tied to current bytes;
-those cells are reported as lacking semantic evidence rather than assumed good.
+DENSE DIGEST CONSTRUCTION -- FROZEN. The tile order is ``sorted(feature_rels)`` followed by
+``sorted(label_rels)``; it is NOT one global sort of all paths (a global sort would interleave
+``<tile>.labels.npy`` with ``<tile>.npy``). Each tile is streamed in 8MiB blocks, and per-tile
+hashes are folded as ``rel NUL <hex> LF`` in that order. Every fleet verifier MUST use
+:func:`_dense_digest_order` so it reproduces the already-published digests.
+
+Semantic (re-encode) evidence is never recomputed here.
+  * Tabular cells: the prior spot check is bound CRYPTOGRAPHICALLY to the current bytes, because
+    adoption recorded ``artifact_sha256`` and the file still hashes to it.
+  * Dense cells: no adoption-time content digest exists, so no such proof is possible. They are
+    accepted only under an explicit OPERATIONAL-LINEAGE assumption (see :func:`_lineage`), which is
+    weaker than proof and is recorded as such.
 
 No command-line arguments: edit CONFIG below and run it. On Gilbreth run it through a CPU Slurm job,
 never on the frontend.
@@ -30,6 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import socket
 import subprocess
 import sys
@@ -53,19 +61,20 @@ CONFIG = {
     "benchmarks": ["cropharvest", "eurocropsml", "breizhcrops", "pastis"],
     "active_models": None,   # None = every compat-eligible model for the benchmark
     "s2_only": False,        # False -> the run consumes ONLY the 'baseline' artifact
-    # Cells absent on this host are reported "absent_here" (not a failure); fleet coverage is
-    # judged across hosts, since PASTIS dense lives only on Gilbreth.
-    "skip_absent": True,
+    # False (the setting for the canonical Gilbreth source audit): a required cell that is absent
+    # here is a FAILURE ("absent_required") and exits nonzero. True is only for auditing a machine
+    # that legitimately holds a subset, and then absence is reported without failing.
+    "skip_absent": False,
     # Write findings into data/logs/cache.json. False = report only, zero writes.
     "write": True,
     # Parallel workers for per-file hashing/inspection. hashlib and file IO both release the GIL,
     # so threads scale here; the aggregate stays deterministic because results are recombined in
-    # sorted relative-path order, never in completion order.
+    # the frozen features-then-labels order (see _dense_digest_order), never in completion order.
     "workers": 8,
     # "audit"   -- full structural + content audit (re-hashes; the expensive path).
-    # "lineage" -- record lineage acceptance for cells ALREADY audited in cache.json. Re-hashes
-    #              nothing; it only proves nothing was rewritten since the semantic check and
-    #              rewrites the audit verdict in place.
+    # "lineage" -- record OPERATIONAL-lineage acceptance for cells ALREADY audited in cache.json.
+    #              Re-hashes nothing. It validates the adoption evidence log, checks no newer mtime,
+    #              and rewrites the audit verdict in place. This is not cryptographic proof.
     "mode": "lineage",
     "lineage": {
         # Dense cells whose PRIOR semantic spot check is accepted via lineage rather than re-encode.
@@ -73,8 +82,9 @@ CONFIG = {
             "pastis/tessera/baseline", "pastis/olmoearth/baseline", "pastis/galileo/baseline",
             "pastis/agrifm/baseline", "pastis/presto/baseline", "pastis/raw/baseline",
         ],
-        # Where that semantic evidence lives, and when it finished. Any cache byte written after
-        # this instant would break the lineage, so the check below refuses in that case.
+        # Where that semantic evidence lives, and when it finished. The log is parsed and must show
+        # a clean completed run that explicitly accepted every cell above; a cache byte with a newer
+        # mtime additionally refuses the cell (corroborating, not proof).
         "evidence_log": "data/output/logs/adopt-all-resume-11339121.out",
         "evidence_completed": "2026-07-20T01:20:28-04:00",
     },
@@ -99,6 +109,16 @@ def _rels_cache(bench, benchmark: str):
     if key not in _BENCH_CACHE:
         _BENCH_CACHE[key] = C._dense_expected_rels(bench)
     return _BENCH_CACHE[key]
+
+
+def _dense_digest_order(feature_rels: list[str], label_rels: list[str]) -> list[str]:
+    """THE frozen tile order for the dense aggregate digest: sorted features, then sorted labels.
+
+    Deliberately NOT a single global sort of every path -- that would interleave each tile's
+    ``.labels.npy`` with its ``.npy`` and produce a different digest. The six published PASTIS
+    digests were computed with this order, so any fleet verifier must call this function.
+    """
+    return sorted(feature_rels) + sorted(label_rels)
 
 
 def _file_sha256(path: Path) -> str:
@@ -210,12 +230,12 @@ def _audit_dense(bench, benchmark, model, artifact, record) -> dict:
             info["finite"] = _finite(path)
         return rel, info
 
-    ordered = sorted(feat_rels) + sorted(lab_rels)
+    ordered = _dense_digest_order(feat_rels, lab_rels)  # FROZEN order: features, then labels
     with ThreadPoolExecutor(max_workers=int(CONFIG["workers"])) as pool:
         inspected = dict(pool.map(_inspect, ordered))
 
-    # Deterministic aggregate: sorted relative path + NUL + that file's content hash + LF,
-    # recombined in path order (never completion order). Same construction the repo already uses.
+    # Aggregate: rel + NUL + that tile's content hash + LF, folded in the frozen order above
+    # (never completion order), so the digest is independent of thread scheduling.
     digest, checked = hashlib.sha256(), 0
     for rel in ordered:
         info = inspected.get(rel, {})
@@ -289,14 +309,59 @@ def _newest_mtime(root: Path) -> float:
     return newest
 
 
+def _parse_evidence_log(path: Path, cells: list[str]) -> tuple[bool, list[str], dict[str, str]]:
+    """Validate the adoption log actually supports lineage for EVERY configured cell.
+
+    Returns ``(ok, problems, per_cell_line)``. The log must exist, must show a successful completed
+    adoption run (a report with zero refusals), and must explicitly accept each configured cell.
+    Anything absent, failed, truncated, or missing a cell refuses lineage outright.
+    """
+    problems: list[str] = []
+    if not path.is_file():
+        return False, [f"evidence log missing: {path}"], {}
+    text = path.read_text(errors="replace")
+    if "==== ADOPTION REPORT ====" not in text:
+        problems.append("evidence log has no ADOPTION REPORT section (truncated or wrong log)")
+    # "N accepted, M refused." -- any refusal, or a missing tally, invalidates the run.
+    tally = re.search(r"(\d+)\s+accepted,\s+(\d+)\s+refused", text)
+    if not tally:
+        problems.append("evidence log has no 'N accepted, M refused' completion tally")
+    elif int(tally.group(2)) != 0:
+        problems.append(f"evidence log reports {tally.group(2)} refused cell(s) -- run was not clean")
+    if "[job] complete" not in text:
+        problems.append("evidence log has no '[job] complete' marker -- run did not finish")
+
+    per_cell: dict[str, str] = {}
+    for key in cells:
+        # e.g. "  [adopted] pastis/raw/baseline: {...}"  or "[already-adopted] ..."
+        match = re.search(rf"^\s*\[(adopted|already-adopted)\]\s+{re.escape(key)}\s*:(.*)$",
+                          text, re.MULTILINE)
+        if match:
+            per_cell[key] = f"{match.group(1)}:{match.group(2).strip()}"
+        else:
+            problems.append(f"evidence log does not explicitly accept {key}")
+    return (not problems), problems, per_cell
+
+
 def _lineage() -> int:
     """Accept prior semantic evidence for already-audited dense cells, without re-encoding.
 
-    The lineage argument is only sound if NOTHING rewrote the cache after the semantic check. That
-    is verified here by comparing the newest mtime under each cache root against the evidence
-    timestamp; a newer byte anywhere refuses the cell. The aggregate content digest recorded by the
-    earlier audit pass is NOT retrospective evidence -- the adoption log never contained it. It is
-    the identity this audit FREEZES going forward, so any later drift becomes detectable.
+    IMPORTANT -- this is an OPERATIONAL argument, not a cryptographic proof. No adoption-time
+    content digest exists for dense cells, so the current bytes CANNOT be shown mathematically
+    identical to the bytes that passed the spot check. What is established instead:
+
+      * the adoption log exists, completed cleanly, and explicitly accepted this cell;
+      * dataset digest, checkpoint SHA-256, tile-set digest, counts, feature dim, shapes and dtypes
+        all still match;
+      * no file under the cache root carries an mtime newer than the adoption check.
+
+    The mtime check is corroborating operational evidence only: copy tools (rsync -a, cp -p, tar -p)
+    preserve timestamps, so an unchanged mtime does not by itself prove unchanged bytes. Acceptance
+    is therefore recorded explicitly as an operational-lineage assumption.
+
+    The aggregate content digest was computed by THIS audit and was never present in the adoption
+    log. It is not retrospective evidence; it freezes the accepted identity going forward so any
+    later drift is detectable.
     """
     cfg = CONFIG["lineage"]
     cutoff = datetime.fromisoformat(cfg["evidence_completed"]).timestamp()
@@ -308,6 +373,17 @@ def _lineage() -> int:
     host = max(audits, key=lambda h: audits[h].get("timestamp", ""))
     cells = audits[host]["cells"]
     print(f"[lineage] host={host} evidence={cfg['evidence_log']} cutoff={cfg['evidence_completed']}", flush=True)
+
+    # GATE: the adoption log must exist, have completed cleanly, and explicitly accept every
+    # configured cell. If it does not, NO cell gets lineage acceptance.
+    evidence_path = C.REPO / cfg["evidence_log"]
+    ok, log_problems, per_cell_evidence = _parse_evidence_log(evidence_path, list(cfg["cells"]))
+    if not ok:
+        for problem in log_problems:
+            print(f"[lineage] EVIDENCE REJECTED: {problem}", flush=True)
+        print(f"[lineage] refusing lineage for all {len(cfg['cells'])} cell(s)", flush=True)
+        return 1
+    print(f"[lineage] evidence log validated: {len(per_cell_evidence)}/{len(cfg['cells'])} cells explicitly accepted", flush=True)
 
     accepted, refused = [], []
     for key in cfg["cells"]:
@@ -328,19 +404,25 @@ def _lineage() -> int:
             continue
         cell["status"] = "valid"
         cell["semantic_evidence"] = (
-            "accepted via lineage: dense re-encode spot check in "
-            f"{cfg['evidence_log']} (completed {cfg['evidence_completed']}) passed for this cell, and "
-            "dataset digest, checkpoint SHA-256, tile-set digest, tile counts, feature dim, shapes and "
-            "dtypes all still match; no byte under the cache root was written after that check."
+            "accepted under an OPERATIONAL-LINEAGE assumption (not cryptographic proof): the dense "
+            f"re-encode spot check in {cfg['evidence_log']} (completed {cfg['evidence_completed']}) "
+            f"explicitly accepted this cell [{per_cell_evidence.get(key, 'n/a')}], and dataset digest, "
+            "checkpoint SHA-256, tile-set digest, tile counts, feature dim, shapes and dtypes all "
+            "still match. No adoption-time content digest exists for dense caches, so the current "
+            "bytes CANNOT be shown mathematically identical to the bytes that passed that check."
         )
         cell["no_rewrite_since_evidence"] = {
-            "verified": True,
             "newest_mtime": datetime.fromtimestamp(newest).isoformat(),
             "evidence_completed": cfg["evidence_completed"],
+            "evidence_strength": "operational_only",
+            "caveat": ("mtime is corroborating operational evidence, not proof: archive-mode copy "
+                       "tools (rsync -a, cp -p, tar -p) preserve timestamps, so an unchanged mtime "
+                       "does not by itself establish unchanged bytes."),
         }
         cell["digest_role"] = (
             "The aggregate content digest FREEZES this cell's accepted identity from this audit "
-            "forward; it was computed by this audit and was NOT present in the adoption log."
+            "forward; it was computed by this audit and was NOT present in the adoption log. It is "
+            "not retrospective evidence."
         )
         accepted.append(key)
         print(f"  [{key}] valid via lineage (newest mtime {datetime.fromtimestamp(newest).isoformat()})", flush=True)
@@ -354,9 +436,12 @@ def _lineage() -> int:
         "evidence_completed": cfg["evidence_completed"],
         "accepted": accepted,
         "refused": [k for k, _ in refused],
-        "basis": ("prior dense re-encode spot check + unchanged identity fields + no rewrite after "
-                  "the check; the aggregate digest freezes identity going forward, it is not "
-                  "retrospective evidence"),
+        "basis": ("OPERATIONAL LINEAGE, not cryptographic proof: validated adoption log explicitly "
+                  "accepting each cell, plus unchanged identity fields, plus no newer mtime under the "
+                  "cache root. mtime is corroborating only (archive-mode copies preserve timestamps). "
+                  "The aggregate digest freezes identity going forward and is not retrospective "
+                  "evidence."),
+        "evidence_strength": "operational_only",
     }
     if CONFIG["write"]:
         with C._cache_lock(C.CACHE_JSON_PATH):  # atomic; datasets/embeddings untouched
@@ -394,7 +479,9 @@ def main() -> int:
             out = {"structural": f"fail: {type(exc).__name__}: {exc}"}
 
         if out.get("structural") == "absent_here":
-            out["status"] = "absent_here"
+            # A required cell that is missing is only tolerable when this host is deliberately
+            # auditing a subset; otherwise it is a hard failure, never a silent pass.
+            out["status"] = "absent_here" if CONFIG["skip_absent"] else "absent_required"
         elif not str(out.get("structural", "")).startswith("ok"):
             out["status"] = "invalid"
         elif out.get("bytes_match_record") is True:
@@ -419,7 +506,7 @@ def main() -> int:
         "cells": results,
     }
     print("\n==== AUDIT SUMMARY ====")
-    for status in ("valid", "missing_evidence", "invalid", "absent_here"):
+    for status in ("valid", "missing_evidence", "invalid", "absent_required", "absent_here"):
         named = [k for k, v in results.items() if v.get("status") == status]
         print(f"  {status}: {len(named)}")
         for k in named:
@@ -438,7 +525,8 @@ def main() -> int:
     print("AUDIT_JSON_BEGIN")
     print(json.dumps(audit, sort_keys=True))
     print("AUDIT_JSON_END")
-    return 0 if all(v.get("status") in ("valid", "absent_here") for v in results.values()) else 1
+    tolerated = {"valid"} | ({"absent_here"} if CONFIG["skip_absent"] else set())
+    return 0 if all(v.get("status") in tolerated for v in results.values()) else 1
 
 
 if __name__ == "__main__":

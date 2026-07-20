@@ -10,7 +10,9 @@ benchmark data, no real model, no real checkpoints.
 from __future__ import annotations
 
 import importlib.util
+import os
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -702,3 +704,130 @@ def test_preflight_dry_run_is_write_free(tmp_path, monkeypatch):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ==================== embedding-cache audit: lineage + digest ====================
+# tools/audit_embedding_cache.py accepts PRIOR dense semantic evidence without re-encoding. That is
+# an OPERATIONAL argument, so the guards that make it safe are what these tests pin down.
+
+_LINEAGE_CELL = "pastis/raw/baseline"
+
+
+def _good_evidence_text(cells) -> str:
+    body = "\n".join(f"  [adopted] {c}: {{'tiles': 32, 'max_abs_err': 0.0, 'tol': 0.0001}}" for c in cells)
+    return f"==== ADOPTION REPORT ====\n{body}\n\n{len(cells)} accepted, 0 refused.\n[job] complete 2026-07-20T01:20:28-04:00\n"
+
+
+def _setup_lineage(tmp_path, monkeypatch, *, evidence: str | None, cells=(_LINEAGE_CELL,),
+                   cache_mtime_offset=-3600):
+    """Audit tool wired to a temp repo: one audited dense cell + a configurable evidence log."""
+    audit = _load_tool("audit_embedding_cache")
+    repo = tmp_path / "repo"
+    cache_root = repo / "data/cache/embeddings/pastis/raw/baseline"
+    cache_root.mkdir(parents=True)
+    (cache_root / "fold_1").mkdir()
+    (cache_root / "fold_1" / "1_0_0.npy").write_bytes(b"x")
+
+    cutoff = "2026-07-20T01:20:28-04:00"
+    stamp = datetime.fromisoformat(cutoff).timestamp() + cache_mtime_offset
+    for path in (cache_root, cache_root / "fold_1", cache_root / "fold_1" / "1_0_0.npy"):
+        os.utime(path, (stamp, stamp))
+
+    log_rel = "data/output/logs/adopt.out"
+    if evidence is not None:
+        log_path = repo / log_rel
+        log_path.parent.mkdir(parents=True)
+        log_path.write_text(evidence)
+
+    monkeypatch.setattr(audit.C, "REPO", repo)
+    monkeypatch.setattr(audit.C, "CACHE_JSON_PATH", repo / "data/logs/cache.json")
+    monkeypatch.setitem(audit.CONFIG, "mode", "lineage")
+    monkeypatch.setitem(audit.CONFIG, "write", True)
+    monkeypatch.setitem(audit.CONFIG, "lineage", {
+        "cells": list(cells), "evidence_log": log_rel, "evidence_completed": cutoff})
+    audit.C.update_cache(embeddings={})
+    doc = audit.C._read_cache_doc()
+    doc["audit"] = {"h1": {"timestamp": "2026-07-20T05:00:00+00:00", "cells": {
+        _LINEAGE_CELL: {"kind": "dense", "structural": "ok", "content_digest": "d" * 64,
+                        "path": str(cache_root), "status": "missing_evidence"}}}}
+    audit.C._atomic_write_json(audit.C.CACHE_JSON_PATH, doc)
+    return audit
+
+
+def _lineage_status(audit):
+    cell = audit.C._read_cache_doc()["audit"]["h1"]["cells"][_LINEAGE_CELL]
+    return cell["status"], cell
+
+
+def test_audit_lineage_refuses_missing_evidence_log(tmp_path, monkeypatch):
+    audit = _setup_lineage(tmp_path, monkeypatch, evidence=None)
+    assert audit.main() == 1
+    assert _lineage_status(audit)[0] == "missing_evidence"  # verdict untouched
+
+
+def test_audit_lineage_refuses_incomplete_or_failed_evidence(tmp_path, monkeypatch):
+    # a run that refused a cell (and never printed the completion marker) is not evidence
+    bad = f"==== ADOPTION REPORT ====\n  [adopted] {_LINEAGE_CELL}: {{}}\n\n0 accepted, 1 refused.\n"
+    audit = _setup_lineage(tmp_path, monkeypatch, evidence=bad)
+    assert audit.main() == 1
+    assert _lineage_status(audit)[0] == "missing_evidence"
+
+
+def test_audit_lineage_refuses_when_evidence_omits_a_configured_cell(tmp_path, monkeypatch):
+    # log is clean but only covers ONE of the two configured cells -> no cell may be accepted
+    other = "pastis/presto/baseline"
+    audit = _setup_lineage(tmp_path, monkeypatch, evidence=_good_evidence_text([_LINEAGE_CELL]),
+                           cells=(_LINEAGE_CELL, other))
+    assert audit.main() == 1
+    assert _lineage_status(audit)[0] == "missing_evidence"
+
+
+def test_audit_lineage_refuses_cache_newer_than_evidence(tmp_path, monkeypatch):
+    # a byte written AFTER the semantic check breaks the lineage chain
+    audit = _setup_lineage(tmp_path, monkeypatch, evidence=_good_evidence_text([_LINEAGE_CELL]),
+                           cache_mtime_offset=+3600)
+    assert audit.main() == 1
+    assert _lineage_status(audit)[0] == "missing_evidence"
+
+
+def test_audit_lineage_accepts_and_records_operational_limitation(tmp_path, monkeypatch):
+    audit = _setup_lineage(tmp_path, monkeypatch, evidence=_good_evidence_text([_LINEAGE_CELL]))
+    assert audit.main() == 0
+    status, cell = _lineage_status(audit)
+    assert status == "valid"
+    assert cell["content_digest"] == "d" * 64  # existing digest preserved, never recomputed
+    # the claim must be explicitly operational, never presented as cryptographic proof
+    assert "OPERATIONAL-LINEAGE" in cell["semantic_evidence"]
+    assert "CANNOT be shown mathematically identical" in cell["semantic_evidence"]
+    assert cell["no_rewrite_since_evidence"]["evidence_strength"] == "operational_only"
+    assert "preserve timestamps" in cell["no_rewrite_since_evidence"]["caveat"]
+    assert "NOT present in the adoption log" in cell["digest_role"]
+
+
+def test_audit_dense_digest_order_is_features_then_labels(tmp_path, monkeypatch):
+    # The six published PASTIS digests depend on this exact order; a global sort would interleave
+    # each tile's .labels.npy with its .npy and silently change every digest.
+    audit = _load_tool("audit_embedding_cache")
+    feats = ["fold_1/2_0_0.npy", "fold_1/1_0_0.npy"]
+    labs = ["fold_1/2_0_0.labels.npy", "fold_1/1_0_0.labels.npy"]
+    order = audit._dense_digest_order(feats, labs)
+    assert order == ["fold_1/1_0_0.npy", "fold_1/2_0_0.npy",
+                     "fold_1/1_0_0.labels.npy", "fold_1/2_0_0.labels.npy"]
+    assert order != sorted(feats + labs)  # explicitly NOT one global sort
+
+
+def test_audit_required_absent_cache_fails_when_skip_absent_false(tmp_path, monkeypatch):
+    audit = _load_tool("audit_embedding_cache")
+    monkeypatch.setitem(audit.CONFIG, "skip_absent", False)
+    monkeypatch.setattr(audit.C, "EMBEDDINGS_DIR", tmp_path / "emb")  # nothing exists
+    monkeypatch.setattr(audit.C, "CACHE_JSON_PATH", tmp_path / "logs" / "cache.json")
+    monkeypatch.setattr(audit.C, "dataset_digest", lambda *a, **k: "DSET")
+    monkeypatch.setattr(audit.C, "checkpoint_sha256", lambda *a, **k: "CKPT")
+    monkeypatch.setattr(audit, "_bench", lambda b: SimpleNamespace(n_samples=1, sample_ids=[0]))
+    monkeypatch.setitem(audit.CONFIG, "mode", "audit")
+    monkeypatch.setitem(audit.CONFIG, "write", False)
+    monkeypatch.setitem(audit.CONFIG, "benchmarks", ["cropharvest"])
+    monkeypatch.setitem(audit.CONFIG, "active_models", ["raw"])
+    # record present but file absent -> must NOT pass as absent_here
+    audit.C.update_cache(embeddings={"cropharvest/raw/baseline": {"shape": [1, 1], "dtype": "float32"}})
+    assert audit.main() == 1
