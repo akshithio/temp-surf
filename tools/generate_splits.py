@@ -39,6 +39,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from evals import evals as EV  # noqa: E402
+from evals import label_access as _LA  # noqa: E402  (shared region-level finalize)
 from evals import split_artifacts as SA  # noqa: E402
 from evals import split_spec  # noqa: E402
 from evals.regimes import base as regime_base  # noqa: E402
@@ -217,112 +218,8 @@ def generate_dense(root, bench, bench_mod, regime, seed, *, audit_only, dense_ca
 
 
 def _finalize_label_access(root, benchmark, candidates, *, audit_only):
-    """The benchmark-global label-access pass, in the one order that is scientifically defensible:
-
-      1. predeclared ELIGIBILITY over every (target, seed) cell -- sizing only, no peeking at results
-      2. ``B_d = min(B_max,d, min-cell N_source, min-cell N_target)`` over the ELIGIBLE cells ONLY
-      3. construct the frozen order and the five allocation sets from that B_d
-      4. AUDIT the realized sets for scientific validity (class collapse, undrawable fractions)
-      5. DEMOTE any target failing the audit to supplementary stress
-      6. a benchmark left with fewer than ``MIN_HEADLINE_TARGETS`` targets is omitted from the headline
-         allocation aggregate (its targets remain as supplementary stress)
-
-    Computing B_d BEFORE the audit is what keeps demotion non-vacuous: eligibility answers "is this
-    region big enough to take part in the budget at all", while the audit answers "does the budget's
-    realized allocation actually train". Excluding ineligible cells from step 2 is what stops one tiny
-    region from dragging the whole benchmark's budget down. Writes each survivor's label_access.csv and
-    records the entire decision -- B_d, eligibility, exclusions, fractions, realized counts -- on the
-    per-leaf summaries that become ``splits.json``."""
-    if not candidates:
-        return
-    spec = split_spec.ALL_SPECS[benchmark]
-    unit = SA.label_access_unit(benchmark)
-    eligible, demoted = [], {}
-    for c in candidates:
-        why = SA.label_access_eligibility(n_source=c["n_source"], n_target_pool=c["n_target_pool"])
-        if why:
-            demoted[(c["seed"], c["holdout"])] = list(why)
-        else:
-            eligible.append(c)
-    if not eligible:
-        raise SA.SplitArtifactError(
-            f"{benchmark}: no geographic_ood target is eligible for the label-access contract -- "
-            f"{len(demoted)} cell(s) failed the predeclared sizing rules"
-        )
-    b_d = SA.benchmark_budget(eligible, spec.max_label_budget)
-
-    survivors = []
-    for c in eligible:
-        where = f"{benchmark}/{SA.LABEL_ACCESS_REGIME}/{c['seed']}/{c['holdout']}/{SA.LABEL_ACCESS_FILENAME}"
-        rows = SA.build_label_access_rows(
-            seed=c["seed"], source_ids=c["source_ids"], target_pool_ids=c["pool_ids"],
-            target_test_ids=c["test_ids"], where=where,
-        )
-        SA.validate_label_access_rows(
-            rows, source_ids=c["source_ids"], target_pool_ids=c["pool_ids"],
-            target_test_ids=c["test_ids"], where=where,
-        )
-        src_ranked, tgt_ranked = SA.ranked_ids(rows)
-        cls = c["class_of"]
-        problems = SA.audit_allocation(
-            source_classes=[cls[s] for s in src_ranked], target_classes=[cls[s] for s in tgt_ranked],
-            budget=b_d, where=where,
-        )
-        if problems:
-            demoted[(c["seed"], c["holdout"])] = problems
-            continue
-        c["rows"] = rows
-        survivors.append(c)
-
-    headline_targets = sorted({c["holdout"] for c in survivors})
-    headline_ok = len(headline_targets) >= SA.MIN_HEADLINE_TARGETS
-    fractions = [
-        {
-            "percent": int(f),
-            "n_target_labels": SA.allocation_target_count(f, b_d),
-            "n_source_labels": int(b_d) - SA.allocation_target_count(f, b_d),
-            "n_total_labels": int(b_d),
-        }
-        for f in SA.ALLOCATION_PERCENTS
-    ]
-    for c in survivors:
-        c["summary"]["label_access"] = {
-            "headline_eligible": bool(headline_ok),
-            "benchmark_budget": int(b_d),
-            "max_label_budget": (None if spec.max_label_budget is None else int(spec.max_label_budget)),
-            "unit": unit,
-            "n_source_pool": int(c["n_source"]),
-            "n_target_pool": int(c["n_target_pool"]),
-            "allocation_fractions": fractions,
-            "additive_counts": list(SA.LABEL_ACCESS_COUNTS),
-            "headline_targets": headline_targets,
-        }
-    by_key = {(c["seed"], c["holdout"]): c for c in candidates}
-    for key, why in sorted(demoted.items()):
-        cand = by_key.get(key)
-        if cand is None:
-            continue
-        cand["summary"]["label_access"] = {
-            "headline_eligible": False,
-            "excluded": True,
-            "exclusion_reasons": list(why),
-            "benchmark_budget": int(b_d),
-            "unit": unit,
-        }
-
-    if not audit_only:
-        for c in survivors:
-            # The frozen label DRAW is bound as tightly as the frozen partitions: a different valid
-            # permutation passes every structural check but silently changes every allocation point.
-            la_path, la_sha = SA.write_label_access(root, benchmark, c["seed"], c["holdout"], c["rows"])
-            c["summary"]["label_access_csv"] = str(la_path.relative_to(root))
-            c["summary"]["label_access_sha256"] = la_sha
-    print(
-        f"  [label-access] {benchmark}: B_d={b_d} {unit} over {len(eligible)} eligible cell(s); "
-        f"{len(survivors)} survivor(s), {len(demoted)} demoted; {len(headline_targets)} headline target(s)"
-        f"{'' if headline_ok else f' -- FEWER THAN {SA.MIN_HEADLINE_TARGETS}, omitted from headline aggregate'}",
-        flush=True,
-    )
+    """Delegate to the shared region-level pass (see :mod:`evals.label_access`)."""
+    return _LA.finalize(root, benchmark, candidates, audit_only=audit_only)
 
 
 def generate_benchmark(root, benchmark, *, audit_only):

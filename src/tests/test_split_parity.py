@@ -506,6 +506,92 @@ def test_undersized_headline_target_is_demoted_not_fatal(tmp_path):
     assert (SA.leaf_dir(root, "cropharvest", "geographic_ood", 0, "kenya") / "label_access.csv").exists()
 
 
+def _region(holdout, n_source, n_pool, *, seeds=(0, 1, 2), bad_seed=None, bad_classes=("0",)):
+    """All three seed cells of one region; ``bad_seed`` gets a single-class pool so the ALLOCATION
+    audit (not the sizing gate) fails for that seed alone."""
+    return [
+        _la_candidate(holdout, s, n_source, n_pool,
+                      classes=(bad_classes if s == bad_seed else ("0", "1")))
+        for s in seeds
+    ]
+
+
+def test_one_seed_failing_eligibility_excludes_the_whole_region(tmp_path):
+    """Eligibility is decided per REGION, not per (region, seed).
+
+    The contrasts average seeds within a region and then bootstrap regions, so a region kept at seeds 0
+    and 2 but dropped at seed 1 would silently contribute a two-seed mean sitting beside three-seed
+    means. One undersized seed therefore removes all three cells."""
+    gen = _load_generator()
+    cands = [
+        *_region("kenya", 200, 120), *_region("togo", 200, 140), *_region("sudan", 200, 160),
+        # brazil is fine at seeds 0 and 2 but undersized at seed 1
+        _la_candidate("lem-brazil", 0, 200, 130),
+        _la_candidate("lem-brazil", 1, 200, 16),
+        _la_candidate("lem-brazil", 2, 200, 130),
+    ]
+    gen._finalize_label_access(tmp_path / "splits", "cropharvest", cands, audit_only=True)
+    brazil = [c for c in cands if c["holdout"] == "lem-brazil"]
+    assert len(brazil) == 3
+    for c in brazil:
+        la = c["summary"]["label_access"]
+        assert la["excluded"] is True and la["headline_eligible"] is False
+        assert not (tmp_path / "splits" / "cropharvest" / "geographic_ood" / str(c["seed"])
+                    / "lem-brazil" / "label_access.csv").exists()
+    kept = next(c for c in cands if c["holdout"] == "kenya")["summary"]["label_access"]
+    assert "lem-brazil" not in kept["headline_targets"]
+    # ...and the excluded region never entered the budget, so B_d is the survivors' minimum (120).
+    assert kept["benchmark_budget"] == 120
+
+
+def test_one_seed_failing_the_allocation_audit_excludes_the_whole_region(tmp_path):
+    """A region that passes SIZING but whose realized allocation collapses to one class at a single
+    seed is demoted in full -- the audit verdict is region-level, exactly like eligibility."""
+    gen = _load_generator()
+    cands = [
+        *_region("kenya", 200, 120), *_region("togo", 200, 140), *_region("sudan", 200, 160),
+        *_region("mali", 200, 130, bad_seed=1),   # sizing fine everywhere; seed 1 is single-class
+    ]
+    gen._finalize_label_access(tmp_path / "splits", "cropharvest", cands, audit_only=True)
+    for c in [c for c in cands if c["holdout"] == "mali"]:
+        la = c["summary"]["label_access"]
+        assert la["excluded"] is True
+        assert any("class(es)" in r for r in la["exclusion_reasons"]), la["exclusion_reasons"]
+    kept = next(c for c in cands if c["holdout"] == "kenya")["summary"]["label_access"]
+    assert kept["headline_targets"] == ["kenya", "sudan", "togo"]
+
+
+def test_exclusion_metadata_is_identical_across_a_regions_seeds(tmp_path):
+    """Every seed of an excluded region carries the SAME reason list, so no reader can conclude the
+    region was usable at some seeds and not others."""
+    gen = _load_generator()
+    cands = [
+        *_region("kenya", 200, 120), *_region("togo", 200, 140), *_region("sudan", 200, 160),
+        *_region("mali", 200, 130, bad_seed=2),
+    ]
+    gen._finalize_label_access(tmp_path / "splits", "cropharvest", cands, audit_only=True)
+    reasons = [tuple(c["summary"]["label_access"]["exclusion_reasons"])
+               for c in cands if c["holdout"] == "mali"]
+    assert len(reasons) == 3 and len(set(reasons)) == 1, reasons
+
+
+def test_budget_is_not_recomputed_after_the_allocation_audit(tmp_path):
+    """B_d is fixed in step 2 and never revisited.
+
+    Recomputing it over the survivors would let the audit OUTCOME move the budget, so the surviving
+    regions would be measured at a budget chosen partly by which regions failed. Here the demoted
+    region also holds the minimum pool, so a recomputation would visibly raise B_d from 100 to 120."""
+    gen = _load_generator()
+    cands = [
+        *_region("kenya", 200, 120), *_region("togo", 200, 140), *_region("sudan", 200, 160),
+        *_region("mali", 200, 100, bad_seed=0),   # smallest pool AND fails the audit
+    ]
+    gen._finalize_label_access(tmp_path / "splits", "cropharvest", cands, audit_only=True)
+    kept = next(c for c in cands if c["holdout"] == "kenya")["summary"]["label_access"]
+    assert kept["benchmark_budget"] == 100, "B_d must stay the step-2 value, not the survivors' minimum"
+    assert "mali" not in kept["headline_targets"]
+
+
 def test_fewer_than_three_targets_loses_headline_status(tmp_path):
     """A benchmark left with <3 eligible targets still freezes its orders but is flagged out of the
     headline allocation aggregate -- a region bootstrap over two regions has no usable uncertainty."""
