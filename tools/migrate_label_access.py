@@ -140,6 +140,39 @@ def _tree_is_dirty() -> str:
     return "; ".join(sorted(ln.strip() for ln in dirty)[:8])
 
 
+def _report(entries: list[dict]) -> None:
+    """The decision, per benchmark: B_d, which regions survive, which are excluded and why, and how
+    many label_access.csv files a publish would produce. A dry run exists to be read, so the reasons
+    are printed rather than left on in-memory entries that a dry run never persists."""
+    print("\n================ label-access migration report ================", flush=True)
+    for benchmark in BENCHMARKS:
+        rows = [e for e in entries if e["benchmark"] == benchmark and e.get("label_access")]
+        if not rows:
+            continue
+        budgets = sorted({e["label_access"]["benchmark_budget"] for e in rows})
+        units = sorted({e["label_access"]["unit"] for e in rows})
+        surviving = sorted({e["holdout"] for e in rows if not e["label_access"].get("excluded")})
+        excluded: dict[str, list[str]] = {}
+        for e in rows:
+            la = e["label_access"]
+            if la.get("excluded"):
+                excluded.setdefault(str(e["holdout"]), list(la["exclusion_reasons"]))
+        n_files = sum(1 for e in rows if not e["label_access"].get("excluded"))
+        headline = any(e["label_access"].get("headline_eligible") for e in rows)
+        print(f"\n[{benchmark}]", flush=True)
+        print(f"  B_d                 : {budgets[0] if len(budgets) == 1 else budgets} {units[0]}", flush=True)
+        print(f"  eligible regions    : {len(surviving)} {surviving}", flush=True)
+        print(f"  excluded regions    : {len(excluded)} {sorted(excluded)}", flush=True)
+        for region in sorted(excluded):
+            for reason in excluded[region]:
+                print(f"      - {region}: {reason}", flush=True)
+        print(f"  label_access.csv    : {n_files} (= {len(surviving)} regions x seeds)", flush=True)
+        print(f"  headline aggregate  : {'YES' if headline else 'NO (fewer than 3 regions)'}", flush=True)
+    total = sum(1 for e in entries if e.get("label_access") and not e["label_access"].get("excluded"))
+    print(f"\nTOTAL label_access.csv a publish would write: {total}", flush=True)
+    print("==============================================================\n", flush=True)
+
+
 def main() -> int:
     root = Path(SPLITS_ROOT)
     log = SA.read_splits_log(LOGS_PATH)
@@ -179,6 +212,7 @@ def main() -> int:
     after = {e["holdout"] + "/" + str(e["seed"]) for e in entries if e.get("label_access_csv")}
     print(f"  label-access leaves: {len(before)} -> {len(after)} ({stale} stale removed)", flush=True)
 
+    _report(entries)
     if DRY_RUN:
         print("[migrate_label_access] DRY RUN complete -- no artifact or log was written.", flush=True)
         return 0
